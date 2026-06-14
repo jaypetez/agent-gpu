@@ -5,3 +5,5 @@ http://SERVER_HOST:PORT/v1/chat/completions
 http://localhost
 https://localhost
 http://127.0.0.1
+# User-owned Projects boards 404 for unauthenticated/token link checkers, though valid in-browser
+https://github.com/users/jaypetez/projects/
