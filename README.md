@@ -1,5 +1,9 @@
 # agent-gpu
 
+[![CI](https://github.com/jaypetez/agent-gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/jaypetez/agent-gpu/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jaypetez/agent-gpu/badge)](https://scorecard.dev/viewer/?uri=github.com/jaypetez/agent-gpu)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **agent-gpu** is a distributed inference layer for [Ollama](https://ollama.com). It forwards
 agent requests to remote GPU-powered Ollama instances and exposes a clean, OpenAI-compatible
 API for running open-source LLMs across your network.
@@ -54,6 +58,7 @@ curl http://SERVER_HOST:PORT/v1/chat/completions \
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Changelog](CHANGELOG.md)
 - Developer Guide — see [#26](https://github.com/jaypetez/agent-gpu/issues/26)
 - API Reference — see [#27](https://github.com/jaypetez/agent-gpu/issues/27)
 

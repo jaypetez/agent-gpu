@@ -1,0 +1,24 @@
+# Operating system cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Logs & temp
+*.log
+tmp/
+.cache/
+
+# Language-specific ignores (build artifacts, deps, coverage) will be added
+# alongside the toolchain chosen in #1.
