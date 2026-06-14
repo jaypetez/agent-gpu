@@ -90,3 +90,5 @@ capacity frees up. Queue depth and per-worker load are exported as metrics.
 Authentication, permission rules, and quota counters are persisted so they survive restarts.
 The Docker Compose environment backs this with Redis/Postgres; standalone deployments may use an
 embedded store. See the relevant milestones on the roadmap for specifics.
+
+<!-- ci: ruleset + admin-merge verification -->
