@@ -1,0 +1,40 @@
+# Mark and eventually close issues/PRs that have gone inactive.
+# https://github.com/actions/stale
+name: Stale
+
+on:
+  schedule:
+    - cron: "30 1 * * *" # daily, 01:30 UTC
+  workflow_dispatch: # allow manual runs
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    name: Flag inactive issues and PRs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Mark stale
+        uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+        with:
+          days-before-stale: 60
+          days-before-close: 14
+          stale-issue-label: stale
+          stale-pr-label: stale
+          stale-issue-message: >
+            This issue has been inactive for 60 days and is now marked stale.
+            Comment to keep it open, otherwise it will be closed in 14 days.
+          stale-pr-message: >
+            This pull request has been inactive for 60 days and is now marked stale.
+            Comment or push to keep it open, otherwise it will be closed in 14 days.
+          # Don't reap roadmap epics, prioritized work, security, or pinned items.
+          exempt-issue-labels: "epic,priority:high,security,pinned"
+          exempt-pr-labels: "epic,priority:high,security,pinned"
+          exempt-all-milestones: true

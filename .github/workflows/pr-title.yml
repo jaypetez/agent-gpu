@@ -1,0 +1,42 @@
+# Validate that pull request titles follow Conventional Commits.
+# This keeps titles consistent with the project's commit style (feat:, fix:, ci: ...)
+# and unlocks future changelog/release automation.
+name: PR title
+
+on:
+  # pull_request_target so the check also runs on PRs from forks. This workflow
+  # only reads the PR title via the action below — it never checks out or executes
+  # PR head code — so the elevated token is safe here.
+  pull_request_target:
+    types: [opened, edited, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  lint:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Validate PR title
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Allowed types — mirror CONTRIBUTING.md and the project's commit history.
+          types: |
+            feat
+            fix
+            chore
+            ci
+            docs
+            test
+            refactor
+            build
+            perf
+            revert

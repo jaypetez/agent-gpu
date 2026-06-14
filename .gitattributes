@@ -1,0 +1,5 @@
+# Normalize line endings: store text as LF in the repo, check out native on Windows.
+* text=auto eol=lf
+
+# Always-LF for shell scripts so they stay executable on Unix runners.
+*.sh text eol=lf
