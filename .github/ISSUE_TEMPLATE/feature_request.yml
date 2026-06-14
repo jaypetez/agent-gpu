@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest an idea or enhancement for agent-gpu
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please check the [roadmap](https://github.com/users/jaypetez/projects/10) and existing issues first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve? Who benefits?
+      placeholder: As a ..., I want ... so that ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the feature or change you'd like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about, and why they fall short.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Server
+        - Worker
+        - CLI
+        - API
+        - Scheduler
+        - Permissions / Security
+        - Quotas
+        - Observability
+        - Docker
+        - Docs
+        - Other
+    validations:
+      required: true

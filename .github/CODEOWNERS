@@ -1,0 +1,10 @@
+# Code owners for agent-gpu.
+# These owners are requested for review on any PR touching matching paths.
+# See https://docs.github.com/articles/about-code-owners
+
+# Default owner for everything in the repo.
+*       @jaypetez
+
+# Adjust ownership per area as the team grows, e.g.:
+# /docs/        @jaypetez
+# /SECURITY.md  @jaypetez
