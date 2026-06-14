@@ -1,0 +1,7 @@
+# Placeholder / example hosts used in quickstart docs
+http://SERVER_HOST:PORT
+http://SERVER_HOST:PORT/v1/chat/completions
+# Local development addresses
+http://localhost
+https://localhost
+http://127.0.0.1
