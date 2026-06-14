@@ -20,5 +20,13 @@ desktop.ini
 tmp/
 .cache/
 
-# Language-specific ignores (build artifacts, deps, coverage) will be added
-# alongside the toolchain chosen in #1.
+# Go (toolchain chosen in #1)
+# Compiled binaries — including the unified agentgpu binary
+/agentgpu
+*.exe
+*.test
+*.out
+# Coverage profiles
+coverage.txt
+# We use Go modules, not vendoring
+/vendor/

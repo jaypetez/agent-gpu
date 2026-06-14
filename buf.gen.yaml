@@ -1,0 +1,14 @@
+version: v2
+managed:
+  enabled: false
+plugins:
+  # Pinned tool versions (keep in sync with docs/architecture.md and the
+  # Makefile `proto` target):
+  #   protoc-gen-go      v1.36.6
+  #   protoc-gen-go-grpc v1.5.1
+  - local: protoc-gen-go
+    out: .
+    opt: module=github.com/jaypetez/agent-gpu
+  - local: protoc-gen-go-grpc
+    out: .
+    opt: module=github.com/jaypetez/agent-gpu

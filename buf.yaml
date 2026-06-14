@@ -1,0 +1,17 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # The control plane is a single symmetric bidirectional stream, not a
+    # request/response RPC. WorkerMessage/ServerMessage describe the two
+    # directions of that stream and read far clearer than the lint-preferred
+    # ConnectRequest/ConnectResponse, so we opt out of these naming rules.
+    - SERVICE_SUFFIX
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE
