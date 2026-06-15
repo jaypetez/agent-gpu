@@ -201,6 +201,13 @@ type Server struct {
 	// heartbeatTimeout/2; tests set it small so the loop reacts promptly to a
 	// fast-forwarded clock without real sleeps approaching the timeout.
 	evictScan time.Duration
+	// onDrain, if set, is invoked with a worker's id the moment the server marks
+	// it draining in response to a Deregister message — before the subsequent
+	// stream-close removeWorker. nil by default; set via WithDrainObserver. It
+	// gives operators (and tests) a synchronization point on the graceful-drain
+	// transition that does not depend on observing the brief draining→removed
+	// window through a polling race.
+	onDrain func(workerID string)
 
 	mu      sync.RWMutex
 	workers map[string]*worker // by worker id
@@ -284,6 +291,19 @@ func WithEvictScanInterval(d time.Duration) Option {
 	return func(s *Server) {
 		if d > 0 {
 			s.evictScan = d
+		}
+	}
+}
+
+// WithDrainObserver registers a callback invoked with a worker's id the moment
+// the server marks it draining in response to a graceful Deregister, before the
+// subsequent stream-close cleanup. A nil callback is ignored. Primarily an
+// observability seam (e.g. operator notifications, tests asserting the drain
+// transition without racing the brief draining→removed window).
+func WithDrainObserver(fn func(workerID string)) Option {
+	return func(s *Server) {
+		if fn != nil {
+			s.onDrain = fn
 		}
 	}
 }
@@ -507,6 +527,9 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 			// has drained, at which point removeWorker (deferred) cleans it up.
 			w.markDraining()
 			s.log.Info("worker draining", "worker", w.id)
+			if s.onDrain != nil {
+				s.onDrain(w.id)
+			}
 		case *agentgpuv1.WorkerMessage_Register:
 			// Re-registration on an established stream is a protocol error.
 			return status.Error(codes.FailedPrecondition, "duplicate Register on established stream")

@@ -422,11 +422,44 @@ func TestWorkerReportsCapacityAndActiveJobs(t *testing.T) {
 	})
 }
 
-// TestWorkerGracefulDeregister verifies the real worker sends a Deregister on
-// graceful shutdown (Run context cancelled), so the server marks it draining
-// and stops routing before the stream tears down (AC4, worker side).
+// TestWorkerGracefulDeregister verifies the real worker reliably sends a
+// Deregister on graceful shutdown (Run context cancelled), so the server marks
+// it draining before the stream tears down (AC4, worker side).
+//
+// Asserting only that the worker is eventually gone is insufficient: the
+// stream-close removeWorker path drops the worker regardless of whether a
+// Deregister was ever sent, so WorkerCount()==0 cannot distinguish a graceful
+// drain from a bare disconnect. We instead assert the server observes the
+// Deregister-driven draining transition. The server's drain observer fires
+// synchronously in the reader loop the instant markDraining runs — strictly
+// before the deferred removeWorker on stream close — giving a race-free
+// synchronization point that does not depend on catching the brief
+// draining→removed window through a polling race.
 func TestWorkerGracefulDeregister(t *testing.T) {
-	h := newHarnessWith(t, server.WithHeartbeatTimeout(time.Minute))
+	// drainStatus carries the fleet status of the draining worker, captured from
+	// inside the drain observer. The observer runs synchronously on the server's
+	// reader goroutine the instant the worker is marked draining — after
+	// markDraining but strictly before the deferred removeWorker (which only runs
+	// once the reader loop sees the post-Deregister stream close). So a Fleet()
+	// snapshot taken here is guaranteed to still contain the worker and to report
+	// WorkerDraining, giving a race-free assertion that needs no polling window.
+	type drainEvent struct {
+		id     string
+		status types.WorkerStatus
+		found  bool
+	}
+	drained := make(chan drainEvent, 1)
+	var h *harness
+	h = newHarnessWith(t,
+		server.WithHeartbeatTimeout(time.Minute),
+		server.WithDrainObserver(func(id string) {
+			w, ok := fleetByID(h.srv, id)
+			select {
+			case drained <- drainEvent{id: id, status: w.Status, found: ok}:
+			default:
+			}
+		}),
+	)
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
 
@@ -441,10 +474,32 @@ func TestWorkerGracefulDeregister(t *testing.T) {
 		return h.srv.WorkerCount() == 1
 	})
 
-	// Cancel Run: the worker should emit Deregister, then close the stream. The
-	// server processes the Deregister (marks draining) and then removeWorker on
-	// stream close. The terminal, observable state is that the worker is gone.
+	// Cancel Run: the worker must emit Deregister before closing the stream. The
+	// server processes the Deregister (marks draining) and only then removeWorker
+	// on stream close.
 	cancel()
+
+	// The graceful Deregister must reach the server and drive the draining
+	// transition. Against the racy worker (where the graceful-shutdown branch was
+	// stolen ~50% of the time by a competing select case, or the Deregister was
+	// truncated when the stream's context was cancelled out from under it) this
+	// observer frequently never fires and the test fails.
+	select {
+	case ev := <-drained:
+		if ev.id != "graceful-worker" {
+			t.Fatalf("drain observer fired for %q, want graceful-worker", ev.id)
+		}
+		if !ev.found {
+			t.Fatal("draining worker absent from fleet at drain time")
+		}
+		if ev.status != types.WorkerDraining {
+			t.Fatalf("worker status at drain = %v, want WorkerDraining", ev.status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed a graceful Deregister/draining transition")
+	}
+
+	// And it is eventually removed once the stream tears down.
 	waitFor(t, 2*time.Second, "worker removed after graceful shutdown", func() bool {
 		return h.srv.WorkerCount() == 0
 	})

@@ -206,10 +206,19 @@ func (w *Worker) runOnce(ctx context.Context, resetBackoff func()) error {
 	// goroutines spawned in serve are torn down when this cycle ends — without
 	// this, every reconnect would leak the previous cycle's goroutines because
 	// they would only observe the long-lived Run context.
-	cctx, cancel := context.WithCancel(ctx)
+	//
+	// Crucially this context is NOT a child of ctx (the long-lived Run context).
+	// If it were, a graceful shutdown (ctx cancelled) would synchronously abort
+	// the gRPC stream, so the Deregister serve tries to send would race a
+	// half-dead transport and usually never reach the server. Decoupling lets
+	// serve send the Deregister on a still-live stream first and only then
+	// return, at which point the deferred cancel tears everything down. ctx is
+	// still honored: dial respects it for connect-time abort, and serve selects
+	// on it to trigger the graceful Deregister.
+	cctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	conn, err := w.dial(cctx)
+	conn, err := w.dial(ctx)
 	if err != nil {
 		return err
 	}
@@ -255,11 +264,17 @@ func (w *Worker) runOnce(ctx context.Context, resetBackoff func()) error {
 // Sends (heartbeats, job results, deregister) to keep stream writes
 // single-threaded.
 //
-// runCtx is the long-lived Run context; connCtx is the per-connection context
-// (cancelled by runOnce on return) so the spawned goroutines are torn down when
-// this connection ends rather than leaking. The two are distinguished so a
-// graceful shutdown (runCtx cancelled) can send a Deregister before closing,
-// while a transient drop (only connCtx cancelled) does not.
+// runCtx is the long-lived Run context. connCtx is the per-connection context
+// owned by runOnce, cancelled by its deferred cancel only when this cycle ends;
+// it is passed to the spawned goroutines so they are torn down (rather than
+// leaked) on every reconnect. connCtx is deliberately NOT derived from runCtx
+// (see runOnce) and is NOT selected on here: while serve runs it is never Done,
+// so it cannot compete with runCtx.Done() for the shutdown branch.
+//
+// The two exit triggers are therefore distinct and unambiguous: a graceful
+// shutdown surfaces via runCtx.Done() (and sends a Deregister), while a
+// transient stream drop (reconnect) surfaces via recvErr and does NOT — a
+// recovering worker must not be wrongly drained.
 func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.ControlPlane_ConnectClient) error {
 	results := make(chan types.JobResult, 8)
 	recvErr := make(chan error, 1)
@@ -322,19 +337,18 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 		case <-runCtx.Done():
 			// Graceful shutdown: the long-lived Run context was cancelled.
 			// Announce departure so the server marks us draining and stops routing
-			// new jobs immediately rather than waiting for the stale timeout. We
-			// send while the stream is still live — runOnce cancels connCtx (which
-			// tears down the stream) only after serve returns. Best-effort: ignore
-			// the send error.
-			_ = stream.Send(&agentgpuv1.WorkerMessage{
-				Payload: &agentgpuv1.WorkerMessage_Deregister{
-					Deregister: &agentgpuv1.Deregister{WorkerId: w.cfg.WorkerID},
-				},
-			})
+			// new jobs immediately rather than waiting for the stale timeout.
+			//
+			// This is the sole context case in the select. An earlier version also
+			// watched connCtx.Done(); because connCtx was a child of runCtx, a
+			// graceful cancel made both ready at once and Go's select picked
+			// pseudo-randomly, dropping the Deregister ~50% of the time. The
+			// per-connection teardown that connCtx drives is now handled purely by
+			// the goroutines and runOnce's deferred cancel, so graceful shutdown is
+			// unambiguous here. Transient drops never reach this case — they surface
+			// via recvErr.
+			w.deregister(stream, recvErr)
 			return runCtx.Err()
-		case <-connCtx.Done():
-			// Transient teardown (e.g. reconnect): no graceful announcement.
-			return connCtx.Err()
 		case err := <-recvErr:
 			if err == io.EOF {
 				return nil
@@ -351,6 +365,39 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 				return err
 			}
 		}
+	}
+}
+
+// deregister announces a graceful departure and ensures it is actually
+// delivered before the connection is torn down. Sending alone is not enough:
+// runOnce's deferred conn.Close() races the in-flight Deregister and can
+// truncate it before the server reads it. So after sending we half-close the
+// send direction (CloseSend) — a clean end-of-stream the server reads only
+// after it has processed the Deregister — then wait for the receive goroutine
+// to observe the server tearing its side down (recvErr). At that point the
+// Deregister has provably been received and the connection can be closed
+// safely. A bounded timeout keeps shutdown from hanging if the server is
+// unresponsive. All steps are best-effort: a send/close error just means the
+// stream is already gone, which a stale timeout would have reaped anyway.
+func (w *Worker) deregister(stream agentgpuv1.ControlPlane_ConnectClient, recvErr <-chan error) {
+	if err := stream.Send(&agentgpuv1.WorkerMessage{
+		Payload: &agentgpuv1.WorkerMessage_Deregister{
+			Deregister: &agentgpuv1.Deregister{WorkerId: w.cfg.WorkerID},
+		},
+	}); err != nil {
+		return
+	}
+	if err := stream.CloseSend(); err != nil {
+		return
+	}
+	// Wait until the server has read through the Deregister and closed its side
+	// (surfacing here as recvErr), so the deferred conn.Close() cannot truncate
+	// the message in flight. Bounded so an unresponsive server can't wedge us.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-recvErr:
+	case <-timer.C:
 	}
 }
 
