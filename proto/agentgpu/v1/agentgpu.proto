@@ -49,6 +49,11 @@ message JobResult {
   string output = 2;
   // Set when the job failed; output is then empty/partial.
   Error error = 3;
+  // Number of tokens generated/consumed by this job, reported by the worker
+  // for quota accounting (#5). The echo executor reports a whitespace token
+  // count; real counts arrive with the Ollama integration (#11). Zero means
+  // "no tokens reported".
+  uint64 tokens = 4;
 }
 
 // Register is the first message a worker sends on the stream. It identifies

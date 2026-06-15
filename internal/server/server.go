@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
@@ -83,6 +84,7 @@ type Server struct {
 	log   *slog.Logger
 	store store.Store
 	authz *authz.Authorizer
+	quota *quota.Engine
 
 	mu      sync.RWMutex
 	workers map[string]*worker // by worker id
@@ -120,6 +122,17 @@ func WithAuthorizer(a *authz.Authorizer) Option {
 	}
 }
 
+// WithQuota sets the quota engine used to enforce per-key consumption limits on
+// the dispatch path. Defaults to an unlimited (no-op) engine so dispatch paths
+// that do not configure quotas behave exactly as before.
+func WithQuota(q *quota.Engine) Option {
+	return func(s *Server) {
+		if q != nil {
+			s.quota = q
+		}
+	}
+}
+
 // New constructs a Server.
 func New(opts ...Option) *Server {
 	s := &Server{
@@ -134,6 +147,12 @@ func New(opts ...Option) *Server {
 	// server logger, after options have run.
 	if s.authz == nil {
 		s.authz = authz.NewAuthorizer(authz.WithLogger(s.log))
+	}
+	// Default the quota engine to an unlimited (no-op) engine over a fresh
+	// in-memory counter store, so dispatch behaves unchanged when no quotas are
+	// configured. Zero default Limits == unlimited on every dimension.
+	if s.quota == nil {
+		s.quota = quota.NewEngine(quota.NewMemoryCounterStore(), quota.WithLogger(s.log))
 	}
 	return s
 }
@@ -274,16 +293,26 @@ func (s *Server) pickWorker() (*worker, bool) {
 }
 
 // SubmitAuthorizedJob authorizes an already-authenticated key for inference on
-// job.Model and, if permitted, dispatches the job. It is the enforcement seam
-// for the request path (#13), whose flow is:
+// job.Model, enforces its quota, and — if permitted — dispatches the job. It is
+// the enforcement seam for the request path (#13), whose flow is:
 //
-//	key, err := auth.Authenticate(ctx, token)   // 401 on err
-//	res, err := srv.SubmitAuthorizedJob(ctx, key, job) // 403 on authz.ErrForbidden
+//	key, err := auth.Authenticate(ctx, token)          // 401 on err
+//	res, err := srv.SubmitAuthorizedJob(ctx, key, job) // 403 authz.ErrForbidden / 429 quota.ErrQuotaExceeded
 //
-// Authorization reads the key's current roles/lists (the caller passes the key
-// freshly read by Authenticate), so permission changes take effect without a
-// restart. A forbidden job is never handed to a worker; the error is
-// authz.ErrForbidden.
+// The order is authenticate (by the caller) → authorize → quota reserve →
+// dispatch → record tokens:
+//
+//   - authz.Authorize gates the model/action (authz.ErrForbidden → 403).
+//   - quota.CheckAndReserve reserves one request against the key's RPM and
+//     rejects an already-exhausted token budget (quota.ErrQuotaExceeded → 429,
+//     mapped by #6). It runs BEFORE dispatch so a denied request never reaches a
+//     worker.
+//   - after the job returns, quota.RecordTokens records the tokens the job
+//     actually produced (result.Tokens). A failed/zero-token job thus consumes
+//     an RPM unit but no token budget.
+//
+// Authorization and quota both read the key passed in (freshly read by
+// Authenticate), so changes take effect without a restart.
 //
 // NOTE (#11): the pull/load operations have no dispatch path yet. When they
 // land, gate them the same way with authz.Pull / authz.Load before touching a
@@ -295,8 +324,22 @@ func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job 
 	if err := s.authz.Authorize(ctx, key, job.Model, authz.Infer); err != nil {
 		return types.JobResult{}, err
 	}
-	return s.SubmitJob(ctx, job)
+	if err := s.quota.CheckAndReserve(ctx, key); err != nil {
+		return types.JobResult{}, err
+	}
+	res, err := s.SubmitJob(ctx, job)
+	// Record whatever tokens the job produced (zero on dispatch failure). The
+	// request itself was already reserved against RPM above.
+	s.quota.RecordTokens(ctx, key.ID, res.Tokens)
+	if err != nil {
+		return res, err
+	}
+	return res, nil
 }
+
+// Quota exposes the configured quota engine (a seam for usage inspection and
+// graceful-shutdown checkpointing by the cmd layer).
+func (s *Server) Quota() *quota.Engine { return s.quota }
 
 // SubmitJob dispatches a job to a connected worker and waits for the result.
 // This is the minimal foundational dispatch primitive with no authorization;

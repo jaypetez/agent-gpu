@@ -97,6 +97,42 @@ func TestPermissionFieldsDeepCopied(t *testing.T) {
 	}
 }
 
+// TestLimitsDeepCopied verifies the per-key Limits pointer is deep-copied by
+// cloneAPIKey, so a caller mutating its copy cannot corrupt stored state.
+func TestLimitsDeepCopied(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := NewMemory()
+	t.Cleanup(func() { _ = s.Close() })
+
+	lim := &Limits{RPM: 10}
+	key := APIKey{ID: "k1", Limits: lim}
+	if err := s.PutAPIKey(ctx, key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// Mutating the caller's Limits after Put must not affect stored state.
+	lim.RPM = 999
+
+	got, err := s.GetAPIKey(ctx, "k1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Limits == nil || got.Limits.RPM != 10 {
+		t.Fatalf("store aliased caller Limits: %+v", got.Limits)
+	}
+	if got.Limits == lim {
+		t.Fatal("GetAPIKey returned the caller's Limits pointer (aliased)")
+	}
+
+	// Mutating the returned copy must not affect a subsequent read.
+	got.Limits.RPM = 999
+	again, _ := s.GetAPIKey(ctx, "k1")
+	if again.Limits.RPM != 10 {
+		t.Fatalf("GetAPIKey returned aliased Limits: %+v", again.Limits)
+	}
+}
+
 func TestMemoryConcurrent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

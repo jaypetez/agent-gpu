@@ -48,6 +48,11 @@ type JobResult struct {
 	JobID  string
 	Output string
 	Err    *JobError
+	// Tokens is the number of tokens generated/consumed by the job, reported by
+	// the worker for quota accounting (#5). The echo executor reports a
+	// whitespace token count; real counts arrive with Ollama (#11). Zero means
+	// "no tokens reported".
+	Tokens uint64
 }
 
 // ErrInvalidJob is returned when a Job fails validation.
@@ -138,6 +143,7 @@ func (r JobResult) Proto() *agentgpuv1.JobResult {
 		JobId:  r.JobID,
 		Output: r.Output,
 		Error:  r.Err.Proto(),
+		Tokens: r.Tokens,
 	}
 }
 
@@ -150,5 +156,6 @@ func JobResultFromProto(p *agentgpuv1.JobResult) JobResult {
 		JobID:  p.GetJobId(),
 		Output: p.GetOutput(),
 		Err:    JobErrorFromProto(p.GetError()),
+		Tokens: p.GetTokens(),
 	}
 }

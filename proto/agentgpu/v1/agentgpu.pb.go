@@ -215,7 +215,12 @@ type JobResult struct {
 	// The produced output (stub workers echo the prompt back).
 	Output string `protobuf:"bytes,2,opt,name=output,proto3" json:"output,omitempty"`
 	// Set when the job failed; output is then empty/partial.
-	Error         *Error `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	Error *Error `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	// Number of tokens generated/consumed by this job, reported by the worker
+	// for quota accounting (#5). The echo executor reports a whitespace token
+	// count; real counts arrive with the Ollama integration (#11). Zero means
+	// "no tokens reported".
+	Tokens        uint64 `protobuf:"varint,4,opt,name=tokens,proto3" json:"tokens,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -269,6 +274,13 @@ func (x *JobResult) GetError() *Error {
 		return x.Error
 	}
 	return nil
+}
+
+func (x *JobResult) GetTokens() uint64 {
+	if x != nil {
+		return x.Tokens
+	}
+	return 0
 }
 
 // Register is the first message a worker sends on the stream. It identifies
@@ -624,11 +636,12 @@ const file_agentgpu_v1_agentgpu_proto_rawDesc = "" +
 	"\x03Job\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05model\x18\x02 \x01(\tR\x05model\x12\x16\n" +
-	"\x06prompt\x18\x03 \x01(\tR\x06prompt\"d\n" +
+	"\x06prompt\x18\x03 \x01(\tR\x06prompt\"|\n" +
 	"\tJobResult\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
 	"\x06output\x18\x02 \x01(\tR\x06output\x12(\n" +
-	"\x05error\x18\x03 \x01(\v2\x12.agentgpu.v1.ErrorR\x05error\"S\n" +
+	"\x05error\x18\x03 \x01(\v2\x12.agentgpu.v1.ErrorR\x05error\x12\x16\n" +
+	"\x06tokens\x18\x04 \x01(\x04R\x06tokens\"S\n" +
 	"\bRegister\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12*\n" +
 	"\x06models\x18\x02 \x03(\v2\x12.agentgpu.v1.ModelR\x06models\",\n" +

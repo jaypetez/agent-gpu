@@ -112,10 +112,13 @@ func TestJobResultRoundTrip(t *testing.T) {
 	t.Parallel()
 	t.Run("success", func(t *testing.T) {
 		t.Parallel()
-		in := JobResult{JobID: "j1", Output: "world"}
+		in := JobResult{JobID: "j1", Output: "world", Tokens: 7}
 		got := JobResultFromProto(in.Proto())
 		if got.JobID != in.JobID || got.Output != in.Output || got.Err != nil {
 			t.Fatalf("round trip mismatch: got %+v want %+v", got, in)
+		}
+		if got.Tokens != in.Tokens {
+			t.Fatalf("tokens did not survive round trip: got %d want %d", got.Tokens, in.Tokens)
 		}
 	})
 	t.Run("failure", func(t *testing.T) {

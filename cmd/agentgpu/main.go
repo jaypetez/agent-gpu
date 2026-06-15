@@ -58,16 +58,18 @@ func usage() {
 	fmt.Fprint(os.Stderr, `agentgpu — distributed inference layer for Ollama
 
 Usage:
-  agentgpu server start [--listen host:port]
+  agentgpu server start [--listen host:port] [--quota-path path] [--default-rpm N] [--default-tpm N]
   agentgpu worker start --server host:port [--id worker-id]
   agentgpu key create --name <name> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--store path]
   agentgpu key list [--store path]
   agentgpu key revoke <id> [--store path]
   agentgpu key rotate <id> [--store path]
   agentgpu key perms <id> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--store path]
+  agentgpu key quota <id> [--store path] [--quota-path path]
+  agentgpu key quota set <id> [--rpm N] [--tpm N] [--daily-tokens N] [--monthly-tokens N] [--store path]
 
 Configuration may also be supplied via environment variables:
   AGENTGPU_SERVER_LISTEN, AGENTGPU_SERVER_ADDR, AGENTGPU_WORKER_ID,
-  AGENTGPU_STORE_PATH
+  AGENTGPU_STORE_PATH, AGENTGPU_QUOTA_PATH
 `)
 }

@@ -53,6 +53,29 @@ type APIKey struct {
 	// DenyModels is the per-key deny-list of model names. Deny always wins over
 	// any allow or role grant.
 	DenyModels []string
+	// Limits are the per-key quota limits (#5). A nil pointer means "use the
+	// global defaults from QuotaConfig"; a non-nil value overrides them per
+	// dimension (a zero field within it meaning "unlimited"). The quota engine
+	// interprets these; the store only persists them.
+	Limits *Limits
+}
+
+// Limits are the per-key quota limits applied by the quota engine (#5):
+// requests-per-minute (RPM), tokens-per-minute (TPM), and daily/monthly token
+// budgets. A zero value for any field means "unlimited" for that dimension.
+//
+// This struct is defined in the store package (rather than internal/quota) so
+// it can be persisted on APIKey without an import cycle; internal/quota aliases
+// it. Limits change rarely, so persisting them via the file store is fine.
+type Limits struct {
+	// RPM is the maximum number of requests per UTC-aligned minute (0 = unlimited).
+	RPM uint64
+	// TPM is the maximum number of tokens per UTC-aligned minute (0 = unlimited).
+	TPM uint64
+	// DailyTokens is the maximum number of tokens per UTC calendar day (0 = unlimited).
+	DailyTokens uint64
+	// MonthlyTokens is the maximum number of tokens per UTC calendar month (0 = unlimited).
+	MonthlyTokens uint64
 }
 
 // Revoked reports whether the key has been revoked.
@@ -109,6 +132,10 @@ func cloneAPIKey(k APIKey) APIKey {
 	}
 	if k.DenyModels != nil {
 		out.DenyModels = append([]string(nil), k.DenyModels...)
+	}
+	if k.Limits != nil {
+		l := *k.Limits
+		out.Limits = &l
 	}
 	return out
 }

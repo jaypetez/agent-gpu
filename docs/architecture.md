@@ -120,6 +120,65 @@ Permissions are read fresh from the store on every check, so role and list chang
 immediately without a restart. Until the admin HTTP endpoints land, roles and lists are managed
 with the `agentgpu key create` and `agentgpu key perms` CLI commands.
 
+## Quotas
+
+After a request is authenticated and authorized, the quota engine (`internal/quota`) enforces
+per-key **consumption limits**. A request that exceeds a limit is refused with `ErrQuotaExceeded`
+— the typed seam the request path maps to HTTP **429** (mirroring `ErrUnauthenticated` → 401 and
+`ErrForbidden` → 403). On the dispatch path the order is:
+
+```
+authenticate → authorize → quota.CheckAndReserve → dispatch → quota.RecordTokens
+```
+
+`CheckAndReserve` runs **before** dispatch (a refused request never reaches a worker) and reserves
+one request against the key's RPM; `RecordTokens` runs **after** the job returns and records the
+tokens it actually produced. A request therefore always consumes one RPM unit (the attempt), but
+only consumes token budget if the job produced tokens — a failed/zero-token job spends no token
+budget.
+
+### Limits
+
+Four dimensions are enforced, each independently:
+
+| dimension       | window | `0` means    |
+| --------------- | ------ | ------------ |
+| `RPM`           | minute | unlimited    |
+| `TPM`           | minute | unlimited    |
+| `DailyTokens`   | day    | unlimited    |
+| `MonthlyTokens` | month  | unlimited    |
+
+A zero value for any dimension means **unlimited** for that dimension. Limits attach to the key
+(`store.APIKey.Limits`): a `nil` override means "use the global defaults" (`--default-rpm`,
+`--default-tpm`, … / `QuotaConfig`); a non-nil value overrides the defaults wholesale. Limits are
+read fresh from the store on every request, so changes take effect without a restart. They are
+managed with `agentgpu key quota set <id> [--rpm …] [--tpm …] [--daily-tokens …]
+[--monthly-tokens …] [--clear]`, and inspected with `agentgpu key quota <id>`.
+
+### Reset windows
+
+Windows are **fixed/calendar windows aligned to UTC boundaries**, not continuously sliding: when
+the clock crosses a boundary the allowance fully resets. The boundaries are:
+
+- **minute** — the start of the UTC minute (RPM, TPM)
+- **day** — UTC midnight, `00:00:00 UTC` (daily token budget)
+- **month** — the 1st of the month at `00:00:00 UTC` (monthly token budget)
+
+Token counts come from `JobResult.Tokens`, reported by the worker. The stub echo executor reports
+the number of whitespace-separated tokens in its output so accounting is testable today; real
+counts arrive with the Ollama integration.
+
+### Persistence
+
+Per-key **limits** change rarely and are persisted with the key in the JSON key store. Per-request
+**counters** live in an in-memory, concurrency-safe `CounterStore` (a single mutex serializes
+check-and-increment so counts stay exact under concurrency). To survive restarts without per-request
+disk writes, the server **checkpoints** the counters to a JSON file (`--quota-path` /
+`AGENTGPU_QUOTA_PATH`, default `~/.agentgpu/quota.json`) periodically and on graceful shutdown, and
+loads the checkpoint on startup — rolling any windows that expired while the process was down. The
+interface is shaped so a Redis-backed counter store (atomic `INCR` per window key) can slot in later
+without touching the engine.
+
 ## State
 
 Authentication, permission rules, and quota counters are persisted so they survive restarts.
