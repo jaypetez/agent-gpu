@@ -43,6 +43,16 @@ type APIKey struct {
 	// RevokedAt, when non-nil, marks the key as revoked; revoked keys never
 	// authenticate.
 	RevokedAt *time.Time
+	// Roles are the built-in role names granted to this key (e.g. "admin",
+	// "user", "read-only"). The authorization engine (#3) interprets them; the
+	// store only persists them.
+	Roles []string
+	// AllowModels is the per-key allow-list of model names. A model present here
+	// is permitted (subject to role/deny precedence — see internal/authz).
+	AllowModels []string
+	// DenyModels is the per-key deny-list of model names. Deny always wins over
+	// any allow or role grant.
+	DenyModels []string
 }
 
 // Revoked reports whether the key has been revoked.
@@ -90,6 +100,15 @@ func cloneAPIKey(k APIKey) APIKey {
 	if k.RevokedAt != nil {
 		t := *k.RevokedAt
 		out.RevokedAt = &t
+	}
+	if k.Roles != nil {
+		out.Roles = append([]string(nil), k.Roles...)
+	}
+	if k.AllowModels != nil {
+		out.AllowModels = append([]string(nil), k.AllowModels...)
+	}
+	if k.DenyModels != nil {
+		out.DenyModels = append([]string(nil), k.DenyModels...)
 	}
 	return out
 }

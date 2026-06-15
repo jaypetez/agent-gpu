@@ -85,6 +85,41 @@ For each job the scheduler scores candidate workers by:
 If no worker currently fits, the job is **queued** (never silently dropped) and re-evaluated as
 capacity frees up. Queue depth and per-worker load are exported as metrics.
 
+## Permissions
+
+Authentication (who you are, `internal/auth`) and authorization (what you may do,
+`internal/authz`) are deliberately separate. Once a request is authenticated, the authorizer
+decides whether the key may perform an **action** — `pull`, `load`, or `infer` — against a named
+model, mapping a refusal to `ErrForbidden` (the future HTTP 403, mirroring
+`ErrUnauthenticated` → 401).
+
+Each API key carries built-in **roles** plus per-key **allow** and **deny** model lists. Three
+roles ship today:
+
+| role        | pull | load | infer | scope                                            |
+| ----------- | ---- | ---- | ----- | ------------------------------------------------ |
+| `admin`     | yes  | yes  | yes   | all models (ignores allow/deny lists)            |
+| `user`      | yes  | yes  | yes   | only models on the key's allow-list              |
+| `read-only` | no   | no   | yes   | only models on the key's allow-list              |
+
+Access is **deny-by-default**: a key with no role and no allow-list can do nothing. Every decision
+is evaluated against a fixed, deny-wins **precedence order**, returning at the first rule that
+fires:
+
+1. model in the key's **deny-list** → **DENY**
+2. role `admin` → **ALLOW** (any model, any action)
+3. role forbids the action (e.g. `read-only` attempting pull/load) → **DENY**
+4. model in the key's **allow-list** (and a granting role is held) → **ALLOW**
+5. otherwise → **DENY**
+
+Every decision — granted or denied — is written to the structured audit log with the key id, model,
+operation, reason, and (where relevant) role. Denials log at `warn`, grants at `info`. Secrets,
+tokens, and hashes are never logged; only the opaque key id.
+
+Permissions are read fresh from the store on every check, so role and list changes take effect
+immediately without a restart. Until the admin HTTP endpoints land, roles and lists are managed
+with the `agentgpu key create` and `agentgpu key perms` CLI commands.
+
 ## State
 
 Authentication, permission rules, and quota counters are persisted so they survive restarts.

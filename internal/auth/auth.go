@@ -95,8 +95,16 @@ func NewService(st store.Store, opts ...Option) *Service {
 
 // Create generates a new key (id + secret + salt), persists only its salted
 // hash, and returns the one-time plaintext token. The plaintext is never stored
-// and cannot be recovered afterward.
+// and cannot be recovered afterward. The key is created with no roles or
+// model lists; use CreateWithPermissions (or SetPermissions) to grant access.
 func (s *Service) Create(ctx context.Context, name string) (token string, key store.APIKey, err error) {
+	return s.CreateWithPermissions(ctx, name, Permissions{})
+}
+
+// CreateWithPermissions is Create with initial roles and allow/deny lists
+// applied atomically at creation, so a key can be born with access rather than
+// requiring a follow-up SetPermissions call.
+func (s *Service) CreateWithPermissions(ctx context.Context, name string, perms Permissions) (token string, key store.APIKey, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -106,12 +114,15 @@ func (s *Service) Create(ctx context.Context, name string) (token string, key st
 	}
 
 	rec := store.APIKey{
-		ID:         id,
-		Name:       name,
-		Prefix:     Prefix,
-		SecretHash: hash,
-		Salt:       salt,
-		CreatedAt:  s.now().UTC(),
+		ID:          id,
+		Name:        name,
+		Prefix:      Prefix,
+		SecretHash:  hash,
+		Salt:        salt,
+		CreatedAt:   s.now().UTC(),
+		Roles:       perms.Roles,
+		AllowModels: perms.AllowModels,
+		DenyModels:  perms.DenyModels,
 	}
 	if err := s.store.PutAPIKey(ctx, rec); err != nil {
 		return "", store.APIKey{}, fmt.Errorf("auth: persist key: %w", err)
@@ -144,6 +155,40 @@ func (s *Service) Revoke(ctx context.Context, id string) error {
 		return fmt.Errorf("auth: persist revoke: %w", err)
 	}
 	return nil
+}
+
+// Permissions are the role and per-model allow/deny lists set on a key. They
+// are interpreted by internal/authz; this package only persists them.
+type Permissions struct {
+	Roles       []string
+	AllowModels []string
+	DenyModels  []string
+}
+
+// SetPermissions replaces a key's roles and allow/deny lists with the supplied
+// values (a full replace, not a merge), preserving the key's identity and
+// secret. It is the management seam used by the `key perms` CLI until the admin
+// HTTP endpoints (#4) exist. Setting permissions on an unknown key returns
+// store.ErrNotFound; nil slices clear the corresponding list.
+//
+// Because authorization reads the key fresh from the store on every check
+// (internal/authz caches nothing), a change here takes effect immediately with
+// no restart.
+func (s *Service) SetPermissions(ctx context.Context, id string, perms Permissions) (store.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.store.GetAPIKey(ctx, id)
+	if err != nil {
+		return store.APIKey{}, err
+	}
+	rec.Roles = perms.Roles
+	rec.AllowModels = perms.AllowModels
+	rec.DenyModels = perms.DenyModels
+	if err := s.store.PutAPIKey(ctx, rec); err != nil {
+		return store.APIKey{}, fmt.Errorf("auth: persist permissions: %w", err)
+	}
+	return rec, nil
 }
 
 // Rotate atomically replaces a key's secret and salt while preserving its id

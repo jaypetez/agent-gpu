@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
@@ -81,6 +82,7 @@ type Server struct {
 
 	log   *slog.Logger
 	store store.Store
+	authz *authz.Authorizer
 
 	mu      sync.RWMutex
 	workers map[string]*worker // by worker id
@@ -108,6 +110,16 @@ func WithStore(st store.Store) Option {
 	}
 }
 
+// WithAuthorizer sets the authorization engine used to gate job dispatch.
+// Defaults to an Authorizer logging through the server's logger.
+func WithAuthorizer(a *authz.Authorizer) Option {
+	return func(s *Server) {
+		if a != nil {
+			s.authz = a
+		}
+	}
+}
+
 // New constructs a Server.
 func New(opts ...Option) *Server {
 	s := &Server{
@@ -117,6 +129,11 @@ func New(opts ...Option) *Server {
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	// Default the authorizer to one auditing through the (possibly overridden)
+	// server logger, after options have run.
+	if s.authz == nil {
+		s.authz = authz.NewAuthorizer(authz.WithLogger(s.log))
 	}
 	return s
 }
@@ -256,9 +273,35 @@ func (s *Server) pickWorker() (*worker, bool) {
 	return nil, false
 }
 
+// SubmitAuthorizedJob authorizes an already-authenticated key for inference on
+// job.Model and, if permitted, dispatches the job. It is the enforcement seam
+// for the request path (#13), whose flow is:
+//
+//	key, err := auth.Authenticate(ctx, token)   // 401 on err
+//	res, err := srv.SubmitAuthorizedJob(ctx, key, job) // 403 on authz.ErrForbidden
+//
+// Authorization reads the key's current roles/lists (the caller passes the key
+// freshly read by Authenticate), so permission changes take effect without a
+// restart. A forbidden job is never handed to a worker; the error is
+// authz.ErrForbidden.
+//
+// NOTE (#11): the pull/load operations have no dispatch path yet. When they
+// land, gate them the same way with authz.Pull / authz.Load before touching a
+// worker.
+func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job types.Job) (types.JobResult, error) {
+	if err := job.Validate(); err != nil {
+		return types.JobResult{}, err
+	}
+	if err := s.authz.Authorize(ctx, key, job.Model, authz.Infer); err != nil {
+		return types.JobResult{}, err
+	}
+	return s.SubmitJob(ctx, job)
+}
+
 // SubmitJob dispatches a job to a connected worker and waits for the result.
-// This is the minimal foundational dispatch path; queueing and capacity-aware
-// scheduling are out of scope for issue #1.
+// This is the minimal foundational dispatch primitive with no authorization;
+// callers on the public request path must use SubmitAuthorizedJob so inference
+// is gated. Queueing and capacity-aware scheduling remain out of scope.
 func (s *Server) SubmitJob(ctx context.Context, job types.Job) (types.JobResult, error) {
 	if err := job.Validate(); err != nil {
 		return types.JobResult{}, err

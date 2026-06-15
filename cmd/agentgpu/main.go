@@ -60,10 +60,11 @@ func usage() {
 Usage:
   agentgpu server start [--listen host:port]
   agentgpu worker start --server host:port [--id worker-id]
-  agentgpu key create --name <name> [--store path]
+  agentgpu key create --name <name> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--store path]
   agentgpu key list [--store path]
   agentgpu key revoke <id> [--store path]
   agentgpu key rotate <id> [--store path]
+  agentgpu key perms <id> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--store path]
 
 Configuration may also be supplied via environment variables:
   AGENTGPU_SERVER_LISTEN, AGENTGPU_SERVER_ADDR, AGENTGPU_WORKER_ID,
