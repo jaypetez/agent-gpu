@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -168,13 +169,36 @@ func TestControlPlaneRoundTrip(t *testing.T) {
 	}
 }
 
-// TestNoWorkersIsError verifies SubmitJob fails cleanly with no workers.
-func TestNoWorkersIsError(t *testing.T) {
+// TestNoWorkerQueuesAndBlocks verifies the capacity-aware behavior change (#9):
+// with no runnable worker a submitted job is QUEUED (not dropped with
+// ErrNoWorkers) and the caller blocks until a worker appears or its context is
+// done. With no worker ever appearing, a bounded-context submit times out, and
+// the job is observable in the queue while the caller waits.
+func TestNoWorkerQueuesAndBlocks(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
-	_, err := h.srv.SubmitJob(context.Background(), types.Job{ID: "j", Model: "m"})
-	if err != server.ErrNoWorkers {
-		t.Fatalf("err = %v, want ErrNoWorkers", err)
+	defer func() { _ = h.srv.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	// The job is enqueued; observe it in the queue while the caller blocks.
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.srv.SubmitJob(ctx, types.Job{ID: "j", Model: "m"})
+		done <- err
+	}()
+	waitFor(t, 2*time.Second, "job queued", func() bool {
+		return h.srv.QueueStats().Total == 1
+	})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued submit did not unblock on context deadline")
 	}
 }
 

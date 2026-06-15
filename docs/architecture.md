@@ -75,15 +75,78 @@ sequenceDiagram
 
 ## Capacity-aware scheduling
 
-For each job the scheduler scores candidate workers by:
+The scheduler (`internal/scheduler`) is the placement core: a **pure, deterministic** function that,
+given a fleet snapshot (`Server.Fleet()`) and a target model, picks the best-fit worker. The server
+consults it on every dispatch and from the background placement loop. Keeping the math pure (no
+clock, no locks, no map-iteration-order dependence) makes the decision reproducible and unit-testable
+in isolation from the server's concurrency.
 
-1. **Model availability** — prefer workers that already have the model loaded.
-2. **Free VRAM** — the model must fit; larger models go only where they fit.
-3. **Current load / active jobs** — spread work and avoid hotspots.
-4. **API-key priority** — higher-priority keys win under contention.
+### Runnable candidates
 
-If no worker currently fits, the job is **queued** (never silently dropped) and re-evaluated as
-capacity frees up. Queue depth and per-worker load are exported as metrics.
+A worker is a candidate for a model only when it is **Online** (never `Draining` or `Stale` — the
+liveness state computed in the fleet view) **and** it can plausibly run the model: either it already
+has the model loaded **or** it reports free VRAM to load it.
+
+### Scoring weights (highest influence first)
+
+`Score(worker, model)` sums weighted terms, ordered by orders of magnitude so a higher term can never
+be outweighed by the sum of every lower term in its expected range:
+
+1. **Model already loaded** — *dominates everything else.* Reusing a loaded model avoids a cold
+   load/reload, the single biggest latency win available today.
+2. **More free VRAM** — headroom to load and run without thrashing.
+3. **Lower load** — the worker's reported 0–100 utilization; prefer the least-busy GPU.
+4. **Fewer active jobs** — final tie-break on raw concurrency.
+
+`Pick` filters to runnable candidates, scores each, and returns the highest. **Ties are broken by
+worker ID (ascending)** so the choice is stable across calls.
+
+### Fit approximation (no model-size data yet)
+
+There is no per-model VRAM-requirement data yet (real GPU/model-size detection is #16), so "fit" is
+approximated as **`FreeVRAM > 0`** (or the model already being loaded). When real footprints land, the
+runnability filter and the VRAM term should compare against the model's actual size rather than a
+non-zero check.
+
+### API-key priority under contention
+
+Priority is carried by the **queue** (higher priority dequeued first), not by the scoring function.
+The per-job priority is derived from the owning key's roles at enqueue time by
+`scheduler.PriorityForRoles`, the single centralized (interim) mapping until an explicit per-key
+priority field exists:
+
+| Roles | Queue priority |
+| --- | --- |
+| `admin` | `PriorityHigh` |
+| `user` | `PriorityNormal` |
+| `read-only` / no roles | `PriorityLow` |
+
+(When a key holds several roles, the highest-implied priority wins.) Keyless internal submits default
+to `PriorityNormal`.
+
+### Queue-on-miss and re-evaluation
+
+If no worker fits at submit time the job is **queued, never silently dropped**, and the caller blocks
+on a server-level waiter keyed by job ID. A background **placement loop** (mirroring the eviction
+loop's `Start`/`Close` lifecycle, clock-injected) dequeues the highest-priority job, waits for a
+runnable worker, dispatches it, and resolves the same waiter the caller holds — so each queued job is
+dispatched **exactly once**. The loop is woken promptly by a coalescing **capacity signal** raised
+whenever capacity may have increased (a heartbeat applied, a job completed, a worker registered), with
+a bounded periodic re-check as a backstop. A bounded queue at depth rejects further submits with
+`queue.ErrQueueFull` (backpressure) rather than blocking; a cancelled caller drops its waiter so
+nothing leaks, and shutdown releases any still-blocked callers.
+
+`Server.QueueStats()` exposes queue depth (total + per-priority breakdown) and enqueue/placement
+events are logged via structured `slog` (`key_id`, `model`, `priority`, `reason`; never secrets).
+
+### Future work
+
+- **Anti-starvation / aging.** Strict priority can starve low-priority jobs under sustained
+  contention; aging a job's effective priority by its queue wait time is the planned mitigation.
+- **Real VRAM-fit.** Replace the `FreeVRAM > 0` approximation with a comparison against each model's
+  actual VRAM footprint once model-size detection (#16) lands.
+- **Metrics export.** Queue depth and per-worker load become Prometheus metrics in #24; today they
+  are plain methods (`QueueStats`) and structured logs.
 
 ## Job queue
 
