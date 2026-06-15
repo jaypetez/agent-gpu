@@ -85,6 +85,35 @@ For each job the scheduler scores candidate workers by:
 If no worker currently fits, the job is **queued** (never silently dropped) and re-evaluated as
 capacity frees up. Queue depth and per-worker load are exported as metrics.
 
+## Job queue
+
+The global job queue (`internal/queue`) is the in-memory holding area the capacity-aware scheduler
+draws from. It is a standalone, concurrency-safe data structure — it owns ordering and backpressure;
+it does **not** choose which worker runs a job (that is the scheduler's job) and is not wired into
+the dispatch path here.
+
+- **Priority then FIFO.** Three named levels — `PriorityLow` (0), `PriorityNormal` (1, the default),
+  `PriorityHigh` (2) — where **higher value is served first**. Within a single level, jobs are served
+  strictly first-in-first-out. FIFO-within-level is guaranteed by a monotonic per-queue sequence
+  number stamped at enqueue time, so equal-priority jobs always leave in the order they arrived
+  regardless of goroutine scheduling. The backing store is a binary heap ordered by
+  *(priority descending, sequence ascending)*.
+- **Backpressure.** A queue may be bounded with `WithMaxDepth(n)` (`n <= 0` means unbounded). When a
+  bounded queue is full, `Enqueue` does **not** block the caller — it returns `ErrQueueFull`
+  immediately, the typed seam the request path maps to an explicit 503/429 rather than stalling.
+- **Blocking dequeue.** `Dequeue` is non-blocking and reports whether an item was available.
+  `DequeueWait(ctx)` blocks (on a condition variable) until an item is available, the context is done
+  (returns `ctx.Err()`), or the queue is closed (returns `ErrClosed`) — the seam the scheduler loop
+  parks on.
+- **Observable depth.** `Len()` returns the total pending count and `Stats()` returns the total plus
+  a per-priority breakdown. (Prometheus export is #24; the queue exposes plain methods, not a metrics
+  hook.)
+- **Concurrency.** All state is guarded by a single mutex paired with a condition variable, so
+  enqueue and dequeue are fully atomic: under concurrency no job is lost and none is dequeued twice.
+  `Close()` wakes every blocked waiter and is idempotent.
+
+The queue is in-memory only and starts empty on every restart; persistence is out of scope.
+
 ## Worker lifecycle / heartbeats
 
 Each worker holds one long-lived bidirectional stream to the server and moves through a small
