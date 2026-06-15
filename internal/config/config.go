@@ -5,6 +5,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 )
 
 // Environment variable names.
@@ -12,6 +13,7 @@ const (
 	EnvServerListen = "AGENTGPU_SERVER_LISTEN"
 	EnvWorkerServer = "AGENTGPU_SERVER_ADDR"
 	EnvWorkerID     = "AGENTGPU_WORKER_ID"
+	EnvStorePath    = "AGENTGPU_STORE_PATH"
 )
 
 // Defaults.
@@ -56,6 +58,33 @@ func ResolveServer(flags ServerConfig, look EnvLookup) ServerConfig {
 		out.Listen = envOr(look, EnvServerListen, DefaultServerListen)
 	}
 	return out
+}
+
+// DefaultStorePath returns the default keys-file location, ~/.agentgpu/keys.json,
+// using homeDir (os.UserHomeDir if nil) to resolve the home directory. If the
+// home directory cannot be determined it falls back to a relative path so the
+// CLI still works in constrained environments.
+func DefaultStorePath(homeDir func() (string, error)) string {
+	if homeDir == nil {
+		homeDir = os.UserHomeDir
+	}
+	home, err := homeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".agentgpu", "keys.json")
+	}
+	return filepath.Join(home, ".agentgpu", "keys.json")
+}
+
+// ResolveStorePath resolves the keys-file path with flag > env > default
+// precedence. An empty flag value means "unset".
+func ResolveStorePath(flagValue string, look EnvLookup, homeDir func() (string, error)) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvStorePath, DefaultStorePath(homeDir))
 }
 
 // ResolveWorker applies env-then-default resolution to a WorkerConfig.

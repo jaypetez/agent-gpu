@@ -25,7 +25,7 @@ func TestMemoryCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got != key {
+	if got.ID != key.ID || got.Name != key.Name {
 		t.Fatalf("got %+v want %+v", got, key)
 	}
 

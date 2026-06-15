@@ -1,6 +1,12 @@
 package config
 
-import "testing"
+import (
+	"errors"
+	"path/filepath"
+	"testing"
+)
+
+var errHome = errors.New("no home")
 
 func env(m map[string]string) EnvLookup {
 	return func(k string) (string, bool) {
@@ -30,6 +36,42 @@ func TestResolveServer(t *testing.T) {
 		got := ResolveServer(ServerConfig{Listen: "1.2.3.4:1"}, env(map[string]string{EnvServerListen: "0.0.0.0:9000"}))
 		if got.Listen != "1.2.3.4:1" {
 			t.Fatalf("Listen = %q, want flag value", got.Listen)
+		}
+	})
+}
+
+func TestResolveStorePath(t *testing.T) {
+	t.Parallel()
+	home := func() (string, error) { return "/home/u", nil }
+	wantDefault := filepath.Join("/home/u", ".agentgpu", "keys.json")
+
+	t.Run("default uses home dir", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveStorePath("", env(nil), home)
+		if got != wantDefault {
+			t.Fatalf("got %q, want default %q", got, wantDefault)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveStorePath("", env(map[string]string{EnvStorePath: "/tmp/k.json"}), home)
+		if got != "/tmp/k.json" {
+			t.Fatalf("got %q, want env value", got)
+		}
+	})
+	t.Run("flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveStorePath("/flag/k.json", env(map[string]string{EnvStorePath: "/tmp/k.json"}), home)
+		if got != "/flag/k.json" {
+			t.Fatalf("got %q, want flag value", got)
+		}
+	})
+	t.Run("home error falls back to relative path", func(t *testing.T) {
+		t.Parallel()
+		badHome := func() (string, error) { return "", errHome }
+		got := ResolveStorePath("", env(nil), badHome)
+		if got != filepath.Join(".agentgpu", "keys.json") {
+			t.Fatalf("got %q, want relative fallback", got)
 		}
 	})
 }
