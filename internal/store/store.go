@@ -12,19 +12,41 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // ErrNotFound is returned when a requested record does not exist.
 var ErrNotFound = errors.New("store: not found")
 
-// APIKey is a stored API credential. Fields beyond the identifier are added by
-// the auth epic; for now this is just enough to exercise the seam.
+// APIKey is a stored API credential. The secret itself is NEVER stored: only a
+// salted hash and its salt are persisted, so a leaked store cannot be used to
+// recover usable tokens. The auth epic (#2) owns the lifecycle that populates
+// these fields; permissions and quotas (#3, #6) attach to the key by ID.
 type APIKey struct {
-	// ID is the opaque key identifier (not the secret itself).
+	// ID is the opaque, public key identifier (the "keyid" in the token). It is
+	// stored in plaintext and used for O(1) lookup; it is NOT the secret.
 	ID string
 	// Name is a human-readable label for the key.
 	Name string
+	// Prefix is the token namespace prefix (e.g. "agpu").
+	Prefix string
+	// SecretHash is SHA-256(Salt || secret). The plaintext secret is never stored.
+	SecretHash []byte
+	// Salt is the per-key random salt mixed into SecretHash.
+	Salt []byte
+	// CreatedAt is when the key was first created.
+	CreatedAt time.Time
+	// LastUsedAt is the timestamp of the most recent successful authentication.
+	LastUsedAt time.Time
+	// UsageCount is the number of successful authentications.
+	UsageCount uint64
+	// RevokedAt, when non-nil, marks the key as revoked; revoked keys never
+	// authenticate.
+	RevokedAt *time.Time
 }
+
+// Revoked reports whether the key has been revoked.
+func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
 
 // Store is the persistence interface for control-plane state. Implementations
 // must be safe for concurrent use. Real backends (Redis/Postgres) and the
@@ -55,11 +77,28 @@ func NewMemory() *Memory {
 	return &Memory{keys: make(map[string]APIKey)}
 }
 
+// cloneAPIKey returns a deep copy so that callers and the store never share
+// mutable backing arrays (the secret-hash/salt slices, the revoked pointer).
+func cloneAPIKey(k APIKey) APIKey {
+	out := k
+	if k.SecretHash != nil {
+		out.SecretHash = append([]byte(nil), k.SecretHash...)
+	}
+	if k.Salt != nil {
+		out.Salt = append([]byte(nil), k.Salt...)
+	}
+	if k.RevokedAt != nil {
+		t := *k.RevokedAt
+		out.RevokedAt = &t
+	}
+	return out
+}
+
 // PutAPIKey implements Store.
 func (m *Memory) PutAPIKey(_ context.Context, key APIKey) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.keys[key.ID] = key
+	m.keys[key.ID] = cloneAPIKey(key)
 	return nil
 }
 
@@ -71,7 +110,7 @@ func (m *Memory) GetAPIKey(_ context.Context, id string) (APIKey, error) {
 	if !ok {
 		return APIKey{}, ErrNotFound
 	}
-	return k, nil
+	return cloneAPIKey(k), nil
 }
 
 // ListAPIKeys implements Store.
@@ -80,7 +119,7 @@ func (m *Memory) ListAPIKeys(_ context.Context) ([]APIKey, error) {
 	defer m.mu.RUnlock()
 	out := make([]APIKey, 0, len(m.keys))
 	for _, k := range m.keys {
-		out = append(out, k)
+		out = append(out, cloneAPIKey(k))
 	}
 	return out, nil
 }

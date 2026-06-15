@@ -43,6 +43,8 @@ func run(args []string) error {
 		return runServerCmd(ctx, logger, args[1:])
 	case "worker":
 		return runWorkerCmd(ctx, logger, args[1:])
+	case "key":
+		return runKeyCmd(ctx, os.Stdout, args[1:])
 	case "-h", "--help", "help":
 		usage()
 		return nil
@@ -58,8 +60,13 @@ func usage() {
 Usage:
   agentgpu server start [--listen host:port]
   agentgpu worker start --server host:port [--id worker-id]
+  agentgpu key create --name <name> [--store path]
+  agentgpu key list [--store path]
+  agentgpu key revoke <id> [--store path]
+  agentgpu key rotate <id> [--store path]
 
 Configuration may also be supplied via environment variables:
-  AGENTGPU_SERVER_LISTEN, AGENTGPU_SERVER_ADDR, AGENTGPU_WORKER_ID
+  AGENTGPU_SERVER_LISTEN, AGENTGPU_SERVER_ADDR, AGENTGPU_WORKER_ID,
+  AGENTGPU_STORE_PATH
 `)
 }
