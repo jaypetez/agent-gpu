@@ -114,9 +114,10 @@ type Worker struct {
 	cfg Config
 	rng *rand.Rand
 
-	// onConnect, if set, is invoked after each successful registration ack.
-	// Used by tests to observe (re)connection events.
-	onConnect func()
+	// onConnect, if set, is invoked after each successful registration ack with
+	// the session ID returned by the server. Used by tests to observe
+	// (re)connection events and assert per-session invariants.
+	onConnect func(sessionID string)
 }
 
 // New constructs a Worker from config.
@@ -129,8 +130,9 @@ func New(cfg Config) *Worker {
 }
 
 // OnConnect registers a callback invoked after each successful registration
-// ack. Primarily for tests observing (re)connection events.
-func (w *Worker) OnConnect(fn func()) { w.onConnect = fn }
+// ack with the assigned session ID. Primarily for tests observing
+// (re)connection events.
+func (w *Worker) OnConnect(fn func(sessionID string)) { w.onConnect = fn }
 
 // Run connects to the server and serves the control stream, reconnecting with
 // exponential backoff until ctx is cancelled. It returns ctx.Err() on
@@ -142,7 +144,11 @@ func (w *Worker) Run(ctx context.Context) error {
 			return err
 		}
 
-		err := w.runOnce(ctx)
+		// resetBackoff is invoked once runOnce successfully registers, so a
+		// long-lived worker that hits a transient drop reconnects promptly
+		// instead of inheriting a near-max backoff from earlier failures.
+		resetBackoff := func() { attempt = 0 }
+		err := w.runOnce(ctx, resetBackoff)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -176,16 +182,24 @@ func (w *Worker) dial(ctx context.Context) (*grpc.ClientConn, error) {
 }
 
 // runOnce performs one full connect → register → serve cycle. It returns when
-// the stream drops or ctx is cancelled.
-func (w *Worker) runOnce(ctx context.Context) error {
-	conn, err := w.dial(ctx)
+// the stream drops or ctx is cancelled. resetBackoff, if non-nil, is invoked
+// once registration succeeds so the caller can reset reconnect backoff.
+func (w *Worker) runOnce(ctx context.Context, resetBackoff func()) error {
+	// Scope a cancellable context to this connection so the stream and any
+	// goroutines spawned in serve are torn down when this cycle ends — without
+	// this, every reconnect would leak the previous cycle's goroutines because
+	// they would only observe the long-lived Run context.
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	conn, err := w.dial(cctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
 	client := agentgpuv1.NewControlPlaneClient(conn)
-	stream, err := client.Connect(ctx)
+	stream, err := client.Connect(cctx)
 	if err != nil {
 		return err
 	}
@@ -209,16 +223,23 @@ func (w *Worker) runOnce(ctx context.Context) error {
 		return errors.New("worker: expected RegisterAck after Register")
 	}
 	w.cfg.Logger.Info("registered with server", "worker", w.cfg.WorkerID, "session", ack.GetRegisterAck().GetSessionId())
+	if resetBackoff != nil {
+		resetBackoff()
+	}
 	if w.onConnect != nil {
-		w.onConnect()
+		w.onConnect(ack.GetRegisterAck().GetSessionId())
 	}
 
-	return w.serve(ctx, stream)
+	return w.serve(cctx, stream)
 }
 
 // serve runs the heartbeat loop and processes dispatched jobs until the stream
 // drops. The receive loop runs in its own goroutine; this method owns all
 // Sends (heartbeats and job results) to keep stream writes single-threaded.
+//
+// ctx must be the per-connection context (cancelled by runOnce on return), so
+// the spawned goroutines are torn down when this connection ends rather than
+// leaking until the long-lived Run context is cancelled.
 func (w *Worker) serve(ctx context.Context, stream agentgpuv1.ControlPlane_ConnectClient) error {
 	results := make(chan types.JobResult, 8)
 	recvErr := make(chan error, 1)

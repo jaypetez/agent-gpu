@@ -162,11 +162,10 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		pending: make(map[string]chan types.JobResult),
 	}
 
-	s.addWorker(w)
+	ses := s.addWorker(w)
 	defer s.removeWorker(w)
 
-	s.nextSes++
-	sessionID := fmt.Sprintf("%s-%d", w.id, s.nextSes)
+	sessionID := fmt.Sprintf("%s-%d", w.id, ses)
 	w.send <- &agentgpuv1.ServerMessage{
 		Payload: &agentgpuv1.ServerMessage_RegisterAck{
 			RegisterAck: &agentgpuv1.RegisterAck{SessionId: sessionID},
@@ -222,10 +221,17 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 	}
 }
 
-func (s *Server) addWorker(w *worker) {
+// addWorker registers the worker and returns its monotonic session number.
+// The increment happens under the same lock that guards the registry, so
+// concurrent Connect goroutines cannot race on nextSes or hand out duplicate
+// session IDs.
+func (s *Server) addWorker(w *worker) uint64 {
 	s.mu.Lock()
+	s.nextSes++
+	ses := s.nextSes
 	s.workers[w.id] = w
 	s.mu.Unlock()
+	return ses
 }
 
 func (s *Server) removeWorker(w *worker) {
@@ -264,8 +270,18 @@ func (s *Server) SubmitJob(ctx context.Context, job types.Job) (types.JobResult,
 	}
 
 	resCh := w.addPending(job.ID)
-	w.send <- &agentgpuv1.ServerMessage{
+	// Hand the job to the worker's writer goroutine. Use select so a cancelled
+	// caller (or a writer goroutine that has already exited) does not block us
+	// forever on a full or unread send channel.
+	select {
+	case w.send <- &agentgpuv1.ServerMessage{
 		Payload: &agentgpuv1.ServerMessage_Job{Job: job.Proto()},
+	}:
+	case <-ctx.Done():
+		w.mu.Lock()
+		delete(w.pending, job.ID)
+		w.mu.Unlock()
+		return types.JobResult{}, ctx.Err()
 	}
 
 	select {

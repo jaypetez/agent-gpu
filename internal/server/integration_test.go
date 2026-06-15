@@ -2,7 +2,9 @@ package server_test
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -88,10 +90,14 @@ func waitFor(t *testing.T, d time.Duration, msg string, cond func() bool) {
 	t.Fatalf("timeout waiting for: %s", msg)
 }
 
-func newWorker(h *harness, onConnect func()) *worker.Worker {
+func newWorker(h *harness, onConnect func(sessionID string)) *worker.Worker {
+	return newWorkerID(h, "worker-1", onConnect)
+}
+
+func newWorkerID(h *harness, id string, onConnect func(sessionID string)) *worker.Worker {
 	w := worker.New(worker.Config{
 		ServerAddr:        "bufconn",
-		WorkerID:          "worker-1",
+		WorkerID:          id,
 		Models:            []types.Model{{Name: "llama3"}},
 		HeartbeatInterval: 20 * time.Millisecond,
 		Backoff:           worker.Backoff{Base: 5 * time.Millisecond, Max: 50 * time.Millisecond, Factor: 2.0},
@@ -157,7 +163,7 @@ func TestReconnectAfterDrop(t *testing.T) {
 	defer cancel()
 
 	var connects int32
-	w := newWorker(h, func() { atomic.AddInt32(&connects, 1) })
+	w := newWorker(h, func(string) { atomic.AddInt32(&connects, 1) })
 	go func() { _ = w.Run(ctx) }()
 
 	// First connection.
@@ -187,4 +193,101 @@ func TestReconnectAfterDrop(t *testing.T) {
 	if res.Output != "echo: pong" {
 		t.Fatalf("post-reconnect output = %q", res.Output)
 	}
+}
+
+// TestConcurrentWorkersUniqueSessions connects many workers concurrently and
+// asserts each receives a distinct session ID. This is the end-to-end guard
+// for the nextSes data race: concurrent Connect goroutines must not hand out
+// duplicate session numbers. Run with -race to catch the underlying race.
+func TestConcurrentWorkersUniqueSessions(t *testing.T) {
+	h := newHarness(t)
+	defer h.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const n = 16
+
+	var mu sync.Mutex
+	sessions := make(map[string]bool)
+	var connects int32
+
+	for i := 0; i < n; i++ {
+		w := newWorkerID(h, fmt.Sprintf("worker-%d", i), func(sessionID string) {
+			mu.Lock()
+			if sessions[sessionID] {
+				mu.Unlock()
+				t.Errorf("duplicate session id handed out: %q", sessionID)
+				return
+			}
+			sessions[sessionID] = true
+			mu.Unlock()
+			atomic.AddInt32(&connects, 1)
+		})
+		go func() { _ = w.Run(ctx) }()
+	}
+
+	waitFor(t, 5*time.Second, "all workers to register", func() bool {
+		return atomic.LoadInt32(&connects) == n && h.srv.WorkerCount() == n
+	})
+
+	mu.Lock()
+	got := len(sessions)
+	mu.Unlock()
+	if got != n {
+		t.Fatalf("expected %d unique session ids, got %d", n, got)
+	}
+}
+
+// TestNoGoroutineLeakAcrossReconnects guards the per-connection goroutine
+// teardown: every reconnect cycle spawns receive/job-worker/writer goroutines,
+// and before the fix the job-worker goroutine only observed the long-lived Run
+// context, leaking one goroutine per reconnect. After many forced reconnects
+// the live goroutine count must return near its baseline.
+func TestNoGoroutineLeakAcrossReconnects(t *testing.T) {
+	h := newHarness(t)
+	defer h.close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var connects int32
+	w := newWorkerID(h, "leak-worker", func(string) { atomic.AddInt32(&connects, 1) })
+	go func() { _ = w.Run(ctx) }()
+
+	waitFor(t, 2*time.Second, "initial registration", func() bool {
+		return atomic.LoadInt32(&connects) >= 1 && h.srv.WorkerCount() == 1
+	})
+
+	// Let startup goroutines settle, then snapshot the baseline.
+	time.Sleep(100 * time.Millisecond)
+	runtime.GC()
+	baseline := runtime.NumGoroutine()
+
+	const cycles = 50
+	for i := 0; i < cycles; i++ {
+		prev := atomic.LoadInt32(&connects)
+		h.dropConnection()
+		waitFor(t, 5*time.Second, fmt.Sprintf("reconnect %d", i), func() bool {
+			return atomic.LoadInt32(&connects) > prev && h.srv.WorkerCount() == 1
+		})
+	}
+
+	// Allow the final cycle's torn-down goroutines to exit.
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+	after := runtime.NumGoroutine()
+
+	// Tolerance covers scheduler jitter and transient gRPC goroutines; a real
+	// leak grows ~1 (or more) per cycle and would blow far past this.
+	const tolerance = 15
+	if after > baseline+tolerance {
+		t.Fatalf("goroutine leak across %d reconnects: baseline=%d after=%d (delta=%d, tolerance=%d)",
+			cycles, baseline, after, after-baseline, tolerance)
+	}
+
+	// Stop the worker and ensure Run unwinds cleanly.
+	cancel()
+	waitFor(t, 2*time.Second, "worker registry to drain", func() bool {
+		return h.srv.WorkerCount() == 0
+	})
 }
