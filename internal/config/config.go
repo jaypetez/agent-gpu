@@ -6,20 +6,28 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Environment variable names.
 const (
-	EnvServerListen = "AGENTGPU_SERVER_LISTEN"
-	EnvWorkerServer = "AGENTGPU_SERVER_ADDR"
-	EnvWorkerID     = "AGENTGPU_WORKER_ID"
-	EnvStorePath    = "AGENTGPU_STORE_PATH"
-	EnvQuotaPath    = "AGENTGPU_QUOTA_PATH"
+	EnvServerListen      = "AGENTGPU_SERVER_LISTEN"
+	EnvWorkerServer      = "AGENTGPU_SERVER_ADDR"
+	EnvWorkerID          = "AGENTGPU_WORKER_ID"
+	EnvStorePath         = "AGENTGPU_STORE_PATH"
+	EnvQuotaPath         = "AGENTGPU_QUOTA_PATH"
+	EnvHeartbeatInterval = "AGENTGPU_HEARTBEAT_INTERVAL"
+	EnvHeartbeatTimeout  = "AGENTGPU_HEARTBEAT_TIMEOUT"
 )
 
 // Defaults.
 const (
 	DefaultServerListen = "127.0.0.1:50051"
+	// DefaultHeartbeatInterval is the worker's heartbeat cadence.
+	DefaultHeartbeatInterval = 15 * time.Second
+	// DefaultHeartbeatTimeout is the server's stale-eviction window (3x the
+	// interval, so a single dropped heartbeat does not evict a live worker).
+	DefaultHeartbeatTimeout = 45 * time.Second
 )
 
 // ServerConfig configures the server process.
@@ -65,6 +73,18 @@ func envOr(look EnvLookup, key, fallback string) string {
 	return fallback
 }
 
+// durationEnvOr returns the duration parsed from the env value if set and
+// parseable, else the fallback. An unparseable value falls back silently so a
+// typo cannot wedge startup.
+func durationEnvOr(look EnvLookup, key string, fallback time.Duration) time.Duration {
+	if v, ok := look(key); ok && v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return fallback
+}
+
 // ResolveServer applies env-then-default resolution to a ServerConfig whose
 // fields hold flag values (empty meaning "unset"). The CLI layer passes flag
 // values in; this fills the gaps from the environment and defaults.
@@ -77,6 +97,30 @@ func ResolveServer(flags ServerConfig, look EnvLookup) ServerConfig {
 		out.Listen = envOr(look, EnvServerListen, DefaultServerListen)
 	}
 	return out
+}
+
+// ResolveHeartbeatInterval resolves the worker heartbeat cadence with flag >
+// env > default precedence. A non-positive flag value means "unset".
+func ResolveHeartbeatInterval(flagValue time.Duration, look EnvLookup) time.Duration {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return durationEnvOr(look, EnvHeartbeatInterval, DefaultHeartbeatInterval)
+}
+
+// ResolveHeartbeatTimeout resolves the server stale-eviction window with flag >
+// env > default precedence. A non-positive flag value means "unset".
+func ResolveHeartbeatTimeout(flagValue time.Duration, look EnvLookup) time.Duration {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return durationEnvOr(look, EnvHeartbeatTimeout, DefaultHeartbeatTimeout)
 }
 
 // DefaultStorePath returns the default keys-file location, ~/.agentgpu/keys.json,

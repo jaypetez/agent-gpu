@@ -386,14 +386,28 @@ func (x *RegisterAck) GetSessionId() string {
 }
 
 // Heartbeat is sent periodically by the worker to prove liveness and report
-// lightweight load signals. Capacity-aware scheduling fields are added later.
+// load and capacity signals the server uses to mark workers stale and (in a
+// later epic, #9) to schedule. Real GPU detection arrives with #16; until then
+// workers report stub/configured capacity.
 type Heartbeat struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	WorkerId string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	// Number of jobs the worker is currently executing.
-	ActiveJobs    uint32 `protobuf:"varint,2,opt,name=active_jobs,json=activeJobs,proto3" json:"active_jobs,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ActiveJobs uint32 `protobuf:"varint,2,opt,name=active_jobs,json=activeJobs,proto3" json:"active_jobs,omitempty"`
+	// Total VRAM on the worker's GPU(s), in bytes (0 = unknown).
+	TotalVramBytes uint64 `protobuf:"varint,3,opt,name=total_vram_bytes,json=totalVramBytes,proto3" json:"total_vram_bytes,omitempty"`
+	// Currently free VRAM, in bytes (0 = unknown).
+	FreeVramBytes uint64 `protobuf:"varint,4,opt,name=free_vram_bytes,json=freeVramBytes,proto3" json:"free_vram_bytes,omitempty"`
+	// Coarse load signal in the range 0-100 (0 = idle, 100 = saturated).
+	Load uint32 `protobuf:"varint,5,opt,name=load,proto3" json:"load,omitempty"`
+	// Human-readable GPU type/description (e.g. "NVIDIA RTX 4090"); empty if
+	// unknown.
+	GpuType string `protobuf:"bytes,6,opt,name=gpu_type,json=gpuType,proto3" json:"gpu_type,omitempty"`
+	// Models the worker currently has available to serve. Lets the server's
+	// fleet view reflect model availability without re-registration.
+	AvailableModels []*Model `protobuf:"bytes,7,rep,name=available_models,json=availableModels,proto3" json:"available_models,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Heartbeat) Reset() {
@@ -440,6 +454,88 @@ func (x *Heartbeat) GetActiveJobs() uint32 {
 	return 0
 }
 
+func (x *Heartbeat) GetTotalVramBytes() uint64 {
+	if x != nil {
+		return x.TotalVramBytes
+	}
+	return 0
+}
+
+func (x *Heartbeat) GetFreeVramBytes() uint64 {
+	if x != nil {
+		return x.FreeVramBytes
+	}
+	return 0
+}
+
+func (x *Heartbeat) GetLoad() uint32 {
+	if x != nil {
+		return x.Load
+	}
+	return 0
+}
+
+func (x *Heartbeat) GetGpuType() string {
+	if x != nil {
+		return x.GpuType
+	}
+	return ""
+}
+
+func (x *Heartbeat) GetAvailableModels() []*Model {
+	if x != nil {
+		return x.AvailableModels
+	}
+	return nil
+}
+
+// Deregister is sent by a worker that is shutting down gracefully. The server
+// marks the worker draining: it routes no new jobs to it, lets in-flight jobs
+// finish, then removes it when the stream closes.
+type Deregister struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Deregister) Reset() {
+	*x = Deregister{}
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Deregister) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Deregister) ProtoMessage() {}
+
+func (x *Deregister) ProtoReflect() protoreflect.Message {
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Deregister.ProtoReflect.Descriptor instead.
+func (*Deregister) Descriptor() ([]byte, []int) {
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *Deregister) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
 // WorkerMessage is the worker -> server side of the bidi stream.
 type WorkerMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -448,6 +544,7 @@ type WorkerMessage struct {
 	//	*WorkerMessage_Register
 	//	*WorkerMessage_Heartbeat
 	//	*WorkerMessage_Result
+	//	*WorkerMessage_Deregister
 	Payload       isWorkerMessage_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -455,7 +552,7 @@ type WorkerMessage struct {
 
 func (x *WorkerMessage) Reset() {
 	*x = WorkerMessage{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -467,7 +564,7 @@ func (x *WorkerMessage) String() string {
 func (*WorkerMessage) ProtoMessage() {}
 
 func (x *WorkerMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -480,7 +577,7 @@ func (x *WorkerMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerMessage.ProtoReflect.Descriptor instead.
 func (*WorkerMessage) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{7}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *WorkerMessage) GetPayload() isWorkerMessage_Payload {
@@ -517,6 +614,15 @@ func (x *WorkerMessage) GetResult() *JobResult {
 	return nil
 }
 
+func (x *WorkerMessage) GetDeregister() *Deregister {
+	if x != nil {
+		if x, ok := x.Payload.(*WorkerMessage_Deregister); ok {
+			return x.Deregister
+		}
+	}
+	return nil
+}
+
 type isWorkerMessage_Payload interface {
 	isWorkerMessage_Payload()
 }
@@ -533,11 +639,17 @@ type WorkerMessage_Result struct {
 	Result *JobResult `protobuf:"bytes,3,opt,name=result,proto3,oneof"`
 }
 
+type WorkerMessage_Deregister struct {
+	Deregister *Deregister `protobuf:"bytes,4,opt,name=deregister,proto3,oneof"`
+}
+
 func (*WorkerMessage_Register) isWorkerMessage_Payload() {}
 
 func (*WorkerMessage_Heartbeat) isWorkerMessage_Payload() {}
 
 func (*WorkerMessage_Result) isWorkerMessage_Payload() {}
+
+func (*WorkerMessage_Deregister) isWorkerMessage_Payload() {}
 
 // ServerMessage is the server -> worker side of the bidi stream.
 type ServerMessage struct {
@@ -553,7 +665,7 @@ type ServerMessage struct {
 
 func (x *ServerMessage) Reset() {
 	*x = ServerMessage{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -565,7 +677,7 @@ func (x *ServerMessage) String() string {
 func (*ServerMessage) ProtoMessage() {}
 
 func (x *ServerMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -578,7 +690,7 @@ func (x *ServerMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerMessage.ProtoReflect.Descriptor instead.
 func (*ServerMessage) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{8}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ServerMessage) GetPayload() isServerMessage_Payload {
@@ -647,15 +759,26 @@ const file_agentgpu_v1_agentgpu_proto_rawDesc = "" +
 	"\x06models\x18\x02 \x03(\v2\x12.agentgpu.v1.ModelR\x06models\",\n" +
 	"\vRegisterAck\x12\x1d\n" +
 	"\n" +
-	"session_id\x18\x01 \x01(\tR\tsessionId\"I\n" +
+	"session_id\x18\x01 \x01(\tR\tsessionId\"\x89\x02\n" +
 	"\tHeartbeat\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1f\n" +
 	"\vactive_jobs\x18\x02 \x01(\rR\n" +
-	"activeJobs\"\xb9\x01\n" +
+	"activeJobs\x12(\n" +
+	"\x10total_vram_bytes\x18\x03 \x01(\x04R\x0etotalVramBytes\x12&\n" +
+	"\x0ffree_vram_bytes\x18\x04 \x01(\x04R\rfreeVramBytes\x12\x12\n" +
+	"\x04load\x18\x05 \x01(\rR\x04load\x12\x19\n" +
+	"\bgpu_type\x18\x06 \x01(\tR\agpuType\x12=\n" +
+	"\x10available_models\x18\a \x03(\v2\x12.agentgpu.v1.ModelR\x0favailableModels\")\n" +
+	"\n" +
+	"Deregister\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\"\xf4\x01\n" +
 	"\rWorkerMessage\x123\n" +
 	"\bregister\x18\x01 \x01(\v2\x15.agentgpu.v1.RegisterH\x00R\bregister\x126\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x16.agentgpu.v1.HeartbeatH\x00R\theartbeat\x120\n" +
-	"\x06result\x18\x03 \x01(\v2\x16.agentgpu.v1.JobResultH\x00R\x06resultB\t\n" +
+	"\x06result\x18\x03 \x01(\v2\x16.agentgpu.v1.JobResultH\x00R\x06result\x129\n" +
+	"\n" +
+	"deregister\x18\x04 \x01(\v2\x17.agentgpu.v1.DeregisterH\x00R\n" +
+	"deregisterB\t\n" +
 	"\apayload\"\x7f\n" +
 	"\rServerMessage\x12=\n" +
 	"\fregister_ack\x18\x01 \x01(\v2\x18.agentgpu.v1.RegisterAckH\x00R\vregisterAck\x12$\n" +
@@ -676,7 +799,7 @@ func file_agentgpu_v1_agentgpu_proto_rawDescGZIP() []byte {
 	return file_agentgpu_v1_agentgpu_proto_rawDescData
 }
 
-var file_agentgpu_v1_agentgpu_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_agentgpu_v1_agentgpu_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_agentgpu_v1_agentgpu_proto_goTypes = []any{
 	(*Model)(nil),         // 0: agentgpu.v1.Model
 	(*Error)(nil),         // 1: agentgpu.v1.Error
@@ -685,24 +808,27 @@ var file_agentgpu_v1_agentgpu_proto_goTypes = []any{
 	(*Register)(nil),      // 4: agentgpu.v1.Register
 	(*RegisterAck)(nil),   // 5: agentgpu.v1.RegisterAck
 	(*Heartbeat)(nil),     // 6: agentgpu.v1.Heartbeat
-	(*WorkerMessage)(nil), // 7: agentgpu.v1.WorkerMessage
-	(*ServerMessage)(nil), // 8: agentgpu.v1.ServerMessage
+	(*Deregister)(nil),    // 7: agentgpu.v1.Deregister
+	(*WorkerMessage)(nil), // 8: agentgpu.v1.WorkerMessage
+	(*ServerMessage)(nil), // 9: agentgpu.v1.ServerMessage
 }
 var file_agentgpu_v1_agentgpu_proto_depIdxs = []int32{
-	1, // 0: agentgpu.v1.JobResult.error:type_name -> agentgpu.v1.Error
-	0, // 1: agentgpu.v1.Register.models:type_name -> agentgpu.v1.Model
-	4, // 2: agentgpu.v1.WorkerMessage.register:type_name -> agentgpu.v1.Register
-	6, // 3: agentgpu.v1.WorkerMessage.heartbeat:type_name -> agentgpu.v1.Heartbeat
-	3, // 4: agentgpu.v1.WorkerMessage.result:type_name -> agentgpu.v1.JobResult
-	5, // 5: agentgpu.v1.ServerMessage.register_ack:type_name -> agentgpu.v1.RegisterAck
-	2, // 6: agentgpu.v1.ServerMessage.job:type_name -> agentgpu.v1.Job
-	7, // 7: agentgpu.v1.ControlPlane.Connect:input_type -> agentgpu.v1.WorkerMessage
-	8, // 8: agentgpu.v1.ControlPlane.Connect:output_type -> agentgpu.v1.ServerMessage
-	8, // [8:9] is the sub-list for method output_type
-	7, // [7:8] is the sub-list for method input_type
-	7, // [7:7] is the sub-list for extension type_name
-	7, // [7:7] is the sub-list for extension extendee
-	0, // [0:7] is the sub-list for field type_name
+	1,  // 0: agentgpu.v1.JobResult.error:type_name -> agentgpu.v1.Error
+	0,  // 1: agentgpu.v1.Register.models:type_name -> agentgpu.v1.Model
+	0,  // 2: agentgpu.v1.Heartbeat.available_models:type_name -> agentgpu.v1.Model
+	4,  // 3: agentgpu.v1.WorkerMessage.register:type_name -> agentgpu.v1.Register
+	6,  // 4: agentgpu.v1.WorkerMessage.heartbeat:type_name -> agentgpu.v1.Heartbeat
+	3,  // 5: agentgpu.v1.WorkerMessage.result:type_name -> agentgpu.v1.JobResult
+	7,  // 6: agentgpu.v1.WorkerMessage.deregister:type_name -> agentgpu.v1.Deregister
+	5,  // 7: agentgpu.v1.ServerMessage.register_ack:type_name -> agentgpu.v1.RegisterAck
+	2,  // 8: agentgpu.v1.ServerMessage.job:type_name -> agentgpu.v1.Job
+	8,  // 9: agentgpu.v1.ControlPlane.Connect:input_type -> agentgpu.v1.WorkerMessage
+	9,  // 10: agentgpu.v1.ControlPlane.Connect:output_type -> agentgpu.v1.ServerMessage
+	10, // [10:11] is the sub-list for method output_type
+	9,  // [9:10] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_agentgpu_v1_agentgpu_proto_init() }
@@ -710,12 +836,13 @@ func file_agentgpu_v1_agentgpu_proto_init() {
 	if File_agentgpu_v1_agentgpu_proto != nil {
 		return
 	}
-	file_agentgpu_v1_agentgpu_proto_msgTypes[7].OneofWrappers = []any{
+	file_agentgpu_v1_agentgpu_proto_msgTypes[8].OneofWrappers = []any{
 		(*WorkerMessage_Register)(nil),
 		(*WorkerMessage_Heartbeat)(nil),
 		(*WorkerMessage_Result)(nil),
+		(*WorkerMessage_Deregister)(nil),
 	}
-	file_agentgpu_v1_agentgpu_proto_msgTypes[8].OneofWrappers = []any{
+	file_agentgpu_v1_agentgpu_proto_msgTypes[9].OneofWrappers = []any{
 		(*ServerMessage_RegisterAck)(nil),
 		(*ServerMessage_Job)(nil),
 	}
@@ -725,7 +852,7 @@ func file_agentgpu_v1_agentgpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agentgpu_v1_agentgpu_proto_rawDesc), len(file_agentgpu_v1_agentgpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

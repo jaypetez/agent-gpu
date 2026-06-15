@@ -18,6 +18,7 @@ func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	fs := flag.NewFlagSet("worker start", flag.ContinueOnError)
 	srvAddr := fs.String("server", "", "gRPC server address (host:port)")
 	id := fs.String("id", "", "worker id (defaults to hostname)")
+	hbInterval := fs.Duration("heartbeat-interval", 0, "heartbeat cadence (default 15s or $AGENTGPU_HEARTBEAT_INTERVAL)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -26,11 +27,13 @@ func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	if cfg.ServerAddr == "" {
 		return fmt.Errorf("--server is required (or set %s)", config.EnvWorkerServer)
 	}
+	heartbeatInterval := config.ResolveHeartbeatInterval(*hbInterval, nil)
 
 	w := worker.New(worker.Config{
-		ServerAddr: cfg.ServerAddr,
-		WorkerID:   cfg.WorkerID,
-		Logger:     logger,
+		ServerAddr:        cfg.ServerAddr,
+		WorkerID:          cfg.WorkerID,
+		HeartbeatInterval: heartbeatInterval,
+		Logger:            logger,
 	})
 
 	logger.Info("starting worker", "id", cfg.WorkerID, "server", cfg.ServerAddr)

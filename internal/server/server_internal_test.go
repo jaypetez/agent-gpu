@@ -3,6 +3,7 @@ package server
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
@@ -50,5 +51,71 @@ func TestAddWorkerSessionsUnique(t *testing.T) {
 	}
 	if len(seen) != n {
 		t.Fatalf("expected %d unique session numbers, got %d", n, len(seen))
+	}
+}
+
+func TestWorkerSnapshotAndStatus(t *testing.T) {
+	base := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	timeout := 30 * time.Second
+
+	w := &worker{
+		id:            "w",
+		models:        []types.Model{{Name: "llama3"}},
+		lastHeartbeat: base,
+		pending:       map[string]chan types.JobResult{},
+	}
+
+	// Heartbeat folds capacity in and re-stamps lastHeartbeat.
+	w.applyHeartbeat(types.Heartbeat{
+		ActiveJobs:      4,
+		TotalVRAM:       16,
+		FreeVRAM:        8,
+		Load:            33,
+		GPUType:         "gpu",
+		AvailableModels: []types.Model{{Name: "mistral"}},
+	}, base.Add(time.Second))
+
+	snap := w.snapshot(base.Add(2*time.Second), timeout)
+	if snap.Status != types.WorkerOnline {
+		t.Fatalf("fresh heartbeat status = %v, want online", snap.Status)
+	}
+	if snap.ActiveJobs != 4 || snap.Load != 33 || snap.GPUType != "gpu" {
+		t.Fatalf("snapshot capacity not applied: %+v", snap)
+	}
+	if len(snap.Models) != 1 || snap.Models[0].Name != "mistral" {
+		t.Fatalf("snapshot should reflect available_models: %+v", snap.Models)
+	}
+
+	// Past the timeout: stale, unavailable.
+	stalePoint := base.Add(time.Second + timeout + time.Nanosecond)
+	if !w.isStale(stalePoint, timeout) {
+		t.Fatal("worker should be stale past the timeout")
+	}
+	if w.available(stalePoint, timeout) {
+		t.Fatal("stale worker must not be available for routing")
+	}
+	if got := w.snapshot(stalePoint, timeout).Status; got != types.WorkerStale {
+		t.Fatalf("stale snapshot status = %v, want stale", got)
+	}
+
+	// Draining trumps liveness for routing and status.
+	w.markDraining()
+	if w.available(base.Add(2*time.Second), timeout) {
+		t.Fatal("draining worker must not be available")
+	}
+	if got := w.snapshot(base.Add(2*time.Second), timeout).Status; got != types.WorkerDraining {
+		t.Fatalf("draining snapshot status = %v, want draining", got)
+	}
+}
+
+func TestWorkerNeverHeartbeatedNotStale(t *testing.T) {
+	// A zero lastHeartbeat (never seeded) is graced, not treated as ancient.
+	w := &worker{id: "w", pending: map[string]chan types.JobResult{}}
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	if w.isStale(now, time.Second) {
+		t.Fatal("never-heartbeated worker (zero lastHeartbeat) must not be stale")
+	}
+	if !w.available(now, time.Second) {
+		t.Fatal("never-heartbeated worker should still be available")
 	}
 }

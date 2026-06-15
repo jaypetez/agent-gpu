@@ -15,6 +15,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -88,10 +89,18 @@ type Config struct {
 	ServerAddr string
 	// WorkerID is this worker's stable identifier.
 	WorkerID string
-	// Models advertised at registration.
+	// Models advertised at registration and reported as available_models in
+	// heartbeats.
 	Models []types.Model
 	// HeartbeatInterval between heartbeats. Defaults to 15s.
 	HeartbeatInterval time.Duration
+	// Capacity stub fields reported in heartbeats. Real GPU detection (#16)
+	// replaces these; until then they are configured/zero. TotalVRAM/FreeVRAM are
+	// bytes, GPUType is a human-readable description, Load is 0-100.
+	TotalVRAM uint64
+	FreeVRAM  uint64
+	GPUType   string
+	Load      uint32
 	// Backoff policy for reconnects.
 	Backoff Backoff
 	// Executor runs jobs. Defaults to EchoExecutor.
@@ -238,20 +247,28 @@ func (w *Worker) runOnce(ctx context.Context, resetBackoff func()) error {
 		w.onConnect(ack.GetRegisterAck().GetSessionId())
 	}
 
-	return w.serve(cctx, stream)
+	return w.serve(ctx, cctx, stream)
 }
 
 // serve runs the heartbeat loop and processes dispatched jobs until the stream
 // drops. The receive loop runs in its own goroutine; this method owns all
-// Sends (heartbeats and job results) to keep stream writes single-threaded.
+// Sends (heartbeats, job results, deregister) to keep stream writes
+// single-threaded.
 //
-// ctx must be the per-connection context (cancelled by runOnce on return), so
-// the spawned goroutines are torn down when this connection ends rather than
-// leaking until the long-lived Run context is cancelled.
-func (w *Worker) serve(ctx context.Context, stream agentgpuv1.ControlPlane_ConnectClient) error {
+// runCtx is the long-lived Run context; connCtx is the per-connection context
+// (cancelled by runOnce on return) so the spawned goroutines are torn down when
+// this connection ends rather than leaking. The two are distinguished so a
+// graceful shutdown (runCtx cancelled) can send a Deregister before closing,
+// while a transient drop (only connCtx cancelled) does not.
+func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.ControlPlane_ConnectClient) error {
 	results := make(chan types.JobResult, 8)
 	recvErr := make(chan error, 1)
 	jobs := make(chan types.Job, 8)
+
+	// activeJobs counts jobs currently executing, reported in heartbeats. It is
+	// touched by the job-worker goroutine and read by this loop, so it must be
+	// accessed atomically.
+	var activeJobs int32
 
 	// Receive loop.
 	go func() {
@@ -267,41 +284,64 @@ func (w *Worker) serve(ctx context.Context, stream agentgpuv1.ControlPlane_Conne
 		}
 	}()
 
-	// Job worker: execute jobs (stub) and queue results for sending.
+	// Job worker: execute jobs (stub) and queue results for sending. active-job
+	// accounting brackets execution: increment when a job is dequeued, decrement
+	// once its result is queued (or the connection ends).
 	go func() {
 		for {
 			select {
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return
 			case job := <-jobs:
-				res := w.cfg.Executor.Execute(ctx, job)
+				atomic.AddInt32(&activeJobs, 1)
+				res := w.cfg.Executor.Execute(connCtx, job)
 				select {
 				case results <- res:
-				case <-ctx.Done():
+					atomic.AddInt32(&activeJobs, -1)
+				case <-connCtx.Done():
+					atomic.AddInt32(&activeJobs, -1)
 					return
 				}
 			}
 		}
 	}()
 
+	sendHeartbeat := func() error {
+		return stream.Send(&agentgpuv1.WorkerMessage{
+			Payload: &agentgpuv1.WorkerMessage_Heartbeat{
+				Heartbeat: w.heartbeat(uint32(atomic.LoadInt32(&activeJobs))),
+			},
+		})
+	}
+
 	ticker := time.NewTicker(w.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-runCtx.Done():
+			// Graceful shutdown: the long-lived Run context was cancelled.
+			// Announce departure so the server marks us draining and stops routing
+			// new jobs immediately rather than waiting for the stale timeout. We
+			// send while the stream is still live — runOnce cancels connCtx (which
+			// tears down the stream) only after serve returns. Best-effort: ignore
+			// the send error.
+			_ = stream.Send(&agentgpuv1.WorkerMessage{
+				Payload: &agentgpuv1.WorkerMessage_Deregister{
+					Deregister: &agentgpuv1.Deregister{WorkerId: w.cfg.WorkerID},
+				},
+			})
+			return runCtx.Err()
+		case <-connCtx.Done():
+			// Transient teardown (e.g. reconnect): no graceful announcement.
+			return connCtx.Err()
 		case err := <-recvErr:
 			if err == io.EOF {
 				return nil
 			}
 			return err
 		case <-ticker.C:
-			if err := stream.Send(&agentgpuv1.WorkerMessage{
-				Payload: &agentgpuv1.WorkerMessage_Heartbeat{
-					Heartbeat: &agentgpuv1.Heartbeat{WorkerId: w.cfg.WorkerID},
-				},
-			}); err != nil {
+			if err := sendHeartbeat(); err != nil {
 				return err
 			}
 		case res := <-results:
@@ -312,4 +352,18 @@ func (w *Worker) serve(ctx context.Context, stream agentgpuv1.ControlPlane_Conne
 			}
 		}
 	}
+}
+
+// heartbeat builds the worker's periodic liveness/capacity report. Capacity
+// fields are stub/configured values until real GPU detection (#16) lands.
+func (w *Worker) heartbeat(activeJobs uint32) *agentgpuv1.Heartbeat {
+	return types.Heartbeat{
+		WorkerID:        w.cfg.WorkerID,
+		ActiveJobs:      activeJobs,
+		TotalVRAM:       w.cfg.TotalVRAM,
+		FreeVRAM:        w.cfg.FreeVRAM,
+		Load:            w.cfg.Load,
+		GPUType:         w.cfg.GPUType,
+		AvailableModels: w.cfg.Models,
+	}.Proto()
 }

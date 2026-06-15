@@ -155,3 +155,43 @@ func TestNilProtoConversions(t *testing.T) {
 	// Ensure the generated proto type is actually wired up.
 	var _ *agentgpuv1.Job = (Job{}).Proto()
 }
+
+func TestHeartbeatRoundTrip(t *testing.T) {
+	t.Parallel()
+	in := Heartbeat{
+		WorkerID:        "w1",
+		ActiveJobs:      3,
+		TotalVRAM:       24 << 30,
+		FreeVRAM:        12 << 30,
+		Load:            55,
+		GPUType:         "test-gpu",
+		AvailableModels: []Model{{Name: "llama3", Digest: "abc"}, {Name: "mistral"}},
+	}
+	got := HeartbeatFromProto(in.Proto())
+	if got.WorkerID != in.WorkerID || got.ActiveJobs != in.ActiveJobs ||
+		got.TotalVRAM != in.TotalVRAM || got.FreeVRAM != in.FreeVRAM ||
+		got.Load != in.Load || got.GPUType != in.GPUType {
+		t.Fatalf("scalar fields did not survive round trip: %+v", got)
+	}
+	if len(got.AvailableModels) != 2 || got.AvailableModels[0] != in.AvailableModels[0] {
+		t.Fatalf("available models did not survive round trip: %+v", got.AvailableModels)
+	}
+	if z := HeartbeatFromProto(nil); z.WorkerID != "" || z.ActiveJobs != 0 || z.AvailableModels != nil {
+		t.Fatalf("HeartbeatFromProto(nil) should be zero value, got %+v", z)
+	}
+}
+
+func TestWorkerStatusString(t *testing.T) {
+	t.Parallel()
+	cases := map[WorkerStatus]string{
+		WorkerOnline:     "online",
+		WorkerDraining:   "draining",
+		WorkerStale:      "stale",
+		WorkerStatus(99): "unknown",
+	}
+	for s, want := range cases {
+		if got := s.String(); got != want {
+			t.Fatalf("WorkerStatus(%d).String() = %q, want %q", s, got, want)
+		}
+	}
+}

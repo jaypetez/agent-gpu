@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 var errHome = errors.New("no home")
@@ -157,4 +158,37 @@ func TestResolveWorker(t *testing.T) {
 			t.Fatalf("flags should win: %+v", got)
 		}
 	})
+}
+
+func TestResolveHeartbeatInterval(t *testing.T) {
+	t.Parallel()
+	// Flag wins.
+	if got := ResolveHeartbeatInterval(5*time.Second, env(map[string]string{EnvHeartbeatInterval: "9s"})); got != 5*time.Second {
+		t.Fatalf("flag precedence: got %v", got)
+	}
+	// Env when no flag.
+	if got := ResolveHeartbeatInterval(0, env(map[string]string{EnvHeartbeatInterval: "9s"})); got != 9*time.Second {
+		t.Fatalf("env precedence: got %v", got)
+	}
+	// Default when neither.
+	if got := ResolveHeartbeatInterval(0, env(nil)); got != DefaultHeartbeatInterval {
+		t.Fatalf("default: got %v", got)
+	}
+	// Unparseable env falls back to default.
+	if got := ResolveHeartbeatInterval(0, env(map[string]string{EnvHeartbeatInterval: "not-a-duration"})); got != DefaultHeartbeatInterval {
+		t.Fatalf("bad env should fall back to default: got %v", got)
+	}
+}
+
+func TestResolveHeartbeatTimeout(t *testing.T) {
+	t.Parallel()
+	if got := ResolveHeartbeatTimeout(90*time.Second, env(map[string]string{EnvHeartbeatTimeout: "120s"})); got != 90*time.Second {
+		t.Fatalf("flag precedence: got %v", got)
+	}
+	if got := ResolveHeartbeatTimeout(0, env(map[string]string{EnvHeartbeatTimeout: "120s"})); got != 120*time.Second {
+		t.Fatalf("env precedence: got %v", got)
+	}
+	if got := ResolveHeartbeatTimeout(0, env(nil)); got != DefaultHeartbeatTimeout {
+		t.Fatalf("default: got %v", got)
+	}
 }

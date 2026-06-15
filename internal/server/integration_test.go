@@ -33,8 +33,16 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWith(t)
+}
+
+// newHarnessWith builds a harness whose Server is constructed with the supplied
+// options (clock injection, heartbeat timeout, scan interval). It does not
+// auto-close; callers register cleanup or call close themselves.
+func newHarnessWith(t *testing.T, opts ...server.Option) *harness {
+	t.Helper()
 	h := &harness{t: t}
-	h.srv = server.New()
+	h.srv = server.New(opts...)
 	h.start()
 	return h
 }
@@ -110,6 +118,24 @@ func newWorkerID(h *harness, id string, onConnect func(sessionID string)) *worke
 		w.OnConnect(onConnect)
 	}
 	return w
+}
+
+// newWorkerWithCapacity builds a worker that reports the given capacity stub
+// fields in its heartbeats, so a test can assert the fleet view reflects them.
+func newWorkerWithCapacity(h *harness, id string, cfg worker.Config) *worker.Worker {
+	cfg.ServerAddr = "bufconn"
+	cfg.WorkerID = id
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = 20 * time.Millisecond
+	}
+	if cfg.Backoff == (worker.Backoff{}) {
+		cfg.Backoff = worker.Backoff{Base: 5 * time.Millisecond, Max: 50 * time.Millisecond, Factor: 2.0}
+	}
+	cfg.DialOptions = append(cfg.DialOptions,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		h.dialOption(),
+	)
+	return worker.New(cfg)
 }
 
 // TestControlPlaneRoundTrip covers the core acceptance criterion: a worker
