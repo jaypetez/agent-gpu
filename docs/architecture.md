@@ -127,7 +127,7 @@ per-key **consumption limits**. A request that exceeds a limit is refused with `
 — the typed seam the request path maps to HTTP **429** (mirroring `ErrUnauthenticated` → 401 and
 `ErrForbidden` → 403). On the dispatch path the order is:
 
-```
+```text
 authenticate → authorize → quota.CheckAndReserve → dispatch → quota.RecordTokens
 ```
 
