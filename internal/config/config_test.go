@@ -76,6 +76,53 @@ func TestResolveStorePath(t *testing.T) {
 	})
 }
 
+func TestResolveQuotaPath(t *testing.T) {
+	t.Parallel()
+	home := func() (string, error) { return "/home/u", nil }
+	wantDefault := filepath.Join("/home/u", ".agentgpu", "quota.json")
+
+	t.Run("default uses home dir", func(t *testing.T) {
+		t.Parallel()
+		if got := ResolveQuotaPath("", env(nil), home); got != wantDefault {
+			t.Fatalf("got %q, want %q", got, wantDefault)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveQuotaPath("", env(map[string]string{EnvQuotaPath: "/tmp/q.json"}), home)
+		if got != "/tmp/q.json" {
+			t.Fatalf("got %q, want env value", got)
+		}
+	})
+	t.Run("flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveQuotaPath("/flag/q.json", env(map[string]string{EnvQuotaPath: "/tmp/q.json"}), home)
+		if got != "/flag/q.json" {
+			t.Fatalf("got %q, want flag value", got)
+		}
+	})
+	t.Run("home error falls back to relative path", func(t *testing.T) {
+		t.Parallel()
+		badHome := func() (string, error) { return "", errHome }
+		if got := ResolveQuotaPath("", env(nil), badHome); got != filepath.Join(".agentgpu", "quota.json") {
+			t.Fatalf("got %q, want relative fallback", got)
+		}
+	})
+}
+
+func TestResolveQuota(t *testing.T) {
+	t.Parallel()
+	home := func() (string, error) { return "/home/u", nil }
+	got := ResolveQuota(QuotaConfig{DefaultRPM: 60, DefaultTPM: 1000}, env(nil), home)
+	if got.Path != filepath.Join("/home/u", ".agentgpu", "quota.json") {
+		t.Fatalf("path = %q", got.Path)
+	}
+	// Limit defaults pass through unchanged.
+	if got.DefaultRPM != 60 || got.DefaultTPM != 1000 {
+		t.Fatalf("limit defaults not preserved: %+v", got)
+	}
+}
+
 func TestResolveWorker(t *testing.T) {
 	t.Parallel()
 	host := func() (string, error) { return "test-host", nil }

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -33,9 +34,16 @@ type Executor interface {
 // EchoExecutor is the stub executor: it echoes the prompt back as output.
 type EchoExecutor struct{}
 
-// Execute implements Executor.
+// Execute implements Executor. It reports a token count equal to the number of
+// whitespace-separated tokens in the output so quota accounting (#5) is
+// testable now; real token counts arrive with the Ollama integration (#11).
 func (EchoExecutor) Execute(_ context.Context, job types.Job) types.JobResult {
-	return types.JobResult{JobID: job.ID, Output: "echo: " + job.Prompt}
+	output := "echo: " + job.Prompt
+	return types.JobResult{
+		JobID:  job.ID,
+		Output: output,
+		Tokens: uint64(len(strings.Fields(output))),
+	}
 }
 
 // Backoff configures exponential reconnect backoff with full jitter.

@@ -191,6 +191,36 @@ func (s *Service) SetPermissions(ctx context.Context, id string, perms Permissio
 	return rec, nil
 }
 
+// SetLimits replaces a key's quota limits (#5), preserving the key's identity,
+// secret, and permissions. Passing a nil *store.Limits clears the per-key
+// override so the key falls back to the global quota defaults; a non-nil value
+// overrides them (a zero field within it meaning "unlimited"). Setting limits
+// on an unknown key returns store.ErrNotFound.
+//
+// Because the quota engine reads the key's limits from the store on each check,
+// a change here takes effect immediately with no restart. It is the management
+// seam used by the `key quota set` CLI until the admin HTTP endpoints (#4)
+// exist.
+func (s *Service) SetLimits(ctx context.Context, id string, limits *store.Limits) (store.APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.store.GetAPIKey(ctx, id)
+	if err != nil {
+		return store.APIKey{}, err
+	}
+	if limits != nil {
+		l := *limits
+		rec.Limits = &l
+	} else {
+		rec.Limits = nil
+	}
+	if err := s.store.PutAPIKey(ctx, rec); err != nil {
+		return store.APIKey{}, fmt.Errorf("auth: persist limits: %w", err)
+	}
+	return rec, nil
+}
+
 // Rotate atomically replaces a key's secret and salt while preserving its id
 // (and thus all identity/permissions/quotas attached to it). The old secret
 // stops verifying immediately. Returns the new one-time plaintext token. A

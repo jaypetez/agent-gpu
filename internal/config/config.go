@@ -14,6 +14,7 @@ const (
 	EnvWorkerServer = "AGENTGPU_SERVER_ADDR"
 	EnvWorkerID     = "AGENTGPU_WORKER_ID"
 	EnvStorePath    = "AGENTGPU_STORE_PATH"
+	EnvQuotaPath    = "AGENTGPU_QUOTA_PATH"
 )
 
 // Defaults.
@@ -33,6 +34,24 @@ type WorkerConfig struct {
 	ServerAddr string
 	// WorkerID is this worker's stable identifier; defaults to the hostname.
 	WorkerID string
+}
+
+// QuotaConfig configures the quota engine's global default limits and the
+// counter checkpoint file location. The limit fields mirror store.Limits /
+// quota.Limits but are kept as plain values here so the config package stays
+// free of a quota dependency (matching how ServerConfig avoids importing
+// server). A zero limit field means "unlimited" for that dimension.
+type QuotaConfig struct {
+	// Path is the counter checkpoint file location.
+	Path string
+	// DefaultRPM is the global default requests-per-minute (0 = unlimited).
+	DefaultRPM uint64
+	// DefaultTPM is the global default tokens-per-minute (0 = unlimited).
+	DefaultTPM uint64
+	// DefaultDailyTokens is the global default daily token budget (0 = unlimited).
+	DefaultDailyTokens uint64
+	// DefaultMonthlyTokens is the global default monthly token budget (0 = unlimited).
+	DefaultMonthlyTokens uint64
 }
 
 // EnvLookup is the signature of os.LookupEnv, injectable for tests.
@@ -85,6 +104,40 @@ func ResolveStorePath(flagValue string, look EnvLookup, homeDir func() (string, 
 		return flagValue
 	}
 	return envOr(look, EnvStorePath, DefaultStorePath(homeDir))
+}
+
+// DefaultQuotaPath returns the default counter-checkpoint location,
+// ~/.agentgpu/quota.json, falling back to a relative path when the home
+// directory cannot be determined (mirroring DefaultStorePath).
+func DefaultQuotaPath(homeDir func() (string, error)) string {
+	if homeDir == nil {
+		homeDir = os.UserHomeDir
+	}
+	home, err := homeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".agentgpu", "quota.json")
+	}
+	return filepath.Join(home, ".agentgpu", "quota.json")
+}
+
+// ResolveQuotaPath resolves the counter-checkpoint path with flag > env >
+// default precedence. An empty flag value means "unset".
+func ResolveQuotaPath(flagValue string, look EnvLookup, homeDir func() (string, error)) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvQuotaPath, DefaultQuotaPath(homeDir))
+}
+
+// ResolveQuota fills a QuotaConfig's Path with flag > env > default precedence
+// (limit defaults are passed through as-is; they have no env override today).
+func ResolveQuota(flags QuotaConfig, look EnvLookup, homeDir func() (string, error)) QuotaConfig {
+	out := flags
+	out.Path = ResolveQuotaPath(flags.Path, look, homeDir)
+	return out
 }
 
 // ResolveWorker applies env-then-default resolution to a WorkerConfig.

@@ -57,6 +57,8 @@ func reorderFlagsFirst(args []string, valueFlags map[string]bool) []string {
 //	agentgpu key revoke <id>
 //	agentgpu key rotate <id>
 //	agentgpu key perms <id> [--role r ...] [--allow-model m ...] [--deny-model m ...]
+//	agentgpu key quota <id>
+//	agentgpu key quota set <id> [--rpm N] [--tpm N] [--daily-tokens N] [--monthly-tokens N]
 //
 // Keys are persisted to a JSON store so they survive across invocations; the
 // path comes from --store / AGENTGPU_STORE_PATH / the default. The plaintext
@@ -66,7 +68,7 @@ func reorderFlagsFirst(args []string, valueFlags map[string]bool) []string {
 // (#4) exist.
 func runKeyCmd(ctx context.Context, out io.Writer, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: agentgpu key <create|list|revoke|rotate|perms> [args]")
+		return fmt.Errorf("usage: agentgpu key <create|list|revoke|rotate|perms|quota> [args]")
 	}
 
 	sub := args[0]
@@ -83,6 +85,8 @@ func runKeyCmd(ctx context.Context, out io.Writer, args []string) error {
 		return runKeyRotate(ctx, out, rest)
 	case "perms":
 		return runKeyPerms(ctx, out, rest)
+	case "quota":
+		return runKeyQuota(ctx, out, rest)
 	default:
 		return fmt.Errorf("unknown key subcommand %q", sub)
 	}
@@ -92,12 +96,19 @@ func runKeyCmd(ctx context.Context, out io.Writer, args []string) error {
 // default fill the gaps), opens the file-backed store, and returns an auth
 // Service plus the store for cleanup.
 func openService(storeFlag string) (*auth.Service, store.Store, error) {
-	path := config.ResolveStorePath(storeFlag, nil, nil)
-	st, err := store.NewFile(path)
+	st, err := openStore(storeFlag)
 	if err != nil {
 		return nil, nil, err
 	}
 	return auth.NewService(st), st, nil
+}
+
+// openStore resolves the store path (flag > env > default) and opens the
+// file-backed key store. The server uses it directly so per-key quota Limits
+// persist across restarts and are visible on the dispatch path.
+func openStore(storeFlag string) (store.Store, error) {
+	path := config.ResolveStorePath(storeFlag, nil, nil)
+	return store.NewFile(path)
 }
 
 func runKeyCreate(ctx context.Context, out io.Writer, args []string) error {

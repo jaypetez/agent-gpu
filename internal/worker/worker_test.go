@@ -58,4 +58,29 @@ func TestEchoExecutor(t *testing.T) {
 	if res.JobID != "j1" || res.Output != "echo: hi" || res.Err != nil {
 		t.Fatalf("unexpected echo result: %+v", res)
 	}
+	// "echo: hi" -> 2 whitespace tokens, reported for quota accounting (#5).
+	if res.Tokens != 2 {
+		t.Fatalf("tokens = %d, want 2", res.Tokens)
+	}
+}
+
+// TestEchoExecutorTokenCount verifies the reported token count is the number of
+// whitespace-separated tokens in the output across a few prompts.
+func TestEchoExecutorTokenCount(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		prompt string
+		want   uint64
+	}{
+		{"", 1},                 // "echo:" -> 1
+		{"one", 2},              // "echo: one" -> 2
+		{"alpha beta gamma", 4}, // "echo: alpha beta gamma" -> 4
+		{"  spaced   out  ", 3}, // "echo:" + "spaced" + "out"; runs collapse -> 3
+	}
+	for _, tc := range cases {
+		res := EchoExecutor{}.Execute(context.Background(), types.Job{ID: "j", Prompt: tc.prompt})
+		if res.Tokens != tc.want {
+			t.Fatalf("prompt %q: tokens = %d, want %d (output %q)", tc.prompt, res.Tokens, tc.want, res.Output)
+		}
+	}
 }
