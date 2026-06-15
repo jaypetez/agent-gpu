@@ -21,13 +21,19 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
+	"github.com/jaypetez/agent-gpu/internal/scheduler"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
 )
 
-// ErrNoWorkers is returned when a job is submitted but no worker is connected.
+// ErrNoWorkers is the typed "no worker available" seam. With the capacity-aware
+// scheduler (#9) the normal dispatch path no longer returns it — a job that fits
+// no worker is queued and waits for capacity rather than failing fast — but it
+// is retained for callers (and the request path, #13) that may want a fail-fast,
+// no-queue variant in future.
 var ErrNoWorkers = errors.New("server: no workers connected")
 
 // ErrShuttingDown is returned when a job is submitted during shutdown.
@@ -218,6 +224,32 @@ type Server struct {
 	evictOnce sync.Once
 	evictStop chan struct{}
 	evictDone chan struct{}
+
+	// queue holds jobs that fit no worker at submit time; the placement loop
+	// drains it as capacity frees. Constructed in New.
+	queue *queue.Queue
+
+	// waiters maps a queued job's ID to the channel its blocked caller is parked
+	// on. The placement loop dispatches the job, then resolves the SAME channel so
+	// the original SubmitJob caller receives the result. Guarded by waitersMu.
+	waitersMu sync.Mutex
+	waiters   map[string]chan types.JobResult
+
+	// capacity is a coalescing signal: a non-blocking send (capacitySignal) wakes
+	// the placement loop to re-attempt placement when capacity may have changed (a
+	// heartbeat applied, a job completed, a worker registered). A buffered size-1
+	// channel coalesces bursts into a single wakeup.
+	capacity chan struct{}
+
+	// placeScan bounds how long the placement loop parks between capacity signals
+	// before re-checking on its own, so a fast-forwarded clock or a missed signal
+	// cannot wedge a queued job. Defaults to evictScan.
+	placeScan time.Duration
+
+	// placement loop lifecycle, mirroring the eviction loop.
+	placeOnce sync.Once
+	placeStop chan struct{}
+	placeDone chan struct{}
 }
 
 // Option configures a Server.
@@ -295,6 +327,30 @@ func WithEvictScanInterval(d time.Duration) Option {
 	}
 }
 
+// WithQueue sets the job queue the scheduler draws from when a submitted job
+// fits no worker. A nil queue is ignored. Defaults to an unbounded queue.
+// Bounding it (queue.WithMaxDepth) makes a full queue reject with
+// queue.ErrQueueFull, which SubmitJob surfaces to the caller for backpressure.
+func WithQueue(q *queue.Queue) Option {
+	return func(s *Server) {
+		if q != nil {
+			s.queue = q
+		}
+	}
+}
+
+// WithPlaceScanInterval overrides the wall-clock cadence at which the placement
+// loop re-checks for an available worker between capacity signals. A
+// non-positive value is ignored. Defaults to evictScan. Primarily a test seam so
+// the loop reacts promptly to a fast-forwarded clock.
+func WithPlaceScanInterval(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.placeScan = d
+		}
+	}
+}
+
 // WithDrainObserver registers a callback invoked with a worker's id the moment
 // the server marks it draining in response to a graceful Deregister, before the
 // subsequent stream-close cleanup. A nil callback is ignored. Primarily an
@@ -318,6 +374,10 @@ func New(opts ...Option) *Server {
 		workers:          make(map[string]*worker),
 		evictStop:        make(chan struct{}),
 		evictDone:        make(chan struct{}),
+		waiters:          make(map[string]chan types.JobResult),
+		capacity:         make(chan struct{}, 1),
+		placeStop:        make(chan struct{}),
+		placeDone:        make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(s)
@@ -327,6 +387,12 @@ func New(opts ...Option) *Server {
 		if s.evictScan <= 0 {
 			s.evictScan = DefaultHeartbeatTimeout / 2
 		}
+	}
+	if s.placeScan <= 0 {
+		s.placeScan = s.evictScan
+	}
+	if s.queue == nil {
+		s.queue = queue.New()
 	}
 	// Default the authorizer to one auditing through the (possibly overridden)
 	// server logger, after options have run.
@@ -366,13 +432,16 @@ func (s *Server) Start() {
 	s.evictOnce.Do(func() {
 		go s.evictLoop()
 	})
+	s.placeOnce.Do(func() {
+		go s.placeLoop()
+	})
 }
 
 // Close stops the eviction loop and waits for it to exit. Safe to call once;
 // further calls are no-ops. It does not tear down active worker streams (the
 // gRPC server's GracefulStop owns that).
 func (s *Server) Close() error {
-	// Ensure the loop was started so the wait below cannot block forever.
+	// Ensure the loops were started so the waits below cannot block forever.
 	s.Start()
 	select {
 	case <-s.evictStop:
@@ -381,6 +450,19 @@ func (s *Server) Close() error {
 		close(s.evictStop)
 	}
 	<-s.evictDone
+
+	// Stop the placement loop. Closing the queue unblocks its parked DequeueWait;
+	// closing placeStop unblocks it if it is parked on a capacity signal. Any
+	// callers still blocked on a waiter are released with a shutdown error so they
+	// do not hang forever past Close.
+	select {
+	case <-s.placeStop:
+	default:
+		close(s.placeStop)
+	}
+	s.queue.Close()
+	<-s.placeDone
+	s.failAllWaiters(&types.JobError{Code: "shutting_down", Message: "server shutting down"})
 	return nil
 }
 
@@ -433,6 +515,64 @@ func (s *Server) evictWorker(w *worker, err *types.JobError) {
 	w.failAllPending(err)
 }
 
+// signalCapacity wakes the placement loop to re-attempt placement of queued
+// jobs. It is a non-blocking, coalescing send: if a wakeup is already pending the
+// extra signal is dropped (one re-check covers all the capacity that freed since
+// the last). Call it whenever capacity may have increased — a heartbeat applied,
+// a job completed, or a worker registered.
+func (s *Server) signalCapacity() {
+	select {
+	case s.capacity <- struct{}{}:
+	default:
+	}
+}
+
+// addWaiter registers a result channel for a queued job's ID so the placement
+// loop can resolve it once it dispatches the job. The channel is buffered so the
+// placement loop never blocks delivering a result whose caller has since gone.
+func (s *Server) addWaiter(jobID string) chan types.JobResult {
+	ch := make(chan types.JobResult, 1)
+	s.waitersMu.Lock()
+	s.waiters[jobID] = ch
+	s.waitersMu.Unlock()
+	return ch
+}
+
+// removeWaiter drops a queued job's waiter (caller cancelled / timed out). It
+// must be paired with addWaiter so a cancelled caller leaks no entry.
+func (s *Server) removeWaiter(jobID string) {
+	s.waitersMu.Lock()
+	delete(s.waiters, jobID)
+	s.waitersMu.Unlock()
+}
+
+// resolveWaiter delivers res to the waiter for res.JobID, if one is still
+// registered, and removes it. It reports whether a waiter was found.
+func (s *Server) resolveWaiter(res types.JobResult) bool {
+	s.waitersMu.Lock()
+	ch, ok := s.waiters[res.JobID]
+	if ok {
+		delete(s.waiters, res.JobID)
+	}
+	s.waitersMu.Unlock()
+	if ok {
+		ch <- res
+	}
+	return ok
+}
+
+// failAllWaiters releases every outstanding queued-job waiter with err. Used on
+// Close so callers blocked on never-placed jobs do not hang past shutdown.
+func (s *Server) failAllWaiters(err *types.JobError) {
+	s.waitersMu.Lock()
+	waiters := s.waiters
+	s.waiters = make(map[string]chan types.JobResult)
+	s.waitersMu.Unlock()
+	for id, ch := range waiters {
+		ch <- types.JobResult{JobID: id, Err: err}
+	}
+}
+
 // Connect implements the ControlPlane bidirectional stream. One call per
 // connected worker; it runs until the worker disconnects or the server's
 // context is cancelled.
@@ -477,6 +617,9 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		},
 	}
 	s.log.Info("worker registered", "worker", w.id, "session", sessionID, "models", len(w.models))
+	// A new worker may be able to run queued jobs (e.g. one that advertises a
+	// queued job's model at registration): wake the placement loop.
+	s.signalCapacity()
 
 	// Writer goroutine: the single owner of stream.Send.
 	sendErr := make(chan error, 1)
@@ -519,8 +662,13 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 			s.log.Debug("heartbeat", "worker", w.id,
 				"active_jobs", hb.ActiveJobs, "load", hb.Load,
 				"free_vram", hb.FreeVRAM, "total_vram", hb.TotalVRAM)
+			// A heartbeat can free capacity (lower load, more VRAM, a newly loaded
+			// model): wake the placement loop to re-attempt queued jobs.
+			s.signalCapacity()
 		case *agentgpuv1.WorkerMessage_Result:
 			w.resolve(types.JobResultFromProto(p.Result))
+			// A completed job frees a worker slot: re-attempt queued jobs.
+			s.signalCapacity()
 		case *agentgpuv1.WorkerMessage_Deregister:
 			// Graceful drain: stop routing new jobs to this worker, but let its
 			// in-flight pending jobs finish. The worker closes the stream once it
@@ -563,21 +711,156 @@ func (s *Server) removeWorker(w *worker) {
 	w.failAllPending(&types.JobError{Code: "worker_disconnected", Message: "worker stream closed"})
 }
 
-// pickWorker returns any currently connected worker that is eligible to
-// receive new jobs (neither draining nor stale). This is a placeholder for the
-// capacity-aware scheduler introduced by #9; that epic replaces the selection
-// policy but the draining/stale skip established here must remain.
-func (s *Server) pickWorker() (*worker, bool) {
+// pickWorker selects the best-fit worker for the model via the capacity-aware
+// scheduler (#9): it scores the current fleet snapshot and returns the live
+// worker handle for the winning id. The scheduler already filters out
+// draining/stale workers (Status != Online), so the selection respects the
+// liveness rules. Returns false when no worker is runnable for the model.
+//
+// There is an inherent snapshot-vs-handle window: the scheduler picks from a
+// point-in-time Fleet snapshot, and the chosen worker may have disconnected or
+// begun draining by the time we resolve its handle. We re-check the live handle
+// with available() under the registry lock to close the obvious cases; a job
+// dispatched into a worker that drops immediately after still fails cleanly via
+// the worker's failAllPending.
+func (s *Server) pickWorker(model string) (*worker, bool) {
+	id, ok := scheduler.Pick(s.Fleet(), model)
+	if !ok {
+		return nil, false
+	}
 	now := s.now()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, w := range s.workers {
-		if w.available(now, s.heartbeatTimeout) {
-			return w, true
+	w, ok := s.workers[id]
+	if ok && !w.available(now, s.heartbeatTimeout) {
+		ok = false
+	}
+	s.mu.RUnlock()
+	return w, ok
+}
+
+// dispatchTo hands job to worker w and blocks until the worker returns a result,
+// the context is done, or the worker's stream drops (failAllPending). It is the
+// shared dispatch primitive used by both the synchronous SubmitJob fast path and
+// the background placement loop. On ctx cancellation it cleans up the worker's
+// pending entry so no waiter leaks.
+func (s *Server) dispatchTo(ctx context.Context, w *worker, job types.Job) (types.JobResult, error) {
+	resCh := w.addPending(job.ID)
+	// Hand the job to the worker's writer goroutine. Use select so a cancelled
+	// caller (or a writer goroutine that has already exited) does not block us
+	// forever on a full or unread send channel.
+	select {
+	case w.send <- &agentgpuv1.ServerMessage{
+		Payload: &agentgpuv1.ServerMessage_Job{Job: job.Proto()},
+	}:
+	case <-ctx.Done():
+		w.mu.Lock()
+		delete(w.pending, job.ID)
+		w.mu.Unlock()
+		return types.JobResult{}, ctx.Err()
+	}
+
+	select {
+	case <-ctx.Done():
+		w.mu.Lock()
+		delete(w.pending, job.ID)
+		w.mu.Unlock()
+		return types.JobResult{}, ctx.Err()
+	case res := <-resCh:
+		if res.Err != nil {
+			return res, res.Err
+		}
+		return res, nil
+	}
+}
+
+// placeLoop is the background placement loop: it dequeues the highest-priority
+// queued job, waits for a worker that can run it (woken promptly by a capacity
+// signal, with a bounded periodic re-check as a backstop), dispatches it, and
+// resolves the waiter the blocked SubmitJob caller holds. It mirrors the
+// eviction loop's Start/Close lifecycle. Each dequeued job is dispatched exactly
+// once: it leaves the queue on DequeueWait and is handed to exactly one worker.
+func (s *Server) placeLoop() {
+	defer close(s.placeDone)
+
+	// The loop's lifetime context is cancelled on Close so a parked DequeueWait
+	// and an in-flight placement both unwind.
+	ctx, cancel := s.placeContext()
+	defer cancel()
+
+	for {
+		item, err := s.queue.DequeueWait(ctx)
+		if err != nil {
+			// ErrClosed (queue closed on shutdown) or ctx cancelled: stop.
+			return
+		}
+		s.placeItem(ctx, item)
+	}
+}
+
+// placeContext returns a context cancelled when the placement loop is asked to
+// stop (placeStop closed).
+func (s *Server) placeContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.placeStop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+// placeItem waits for a runnable worker for the dequeued item and dispatches it,
+// resolving the caller's waiter with the result. If the loop is stopping before
+// a worker appears, the item's waiter is failed so the caller does not hang.
+func (s *Server) placeItem(ctx context.Context, item queue.Item) {
+	ticker := time.NewTicker(s.placeScan)
+	defer ticker.Stop()
+
+	for {
+		if w, ok := s.pickWorker(item.Job.Model); ok {
+			s.log.Info("placing queued job", "key_id", item.Key, "model", item.Job.Model,
+				"priority", int(item.Priority), "worker", w.id)
+			// Dispatch and forward the result to the original caller's waiter. A
+			// fresh context bounds the dispatch to the loop's lifetime (cancelled
+			// on Close); the caller's own ctx cancellation is handled separately by
+			// SubmitJob, which drops its waiter on cancel.
+			res, err := s.dispatchTo(ctx, w, item.Job)
+			if err != nil {
+				res = types.JobResult{JobID: item.Job.ID, Err: jobErr(err)}
+			}
+			s.resolveWaiter(res)
+			return
+		}
+		// No worker yet: park until capacity changes, a periodic re-check, or the
+		// loop stops.
+		select {
+		case <-ctx.Done():
+			s.resolveWaiter(types.JobResult{
+				JobID: item.Job.ID,
+				Err:   &types.JobError{Code: "shutting_down", Message: "server shutting down"},
+			})
+			return
+		case <-s.capacity:
+		case <-ticker.C:
 		}
 	}
-	return nil, false
 }
+
+// jobErr coerces an error into a *types.JobError for delivery through a waiter.
+func jobErr(err error) *types.JobError {
+	var je *types.JobError
+	if errors.As(err, &je) {
+		return je
+	}
+	return &types.JobError{Code: "dispatch_failed", Message: err.Error()}
+}
+
+// QueueStats returns an observable snapshot of the job queue depth (total and a
+// per-priority breakdown). It delegates to the queue and is the metrics seam for
+// #24 (Prometheus) until that lands.
+func (s *Server) QueueStats() queue.Stats { return s.queue.Stats() }
 
 // Fleet returns a point-in-time snapshot of every connected worker, including
 // its reported capacity and computed status (online/draining/stale). It is the
@@ -649,7 +932,12 @@ func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job 
 	if err := s.quota.CheckAndReserve(ctx, key); err != nil {
 		return types.JobResult{}, err
 	}
-	res, err := s.SubmitJob(ctx, job)
+	// Derive the queue priority from the key's roles so that, under contention,
+	// higher-privilege keys are placed ahead of lower ones. The priority only
+	// matters if the job has to queue (no worker fits now); the fast path is
+	// unaffected.
+	prio := scheduler.PriorityForRoles(key.Roles)
+	res, err := s.submit(ctx, job, key.ID, prio)
 	// Record whatever tokens the job produced (zero on dispatch failure). The
 	// request itself was already reserved against RPM above.
 	s.quota.RecordTokens(ctx, key.ID, res.Tokens)
@@ -663,40 +951,62 @@ func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job 
 // graceful-shutdown checkpointing by the cmd layer).
 func (s *Server) Quota() *quota.Engine { return s.quota }
 
-// SubmitJob dispatches a job to a connected worker and waits for the result.
-// This is the minimal foundational dispatch primitive with no authorization;
-// callers on the public request path must use SubmitAuthorizedJob so inference
-// is gated. Queueing and capacity-aware scheduling remain out of scope.
+// SubmitJob dispatches a job to a worker and waits for the result. This is the
+// minimal foundational dispatch primitive with no authorization; callers on the
+// public request path must use SubmitAuthorizedJob so inference is gated.
+//
+// As of #9 the selection is capacity-aware (scheduler.Pick) and a job that fits
+// no worker right now is QUEUED (not dropped): the call blocks until the
+// background placement loop finds a worker and resolves the result, or ctx is
+// done. Keyless internal callers queue at PriorityNormal so the priority lane is
+// well-defined; the public path derives priority from the key's roles via
+// SubmitAuthorizedJob.
 func (s *Server) SubmitJob(ctx context.Context, job types.Job) (types.JobResult, error) {
+	return s.submit(ctx, job, "", queue.PriorityNormal)
+}
+
+// submit is the shared dispatch core. It validates the job, tries an immediate
+// capacity-aware placement, and — on a miss — enqueues the job at the given
+// priority and blocks the caller on a server-level waiter until the placement
+// loop dispatches it. A queue.ErrQueueFull (bounded queue at depth) is returned
+// to the caller for backpressure; ctx cancellation returns ctx.Err() and cleans
+// up the waiter so nothing leaks.
+func (s *Server) submit(ctx context.Context, job types.Job, keyID string, prio queue.Priority) (types.JobResult, error) {
 	if err := job.Validate(); err != nil {
 		return types.JobResult{}, err
 	}
 
-	w, ok := s.pickWorker()
-	if !ok {
-		return types.JobResult{}, ErrNoWorkers
+	// Fast path: a worker fits right now. Dispatch synchronously.
+	if w, ok := s.pickWorker(job.Model); ok {
+		return s.dispatchTo(ctx, w, job)
 	}
 
-	resCh := w.addPending(job.ID)
-	// Hand the job to the worker's writer goroutine. Use select so a cancelled
-	// caller (or a writer goroutine that has already exited) does not block us
-	// forever on a full or unread send channel.
-	select {
-	case w.send <- &agentgpuv1.ServerMessage{
-		Payload: &agentgpuv1.ServerMessage_Job{Job: job.Proto()},
-	}:
-	case <-ctx.Done():
-		w.mu.Lock()
-		delete(w.pending, job.ID)
-		w.mu.Unlock()
-		return types.JobResult{}, ctx.Err()
+	// No worker fits: queue the job and block on a waiter the placement loop will
+	// resolve once it places the job on a worker. Register the waiter BEFORE
+	// enqueueing so the loop cannot dispatch-and-resolve before we are listening.
+	resCh := s.addWaiter(job.ID)
+	if err := s.queue.Enqueue(job, keyID, prio); err != nil {
+		// Could not queue (full or closed): drop the waiter and surface the error.
+		s.removeWaiter(job.ID)
+		if errors.Is(err, queue.ErrClosed) {
+			return types.JobResult{}, ErrShuttingDown
+		}
+		s.log.Warn("job rejected: queue full", "key_id", keyID, "model", job.Model,
+			"priority", int(prio), "reason", "queue_full")
+		return types.JobResult{}, err
 	}
+	s.log.Info("job queued: no worker available", "key_id", keyID, "model", job.Model,
+		"priority", int(prio), "reason", "no_runnable_worker")
+	// A worker may appear concurrently; nudge the placement loop in case the
+	// capacity signal that would have woken it landed before we enqueued.
+	s.signalCapacity()
 
 	select {
 	case <-ctx.Done():
-		w.mu.Lock()
-		delete(w.pending, job.ID)
-		w.mu.Unlock()
+		// Caller gave up. Drop the waiter so the placement loop's later resolve is a
+		// harmless no-op (the job, if still queued, is dispatched but its result is
+		// discarded — at-least-once dispatch, never lost mid-flight).
+		s.removeWaiter(job.ID)
 		return types.JobResult{}, ctx.Err()
 	case res := <-resCh:
 		if res.Err != nil {

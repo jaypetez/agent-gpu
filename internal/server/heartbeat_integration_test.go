@@ -296,13 +296,15 @@ func TestDrainStopsRoutingButFinishesInFlight(t *testing.T) {
 		return ok && w.Status == types.WorkerDraining
 	})
 
-	// AC4: while draining, no new routing — pickWorker skips it. Use a bounded
-	// context so this never blocks even if a stray job were enqueued.
-	probeCtx, cancelProbe := context.WithTimeout(context.Background(), time.Second)
+	// AC4: while draining, no new routing — the scheduler skips the draining
+	// worker. With no other runnable worker the new job is queued (not dropped)
+	// and the bounded-context caller times out rather than reaching the draining
+	// worker.
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancelProbe()
 	if _, err := h.srv.SubmitJob(probeCtx,
-		types.Job{ID: "new", Model: "llama3", Prompt: "y"}); !errors.Is(err, server.ErrNoWorkers) {
-		t.Fatalf("dispatch to draining worker = %v, want ErrNoWorkers", err)
+		types.Job{ID: "new", Model: "llama3", Prompt: "y"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dispatch to draining worker = %v, want context deadline (queued, not routed)", err)
 	}
 
 	// The in-flight job must still be allowed to finish: send its result.
@@ -360,9 +362,14 @@ func TestDrainWorkerAdminSeam(t *testing.T) {
 	if !ok || w.Status != types.WorkerDraining {
 		t.Fatalf("fleet status = %v ok=%v, want draining", w.Status, ok)
 	}
-	if _, err := h.srv.SubmitJob(context.Background(),
-		types.Job{ID: "j", Model: "llama3", Prompt: "x"}); !errors.Is(err, server.ErrNoWorkers) {
-		t.Fatalf("dispatch to drained worker = %v, want ErrNoWorkers", err)
+	// With the only worker draining and no other runnable worker, the job is
+	// queued (not routed to the draining worker); a bounded-context caller times
+	// out rather than dispatching to it.
+	probeCtx, cancelProbe := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelProbe()
+	if _, err := h.srv.SubmitJob(probeCtx,
+		types.Job{ID: "j", Model: "llama3", Prompt: "x"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dispatch to drained worker = %v, want context deadline (queued, not routed)", err)
 	}
 }
 
