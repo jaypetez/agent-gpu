@@ -14,7 +14,7 @@ import (
 	"log/slog"
 	"math"
 	"math/rand"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,27 +25,6 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
 )
-
-// Executor runs an inference job and returns its result. The default echo
-// executor is a stub; the Ollama epic provides the real implementation.
-type Executor interface {
-	Execute(ctx context.Context, job types.Job) types.JobResult
-}
-
-// EchoExecutor is the stub executor: it echoes the prompt back as output.
-type EchoExecutor struct{}
-
-// Execute implements Executor. It reports a token count equal to the number of
-// whitespace-separated tokens in the output so quota accounting (#5) is
-// testable now; real token counts arrive with the Ollama integration (#11).
-func (EchoExecutor) Execute(_ context.Context, job types.Job) types.JobResult {
-	output := "echo: " + job.Prompt
-	return types.JobResult{
-		JobID:  job.ID,
-		Output: output,
-		Tokens: uint64(len(strings.Fields(output))),
-	}
-}
 
 // Backoff configures exponential reconnect backoff with full jitter.
 type Backoff struct {
@@ -89,8 +68,9 @@ type Config struct {
 	ServerAddr string
 	// WorkerID is this worker's stable identifier.
 	WorkerID string
-	// Models advertised at registration and reported as available_models in
-	// heartbeats.
+	// Models advertised at registration. They seed the registration message and
+	// serve as a fallback/override; once running, heartbeats report the models
+	// the Executor lists (sourced from Ollama's /api/tags for the real worker).
 	Models []types.Model
 	// HeartbeatInterval between heartbeats. Defaults to 15s.
 	HeartbeatInterval time.Duration
@@ -119,7 +99,7 @@ func (c *Config) withDefaults() {
 		c.Backoff = DefaultBackoff
 	}
 	if c.Executor == nil {
-		c.Executor = EchoExecutor{}
+		c.Executor = EchoExecutor{Models: c.Models}
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -135,15 +115,47 @@ type Worker struct {
 	// the session ID returned by the server. Used by tests to observe
 	// (re)connection events and assert per-session invariants.
 	onConnect func(sessionID string)
+
+	// modelsMu guards models, the most recent successful Executor.ListModels
+	// result, refreshed before each heartbeat and after a pull. It is reported as
+	// available_models so the server's fleet view tracks model availability
+	// (including newly pulled models) without re-registration. It is seeded from
+	// the configured Models so a worker advertises something before its first
+	// refresh.
+	modelsMu sync.Mutex
+	models   []types.Model
 }
 
 // New constructs a Worker from config.
 func New(cfg Config) *Worker {
 	cfg.withDefaults()
 	return &Worker{
-		cfg: cfg,
-		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		cfg:    cfg,
+		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		models: cfg.Models,
 	}
+}
+
+// currentModels returns a copy of the most recently cached model list.
+func (w *Worker) currentModels() []types.Model {
+	w.modelsMu.Lock()
+	defer w.modelsMu.Unlock()
+	return append([]types.Model(nil), w.models...)
+}
+
+// refreshModels asks the Executor for the current model list and caches it.
+// A failure (e.g. Ollama unreachable) leaves the previous cache intact and is
+// logged at debug level; the worker keeps advertising what it last knew rather
+// than flapping to empty on a transient blip.
+func (w *Worker) refreshModels(ctx context.Context) {
+	models, err := w.cfg.Executor.ListModels(ctx)
+	if err != nil {
+		w.cfg.Logger.Debug("list models failed; keeping cached set", "worker", w.cfg.WorkerID, "err", err)
+		return
+	}
+	w.modelsMu.Lock()
+	w.models = models
+	w.modelsMu.Unlock()
 }
 
 // OnConnect registers a callback invoked after each successful registration
@@ -155,6 +167,13 @@ func (w *Worker) OnConnect(fn func(sessionID string)) { w.onConnect = fn }
 // exponential backoff until ctx is cancelled. It returns ctx.Err() on
 // cancellation and only returns a non-context error if it cannot proceed.
 func (w *Worker) Run(ctx context.Context) error {
+	// Detect the local inference backend on startup. A reachable backend logs its
+	// version and seeds the model cache; an unreachable one logs a clear warning
+	// and the worker continues DEGRADED — it still registers and heartbeats (with
+	// whatever models it last knew, possibly none) so the fleet sees it. This is
+	// best-effort and bounded so a slow/hung backend cannot wedge startup.
+	w.detectBackend(ctx)
+
 	attempt := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -182,6 +201,37 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// versionReporter is an optional Executor capability: a backend that can report
+// its version (Ollama does; the echo stub does not). detectBackend uses it for
+// the startup probe.
+type versionReporter interface {
+	Version(ctx context.Context) (string, error)
+}
+
+// detectBackend performs the startup backend probe: it reports the backend
+// version (if the Executor supports it) and refreshes the model cache. A
+// version probe failure is logged as a clear DEGRADED warning and is
+// non-fatal — the worker still registers and heartbeats. The probe is bounded
+// by a short timeout so an unresponsive backend cannot wedge startup.
+func (w *Worker) detectBackend(ctx context.Context) {
+	vr, ok := w.cfg.Executor.(versionReporter)
+	if !ok {
+		// Stub/no-version executor: just seed the model cache best-effort.
+		w.refreshModels(ctx)
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	version, err := vr.Version(probeCtx)
+	if err != nil {
+		w.cfg.Logger.Warn("ollama not reachable at startup; running degraded (will still register/heartbeat)",
+			"worker", w.cfg.WorkerID, "err", err)
+		return
+	}
+	w.cfg.Logger.Info("detected ollama", "worker", w.cfg.WorkerID, "version", version)
+	w.refreshModels(probeCtx)
 }
 
 // dial opens a gRPC connection to the server.
@@ -235,7 +285,7 @@ func (w *Worker) runOnce(ctx context.Context, resetBackoff func()) error {
 		Payload: &agentgpuv1.WorkerMessage_Register{
 			Register: &agentgpuv1.Register{
 				WorkerId: w.cfg.WorkerID,
-				Models:   types.ModelsToProto(w.cfg.Models),
+				Models:   types.ModelsToProto(w.currentModels()),
 			},
 		},
 	}); err != nil {
@@ -276,9 +326,12 @@ func (w *Worker) runOnce(ctx context.Context, resetBackoff func()) error {
 // transient stream drop (reconnect) surfaces via recvErr and does NOT — a
 // recovering worker must not be wrongly drained.
 func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.ControlPlane_ConnectClient) error {
-	results := make(chan types.JobResult, 8)
+	// chunks carries every streaming JobChunk (per-token deltas and terminal
+	// chunks) from the job worker to this loop, the single owner of stream.Send.
+	chunks := make(chan types.JobChunk, 64)
 	recvErr := make(chan error, 1)
 	jobs := make(chan types.Job, 8)
+	pulls := make(chan string, 8)
 
 	// activeJobs counts jobs currently executing, reported in heartbeats. It is
 	// touched by the job-worker goroutine and read by this loop, so it must be
@@ -293,15 +346,31 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 				recvErr <- err
 				return
 			}
-			if job := msg.GetJob(); job != nil {
-				jobs <- types.JobFromProto(job)
+			switch p := msg.Payload.(type) {
+			case *agentgpuv1.ServerMessage_Job:
+				jobs <- types.JobFromProto(p.Job)
+			case *agentgpuv1.ServerMessage_PullModel:
+				if pm := p.PullModel; pm != nil {
+					pulls <- pm.GetModel()
+				}
 			}
 		}
 	}()
 
-	// Job worker: execute jobs (stub) and queue results for sending. active-job
-	// accounting brackets execution: increment when a job is dequeued, decrement
-	// once its result is queued (or the connection ends).
+	// emit forwards a streaming chunk to the send loop. It is the callback the
+	// Executor calls per token; it drops on connCtx so a dropped connection does
+	// not wedge the executor on a full channel.
+	emit := func(c types.JobChunk) {
+		select {
+		case chunks <- c:
+		case <-connCtx.Done():
+		}
+	}
+
+	// Job worker: execute jobs, streaming each output delta as a JobChunk and a
+	// terminal JobChunk{Done:true} carrying tokens or error. active-job accounting
+	// brackets execution: increment when a job is dequeued, decrement once its
+	// terminal chunk is queued (or the connection ends).
 	go func() {
 		for {
 			select {
@@ -309,19 +378,44 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 				return
 			case job := <-jobs:
 				atomic.AddInt32(&activeJobs, 1)
-				res := w.cfg.Executor.Execute(connCtx, job)
-				select {
-				case results <- res:
-					atomic.AddInt32(&activeJobs, -1)
-				case <-connCtx.Done():
-					atomic.AddInt32(&activeJobs, -1)
-					return
+				res := w.cfg.Executor.Execute(connCtx, job, emit)
+				// Always send a terminal chunk so the server's accumulator resolves the
+				// waiter exactly once — even on failure, so the waiter never hangs.
+				emit(types.JobChunk{
+					JobID:  job.ID,
+					Done:   true,
+					Err:    res.Err,
+					Tokens: res.Tokens,
+				})
+				atomic.AddInt32(&activeJobs, -1)
+			}
+		}
+	}()
+
+	// Pull worker: handle PullModel control messages off the receive path so a
+	// long pull does not block job dispatch. On success it refreshes the model
+	// cache so the next heartbeat advertises the newly pulled model.
+	go func() {
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case model := <-pulls:
+				if err := w.cfg.Executor.Pull(connCtx, model); err != nil {
+					w.cfg.Logger.Warn("model pull failed", "worker", w.cfg.WorkerID, "model", model, "err", err)
+					continue
 				}
+				w.cfg.Logger.Info("model pulled", "worker", w.cfg.WorkerID, "model", model)
+				w.refreshModels(connCtx)
 			}
 		}
 	}()
 
 	sendHeartbeat := func() error {
+		// Refresh the model cache so the heartbeat advertises the live set
+		// (sourced from Ollama for the real worker); a refresh failure keeps the
+		// last-known set.
+		w.refreshModels(connCtx)
 		return stream.Send(&agentgpuv1.WorkerMessage{
 			Payload: &agentgpuv1.WorkerMessage_Heartbeat{
 				Heartbeat: w.heartbeat(uint32(atomic.LoadInt32(&activeJobs))),
@@ -358,9 +452,9 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 			if err := sendHeartbeat(); err != nil {
 				return err
 			}
-		case res := <-results:
+		case c := <-chunks:
 			if err := stream.Send(&agentgpuv1.WorkerMessage{
-				Payload: &agentgpuv1.WorkerMessage_Result{Result: res.Proto()},
+				Payload: &agentgpuv1.WorkerMessage_Chunk{Chunk: c.Proto()},
 			}); err != nil {
 				return err
 			}
@@ -411,6 +505,6 @@ func (w *Worker) heartbeat(activeJobs uint32) *agentgpuv1.Heartbeat {
 		FreeVRAM:        w.cfg.FreeVRAM,
 		Load:            w.cfg.Load,
 		GPUType:         w.cfg.GPUType,
-		AvailableModels: w.cfg.Models,
+		AvailableModels: w.currentModels(),
 	}.Proto()
 }

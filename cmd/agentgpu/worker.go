@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/jaypetez/agent-gpu/internal/config"
+	"github.com/jaypetez/agent-gpu/internal/ollama"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	"github.com/jaypetez/agent-gpu/internal/worker"
 )
@@ -36,7 +37,8 @@ func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	srvAddr := fs.String("server", "", "gRPC server address (host:port)")
 	id := fs.String("id", "", "worker id (defaults to hostname)")
 	hbInterval := fs.Duration("heartbeat-interval", 0, "heartbeat cadence (default 15s or $AGENTGPU_HEARTBEAT_INTERVAL)")
-	modelsFlag := fs.String("models", "", "comma-separated models this worker serves (advertised at registration; routing key)")
+	modelsFlag := fs.String("models", "", "comma-separated models this worker serves (fallback/override; live set is sourced from Ollama)")
+	ollamaURL := fs.String("ollama-url", "", "local Ollama base URL (default http://localhost:11434 or $AGENTGPU_OLLAMA_URL)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -47,16 +49,25 @@ func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	}
 	heartbeatInterval := config.ResolveHeartbeatInterval(*hbInterval, nil)
 	models := parseModels(*modelsFlag)
+	resolvedOllamaURL := config.ResolveOllamaURL(*ollamaURL, nil)
+
+	// The real worker runs inference against the local Ollama instance. Model
+	// detection, listing, streaming chat, and permission-gated pull all flow
+	// through this executor; --models is a fallback/override the worker seeds with
+	// until Ollama's /api/tags is reachable.
+	executor := worker.NewOllamaExecutor(ollama.New(resolvedOllamaURL))
 
 	w := worker.New(worker.Config{
 		ServerAddr:        cfg.ServerAddr,
 		WorkerID:          cfg.WorkerID,
 		Models:            models,
 		HeartbeatInterval: heartbeatInterval,
+		Executor:          executor,
 		Logger:            logger,
 	})
 
-	logger.Info("starting worker", "id", cfg.WorkerID, "server", cfg.ServerAddr, "models", len(models))
+	logger.Info("starting worker", "id", cfg.WorkerID, "server", cfg.ServerAddr,
+		"models", len(models), "ollama_url", resolvedOllamaURL)
 	if err := w.Run(ctx); err != nil && err != context.Canceled {
 		return err
 	}

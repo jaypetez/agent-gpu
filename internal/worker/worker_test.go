@@ -54,13 +54,20 @@ func TestBackoffZeroValueUsesDefaults(t *testing.T) {
 
 func TestEchoExecutor(t *testing.T) {
 	t.Parallel()
-	res := EchoExecutor{}.Execute(context.Background(), types.Job{ID: "j1", Prompt: "hi"})
+	var deltas []string
+	emit := func(c types.JobChunk) { deltas = append(deltas, c.Delta) }
+	res := EchoExecutor{}.Execute(context.Background(), types.Job{ID: "j1", Prompt: "hi"}, emit)
 	if res.JobID != "j1" || res.Output != "echo: hi" || res.Err != nil {
 		t.Fatalf("unexpected echo result: %+v", res)
 	}
 	// "echo: hi" -> 2 whitespace tokens, reported for quota accounting (#5).
 	if res.Tokens != 2 {
 		t.Fatalf("tokens = %d, want 2", res.Tokens)
+	}
+	// The echo executor streams its output as a single delta chunk so the server
+	// accumulates exactly the final output.
+	if len(deltas) != 1 || deltas[0] != "echo: hi" {
+		t.Fatalf("emitted deltas = %v, want one delta %q", deltas, "echo: hi")
 	}
 }
 
@@ -78,7 +85,7 @@ func TestEchoExecutorTokenCount(t *testing.T) {
 		{"  spaced   out  ", 3}, // "echo:" + "spaced" + "out"; runs collapse -> 3
 	}
 	for _, tc := range cases {
-		res := EchoExecutor{}.Execute(context.Background(), types.Job{ID: "j", Prompt: tc.prompt})
+		res := EchoExecutor{}.Execute(context.Background(), types.Job{ID: "j", Prompt: tc.prompt}, nil)
 		if res.Tokens != tc.want {
 			t.Fatalf("prompt %q: tokens = %d, want %d (output %q)", tc.prompt, res.Tokens, tc.want, res.Output)
 		}

@@ -18,6 +18,7 @@ const (
 	EnvQuotaPath         = "AGENTGPU_QUOTA_PATH"
 	EnvHeartbeatInterval = "AGENTGPU_HEARTBEAT_INTERVAL"
 	EnvHeartbeatTimeout  = "AGENTGPU_HEARTBEAT_TIMEOUT"
+	EnvOllamaURL         = "AGENTGPU_OLLAMA_URL"
 )
 
 // Defaults.
@@ -28,6 +29,8 @@ const (
 	// DefaultHeartbeatTimeout is the server's stale-eviction window (3x the
 	// interval, so a single dropped heartbeat does not evict a live worker).
 	DefaultHeartbeatTimeout = 45 * time.Second
+	// DefaultOllamaURL is the address a local Ollama listens on by default.
+	DefaultOllamaURL = "http://localhost:11434"
 )
 
 // ServerConfig configures the server process.
@@ -121,6 +124,18 @@ func ResolveHeartbeatTimeout(flagValue time.Duration, look EnvLookup) time.Durat
 		return flagValue
 	}
 	return durationEnvOr(look, EnvHeartbeatTimeout, DefaultHeartbeatTimeout)
+}
+
+// ResolveOllamaURL resolves the worker's local Ollama base URL with flag > env
+// > default precedence. An empty flag value means "unset".
+func ResolveOllamaURL(flagValue string, look EnvLookup) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvOllamaURL, DefaultOllamaURL)
 }
 
 // DefaultStorePath returns the default keys-file location, ~/.agentgpu/keys.json,

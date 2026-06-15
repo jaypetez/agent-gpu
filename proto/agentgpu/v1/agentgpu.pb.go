@@ -283,6 +283,100 @@ func (x *JobResult) GetTokens() uint64 {
 	return 0
 }
 
+// JobChunk is an incremental piece of a streaming job's output, sent
+// worker -> server as tokens are produced. The server accumulates the deltas
+// per job_id and, on the terminal chunk (done = true), resolves the pending
+// job waiter with the final JobResult. This carries inference output as a true
+// stream rather than a single final JobResult so the request path (#13) can
+// forward it to clients as SSE.
+//
+// Per-token chunks carry delta (and done = false); the final chunk carries
+// done = true plus the total tokens count, or done = true plus error on
+// failure. delta is empty on the terminal chunk.
+type JobChunk struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Echoes Job.id so the server can correlate and accumulate.
+	JobId string `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	// Incremental output produced since the previous chunk (empty on the
+	// terminal chunk).
+	Delta string `protobuf:"bytes,2,opt,name=delta,proto3" json:"delta,omitempty"`
+	// True on the final chunk for this job; no further chunks follow.
+	Done bool `protobuf:"varint,3,opt,name=done,proto3" json:"done,omitempty"`
+	// Set on the terminal chunk when the job failed; accumulated output is then
+	// discarded by the server in favor of the error.
+	Error *Error `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	// Total tokens generated/consumed by the job, reported on the terminal chunk
+	// for quota accounting (#5). Zero means "no tokens reported".
+	Tokens        uint64 `protobuf:"varint,5,opt,name=tokens,proto3" json:"tokens,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JobChunk) Reset() {
+	*x = JobChunk{}
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JobChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JobChunk) ProtoMessage() {}
+
+func (x *JobChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JobChunk.ProtoReflect.Descriptor instead.
+func (*JobChunk) Descriptor() ([]byte, []int) {
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *JobChunk) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *JobChunk) GetDelta() string {
+	if x != nil {
+		return x.Delta
+	}
+	return ""
+}
+
+func (x *JobChunk) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *JobChunk) GetError() *Error {
+	if x != nil {
+		return x.Error
+	}
+	return nil
+}
+
+func (x *JobChunk) GetTokens() uint64 {
+	if x != nil {
+		return x.Tokens
+	}
+	return 0
+}
+
 // Register is the first message a worker sends on the stream. It identifies
 // the worker and advertises the models it can serve.
 type Register struct {
@@ -297,7 +391,7 @@ type Register struct {
 
 func (x *Register) Reset() {
 	*x = Register{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[4]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -309,7 +403,7 @@ func (x *Register) String() string {
 func (*Register) ProtoMessage() {}
 
 func (x *Register) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[4]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -322,7 +416,7 @@ func (x *Register) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Register.ProtoReflect.Descriptor instead.
 func (*Register) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{4}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *Register) GetWorkerId() string {
@@ -350,7 +444,7 @@ type RegisterAck struct {
 
 func (x *RegisterAck) Reset() {
 	*x = RegisterAck{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[5]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -362,7 +456,7 @@ func (x *RegisterAck) String() string {
 func (*RegisterAck) ProtoMessage() {}
 
 func (x *RegisterAck) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[5]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -375,7 +469,7 @@ func (x *RegisterAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterAck.ProtoReflect.Descriptor instead.
 func (*RegisterAck) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{5}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RegisterAck) GetSessionId() string {
@@ -412,7 +506,7 @@ type Heartbeat struct {
 
 func (x *Heartbeat) Reset() {
 	*x = Heartbeat{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[6]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -424,7 +518,7 @@ func (x *Heartbeat) String() string {
 func (*Heartbeat) ProtoMessage() {}
 
 func (x *Heartbeat) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[6]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -437,7 +531,7 @@ func (x *Heartbeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Heartbeat.ProtoReflect.Descriptor instead.
 func (*Heartbeat) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{6}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *Heartbeat) GetWorkerId() string {
@@ -501,7 +595,7 @@ type Deregister struct {
 
 func (x *Deregister) Reset() {
 	*x = Deregister{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -513,7 +607,7 @@ func (x *Deregister) String() string {
 func (*Deregister) ProtoMessage() {}
 
 func (x *Deregister) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[7]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -526,12 +620,62 @@ func (x *Deregister) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Deregister.ProtoReflect.Descriptor instead.
 func (*Deregister) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{7}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *Deregister) GetWorkerId() string {
 	if x != nil {
 		return x.WorkerId
+	}
+	return ""
+}
+
+// PullModel instructs a worker to fetch a model onto its local Ollama. The
+// server sends it only after authorizing the requesting key for the Pull
+// action (#11); the worker pulls the model and refreshes its advertised model
+// list on its next heartbeat. This is an additive, fire-and-forget control
+// message; pull progress/results are not streamed back today.
+type PullModel struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Name of the model to pull (e.g. "llama3").
+	Model         string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PullModel) Reset() {
+	*x = PullModel{}
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PullModel) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PullModel) ProtoMessage() {}
+
+func (x *PullModel) ProtoReflect() protoreflect.Message {
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PullModel.ProtoReflect.Descriptor instead.
+func (*PullModel) Descriptor() ([]byte, []int) {
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *PullModel) GetModel() string {
+	if x != nil {
+		return x.Model
 	}
 	return ""
 }
@@ -545,6 +689,7 @@ type WorkerMessage struct {
 	//	*WorkerMessage_Heartbeat
 	//	*WorkerMessage_Result
 	//	*WorkerMessage_Deregister
+	//	*WorkerMessage_Chunk
 	Payload       isWorkerMessage_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -552,7 +697,7 @@ type WorkerMessage struct {
 
 func (x *WorkerMessage) Reset() {
 	*x = WorkerMessage{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -564,7 +709,7 @@ func (x *WorkerMessage) String() string {
 func (*WorkerMessage) ProtoMessage() {}
 
 func (x *WorkerMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[8]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -577,7 +722,7 @@ func (x *WorkerMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WorkerMessage.ProtoReflect.Descriptor instead.
 func (*WorkerMessage) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{8}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *WorkerMessage) GetPayload() isWorkerMessage_Payload {
@@ -623,6 +768,15 @@ func (x *WorkerMessage) GetDeregister() *Deregister {
 	return nil
 }
 
+func (x *WorkerMessage) GetChunk() *JobChunk {
+	if x != nil {
+		if x, ok := x.Payload.(*WorkerMessage_Chunk); ok {
+			return x.Chunk
+		}
+	}
+	return nil
+}
+
 type isWorkerMessage_Payload interface {
 	isWorkerMessage_Payload()
 }
@@ -643,6 +797,10 @@ type WorkerMessage_Deregister struct {
 	Deregister *Deregister `protobuf:"bytes,4,opt,name=deregister,proto3,oneof"`
 }
 
+type WorkerMessage_Chunk struct {
+	Chunk *JobChunk `protobuf:"bytes,5,opt,name=chunk,proto3,oneof"`
+}
+
 func (*WorkerMessage_Register) isWorkerMessage_Payload() {}
 
 func (*WorkerMessage_Heartbeat) isWorkerMessage_Payload() {}
@@ -651,6 +809,8 @@ func (*WorkerMessage_Result) isWorkerMessage_Payload() {}
 
 func (*WorkerMessage_Deregister) isWorkerMessage_Payload() {}
 
+func (*WorkerMessage_Chunk) isWorkerMessage_Payload() {}
+
 // ServerMessage is the server -> worker side of the bidi stream.
 type ServerMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -658,6 +818,7 @@ type ServerMessage struct {
 	//
 	//	*ServerMessage_RegisterAck
 	//	*ServerMessage_Job
+	//	*ServerMessage_PullModel
 	Payload       isServerMessage_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -665,7 +826,7 @@ type ServerMessage struct {
 
 func (x *ServerMessage) Reset() {
 	*x = ServerMessage{}
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[9]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -677,7 +838,7 @@ func (x *ServerMessage) String() string {
 func (*ServerMessage) ProtoMessage() {}
 
 func (x *ServerMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[9]
+	mi := &file_agentgpu_v1_agentgpu_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -690,7 +851,7 @@ func (x *ServerMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerMessage.ProtoReflect.Descriptor instead.
 func (*ServerMessage) Descriptor() ([]byte, []int) {
-	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{9}
+	return file_agentgpu_v1_agentgpu_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ServerMessage) GetPayload() isServerMessage_Payload {
@@ -718,6 +879,15 @@ func (x *ServerMessage) GetJob() *Job {
 	return nil
 }
 
+func (x *ServerMessage) GetPullModel() *PullModel {
+	if x != nil {
+		if x, ok := x.Payload.(*ServerMessage_PullModel); ok {
+			return x.PullModel
+		}
+	}
+	return nil
+}
+
 type isServerMessage_Payload interface {
 	isServerMessage_Payload()
 }
@@ -730,9 +900,15 @@ type ServerMessage_Job struct {
 	Job *Job `protobuf:"bytes,2,opt,name=job,proto3,oneof"`
 }
 
+type ServerMessage_PullModel struct {
+	PullModel *PullModel `protobuf:"bytes,3,opt,name=pull_model,json=pullModel,proto3,oneof"`
+}
+
 func (*ServerMessage_RegisterAck) isServerMessage_Payload() {}
 
 func (*ServerMessage_Job) isServerMessage_Payload() {}
+
+func (*ServerMessage_PullModel) isServerMessage_Payload() {}
 
 var File_agentgpu_v1_agentgpu_proto protoreflect.FileDescriptor
 
@@ -753,7 +929,13 @@ const file_agentgpu_v1_agentgpu_proto_rawDesc = "" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x16\n" +
 	"\x06output\x18\x02 \x01(\tR\x06output\x12(\n" +
 	"\x05error\x18\x03 \x01(\v2\x12.agentgpu.v1.ErrorR\x05error\x12\x16\n" +
-	"\x06tokens\x18\x04 \x01(\x04R\x06tokens\"S\n" +
+	"\x06tokens\x18\x04 \x01(\x04R\x06tokens\"\x8d\x01\n" +
+	"\bJobChunk\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
+	"\x05delta\x18\x02 \x01(\tR\x05delta\x12\x12\n" +
+	"\x04done\x18\x03 \x01(\bR\x04done\x12(\n" +
+	"\x05error\x18\x04 \x01(\v2\x12.agentgpu.v1.ErrorR\x05error\x12\x16\n" +
+	"\x06tokens\x18\x05 \x01(\x04R\x06tokens\"S\n" +
 	"\bRegister\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12*\n" +
 	"\x06models\x18\x02 \x03(\v2\x12.agentgpu.v1.ModelR\x06models\",\n" +
@@ -771,18 +953,23 @@ const file_agentgpu_v1_agentgpu_proto_rawDesc = "" +
 	"\x10available_models\x18\a \x03(\v2\x12.agentgpu.v1.ModelR\x0favailableModels\")\n" +
 	"\n" +
 	"Deregister\x12\x1b\n" +
-	"\tworker_id\x18\x01 \x01(\tR\bworkerId\"\xf4\x01\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\"!\n" +
+	"\tPullModel\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\"\xa3\x02\n" +
 	"\rWorkerMessage\x123\n" +
 	"\bregister\x18\x01 \x01(\v2\x15.agentgpu.v1.RegisterH\x00R\bregister\x126\n" +
 	"\theartbeat\x18\x02 \x01(\v2\x16.agentgpu.v1.HeartbeatH\x00R\theartbeat\x120\n" +
 	"\x06result\x18\x03 \x01(\v2\x16.agentgpu.v1.JobResultH\x00R\x06result\x129\n" +
 	"\n" +
 	"deregister\x18\x04 \x01(\v2\x17.agentgpu.v1.DeregisterH\x00R\n" +
-	"deregisterB\t\n" +
-	"\apayload\"\x7f\n" +
+	"deregister\x12-\n" +
+	"\x05chunk\x18\x05 \x01(\v2\x15.agentgpu.v1.JobChunkH\x00R\x05chunkB\t\n" +
+	"\apayload\"\xb8\x01\n" +
 	"\rServerMessage\x12=\n" +
 	"\fregister_ack\x18\x01 \x01(\v2\x18.agentgpu.v1.RegisterAckH\x00R\vregisterAck\x12$\n" +
-	"\x03job\x18\x02 \x01(\v2\x10.agentgpu.v1.JobH\x00R\x03jobB\t\n" +
+	"\x03job\x18\x02 \x01(\v2\x10.agentgpu.v1.JobH\x00R\x03job\x127\n" +
+	"\n" +
+	"pull_model\x18\x03 \x01(\v2\x16.agentgpu.v1.PullModelH\x00R\tpullModelB\t\n" +
 	"\apayload2U\n" +
 	"\fControlPlane\x12E\n" +
 	"\aConnect\x12\x1a.agentgpu.v1.WorkerMessage\x1a\x1a.agentgpu.v1.ServerMessage(\x010\x01B<Z:github.com/jaypetez/agent-gpu/proto/agentgpu/v1;agentgpuv1b\x06proto3"
@@ -799,36 +986,41 @@ func file_agentgpu_v1_agentgpu_proto_rawDescGZIP() []byte {
 	return file_agentgpu_v1_agentgpu_proto_rawDescData
 }
 
-var file_agentgpu_v1_agentgpu_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_agentgpu_v1_agentgpu_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_agentgpu_v1_agentgpu_proto_goTypes = []any{
 	(*Model)(nil),         // 0: agentgpu.v1.Model
 	(*Error)(nil),         // 1: agentgpu.v1.Error
 	(*Job)(nil),           // 2: agentgpu.v1.Job
 	(*JobResult)(nil),     // 3: agentgpu.v1.JobResult
-	(*Register)(nil),      // 4: agentgpu.v1.Register
-	(*RegisterAck)(nil),   // 5: agentgpu.v1.RegisterAck
-	(*Heartbeat)(nil),     // 6: agentgpu.v1.Heartbeat
-	(*Deregister)(nil),    // 7: agentgpu.v1.Deregister
-	(*WorkerMessage)(nil), // 8: agentgpu.v1.WorkerMessage
-	(*ServerMessage)(nil), // 9: agentgpu.v1.ServerMessage
+	(*JobChunk)(nil),      // 4: agentgpu.v1.JobChunk
+	(*Register)(nil),      // 5: agentgpu.v1.Register
+	(*RegisterAck)(nil),   // 6: agentgpu.v1.RegisterAck
+	(*Heartbeat)(nil),     // 7: agentgpu.v1.Heartbeat
+	(*Deregister)(nil),    // 8: agentgpu.v1.Deregister
+	(*PullModel)(nil),     // 9: agentgpu.v1.PullModel
+	(*WorkerMessage)(nil), // 10: agentgpu.v1.WorkerMessage
+	(*ServerMessage)(nil), // 11: agentgpu.v1.ServerMessage
 }
 var file_agentgpu_v1_agentgpu_proto_depIdxs = []int32{
 	1,  // 0: agentgpu.v1.JobResult.error:type_name -> agentgpu.v1.Error
-	0,  // 1: agentgpu.v1.Register.models:type_name -> agentgpu.v1.Model
-	0,  // 2: agentgpu.v1.Heartbeat.available_models:type_name -> agentgpu.v1.Model
-	4,  // 3: agentgpu.v1.WorkerMessage.register:type_name -> agentgpu.v1.Register
-	6,  // 4: agentgpu.v1.WorkerMessage.heartbeat:type_name -> agentgpu.v1.Heartbeat
-	3,  // 5: agentgpu.v1.WorkerMessage.result:type_name -> agentgpu.v1.JobResult
-	7,  // 6: agentgpu.v1.WorkerMessage.deregister:type_name -> agentgpu.v1.Deregister
-	5,  // 7: agentgpu.v1.ServerMessage.register_ack:type_name -> agentgpu.v1.RegisterAck
-	2,  // 8: agentgpu.v1.ServerMessage.job:type_name -> agentgpu.v1.Job
-	8,  // 9: agentgpu.v1.ControlPlane.Connect:input_type -> agentgpu.v1.WorkerMessage
-	9,  // 10: agentgpu.v1.ControlPlane.Connect:output_type -> agentgpu.v1.ServerMessage
-	10, // [10:11] is the sub-list for method output_type
-	9,  // [9:10] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	1,  // 1: agentgpu.v1.JobChunk.error:type_name -> agentgpu.v1.Error
+	0,  // 2: agentgpu.v1.Register.models:type_name -> agentgpu.v1.Model
+	0,  // 3: agentgpu.v1.Heartbeat.available_models:type_name -> agentgpu.v1.Model
+	5,  // 4: agentgpu.v1.WorkerMessage.register:type_name -> agentgpu.v1.Register
+	7,  // 5: agentgpu.v1.WorkerMessage.heartbeat:type_name -> agentgpu.v1.Heartbeat
+	3,  // 6: agentgpu.v1.WorkerMessage.result:type_name -> agentgpu.v1.JobResult
+	8,  // 7: agentgpu.v1.WorkerMessage.deregister:type_name -> agentgpu.v1.Deregister
+	4,  // 8: agentgpu.v1.WorkerMessage.chunk:type_name -> agentgpu.v1.JobChunk
+	6,  // 9: agentgpu.v1.ServerMessage.register_ack:type_name -> agentgpu.v1.RegisterAck
+	2,  // 10: agentgpu.v1.ServerMessage.job:type_name -> agentgpu.v1.Job
+	9,  // 11: agentgpu.v1.ServerMessage.pull_model:type_name -> agentgpu.v1.PullModel
+	10, // 12: agentgpu.v1.ControlPlane.Connect:input_type -> agentgpu.v1.WorkerMessage
+	11, // 13: agentgpu.v1.ControlPlane.Connect:output_type -> agentgpu.v1.ServerMessage
+	13, // [13:14] is the sub-list for method output_type
+	12, // [12:13] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_agentgpu_v1_agentgpu_proto_init() }
@@ -836,15 +1028,17 @@ func file_agentgpu_v1_agentgpu_proto_init() {
 	if File_agentgpu_v1_agentgpu_proto != nil {
 		return
 	}
-	file_agentgpu_v1_agentgpu_proto_msgTypes[8].OneofWrappers = []any{
+	file_agentgpu_v1_agentgpu_proto_msgTypes[10].OneofWrappers = []any{
 		(*WorkerMessage_Register)(nil),
 		(*WorkerMessage_Heartbeat)(nil),
 		(*WorkerMessage_Result)(nil),
 		(*WorkerMessage_Deregister)(nil),
+		(*WorkerMessage_Chunk)(nil),
 	}
-	file_agentgpu_v1_agentgpu_proto_msgTypes[9].OneofWrappers = []any{
+	file_agentgpu_v1_agentgpu_proto_msgTypes[11].OneofWrappers = []any{
 		(*ServerMessage_RegisterAck)(nil),
 		(*ServerMessage_Job)(nil),
+		(*ServerMessage_PullModel)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -852,7 +1046,7 @@ func file_agentgpu_v1_agentgpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agentgpu_v1_agentgpu_proto_rawDesc), len(file_agentgpu_v1_agentgpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
