@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+// Package agentgpu.v1 is the versioned contract for the agent-gpu internal
+// control plane: the gRPC link between the central server and each worker.
+//
+// The public, OpenAI-compatible HTTP API is deliberately NOT modeled here —
+// this package only covers the server<->worker plane (registration,
+// heartbeats, job dispatch, and results). Later epics extend this same
+// package; never break it without a version bump.
+package agentgpu.v1;
+
+option go_package = "github.com/jaypetez/agent-gpu/proto/agentgpu/v1;agentgpuv1";
+
+// Model describes an inference model a worker can serve. The fields are
+// intentionally minimal for the foundational milestone; scheduling-relevant
+// metadata (VRAM footprint, quantization, etc.) is added by later epics.
+message Model {
+  // Canonical model name, e.g. "llama3".
+  string name = 1;
+  // Optional human-readable digest/revision of the model.
+  string digest = 2;
+}
+
+// Error is a structured, transport-neutral error carried inside results.
+// gRPC status codes cover transport failures; this models *job* failures.
+message Error {
+  // Machine-readable, stable error code (e.g. "model_not_found").
+  string code = 1;
+  // Human-readable message.
+  string message = 2;
+}
+
+// Job is a single unit of inference work dispatched from server to worker.
+message Job {
+  // Server-assigned unique id for correlating dispatch with result.
+  string id = 1;
+  // Name of the model to run the job against.
+  string model = 2;
+  // Free-form prompt/input. The real schema (chat messages, params) is built
+  // by the OpenAI-API epic; for the foundational stub this is a plain prompt.
+  string prompt = 3;
+}
+
+// JobResult is the worker's response to a dispatched Job.
+message JobResult {
+  // Echoes Job.id so the server can correlate.
+  string job_id = 1;
+  // The produced output (stub workers echo the prompt back).
+  string output = 2;
+  // Set when the job failed; output is then empty/partial.
+  Error error = 3;
+}
+
+// Register is the first message a worker sends on the stream. It identifies
+// the worker and advertises the models it can serve.
+message Register {
+  // Stable, worker-chosen id (e.g. hostname or configured name).
+  string worker_id = 1;
+  // Models this worker can serve.
+  repeated Model models = 2;
+}
+
+// RegisterAck acknowledges a successful registration.
+message RegisterAck {
+  // Server-assigned session id for this stream.
+  string session_id = 1;
+}
+
+// Heartbeat is sent periodically by the worker to prove liveness and report
+// lightweight load signals. Capacity-aware scheduling fields are added later.
+message Heartbeat {
+  string worker_id = 1;
+  // Number of jobs the worker is currently executing.
+  uint32 active_jobs = 2;
+}
+
+// WorkerMessage is the worker -> server side of the bidi stream.
+message WorkerMessage {
+  oneof payload {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+    JobResult result = 3;
+  }
+}
+
+// ServerMessage is the server -> worker side of the bidi stream.
+message ServerMessage {
+  oneof payload {
+    RegisterAck register_ack = 1;
+    Job job = 2;
+  }
+}
+
+// ControlPlane is the internal server<->worker service. A worker opens one
+// persistent bidirectional stream and keeps it open; the server pushes job
+// dispatches down it and the worker pushes registration, heartbeats, and
+// results up it.
+service ControlPlane {
+  // Connect establishes the single long-lived control stream for a worker.
+  rpc Connect(stream WorkerMessage) returns (stream ServerMessage);
+}

@@ -3,3 +3,7 @@
 
 # Always-LF for shell scripts so they stay executable on Unix runners.
 *.sh text eol=lf
+
+# Generated protobuf Go stubs: committed for reproducible builds, but marked
+# generated so they collapse in diffs and don't skew language stats.
+*.pb.go linguist-generated=true -diff
