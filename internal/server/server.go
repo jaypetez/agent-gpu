@@ -33,10 +33,23 @@ var ErrNoWorkers = errors.New("server: no workers connected")
 // ErrShuttingDown is returned when a job is submitted during shutdown.
 var ErrShuttingDown = errors.New("server: shutting down")
 
+// ErrWorkerNotFound is returned by DrainWorker when no worker has the given id.
+var ErrWorkerNotFound = errors.New("server: worker not found")
+
+// Heartbeat lifecycle defaults. The timeout is the window after a worker's last
+// heartbeat before it is considered stale and evicted; it defaults to three
+// missed intervals so a single dropped heartbeat does not evict a live worker.
+const (
+	// DefaultHeartbeatInterval is the expected gap between worker heartbeats.
+	DefaultHeartbeatInterval = 15 * time.Second
+	// DefaultHeartbeatTimeout is how long a worker may go without a heartbeat
+	// before it is marked stale and evicted (3x the interval).
+	DefaultHeartbeatTimeout = 45 * time.Second
+)
+
 // worker is the server's view of one connected worker stream.
 type worker struct {
-	id     string
-	models []types.Model
+	id string
 
 	// send serializes writes to the worker's stream (a gRPC stream must not be
 	// written from multiple goroutines concurrently).
@@ -44,6 +57,97 @@ type worker struct {
 
 	mu      sync.Mutex
 	pending map[string]chan types.JobResult // job id -> result waiter
+
+	// Capacity/liveness fields reported via heartbeats, guarded by mu. models is
+	// seeded from the registration advertisement and refreshed from each
+	// heartbeat's available_models.
+	models          []types.Model
+	lastHeartbeat   time.Time
+	activeJobs      uint32
+	totalVRAM       uint64
+	freeVRAM        uint64
+	load            uint32
+	gpuType         string
+	availableModels []types.Model
+	draining        bool
+}
+
+// applyHeartbeat folds a heartbeat's capacity report into the worker's view and
+// stamps lastHeartbeat with the server clock. All under w.mu.
+func (w *worker) applyHeartbeat(hb types.Heartbeat, now time.Time) {
+	w.mu.Lock()
+	w.lastHeartbeat = now
+	w.activeJobs = hb.ActiveJobs
+	w.totalVRAM = hb.TotalVRAM
+	w.freeVRAM = hb.FreeVRAM
+	w.load = hb.Load
+	w.gpuType = hb.GPUType
+	if hb.AvailableModels != nil {
+		w.availableModels = hb.AvailableModels
+	}
+	w.mu.Unlock()
+}
+
+// markDraining flags the worker as draining so pickWorker stops selecting it.
+func (w *worker) markDraining() {
+	w.mu.Lock()
+	w.draining = true
+	w.mu.Unlock()
+}
+
+// snapshot builds a fleet-view snapshot of the worker. now and timeout classify
+// the worker as stale when it has missed heartbeats past the timeout.
+func (w *worker) snapshot(now time.Time, timeout time.Duration) types.Worker {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	models := w.availableModels
+	if models == nil {
+		models = w.models
+	}
+	status := types.WorkerOnline
+	switch {
+	case w.draining:
+		status = types.WorkerDraining
+	case !w.lastHeartbeat.IsZero() && now.Sub(w.lastHeartbeat) > timeout:
+		status = types.WorkerStale
+	}
+	return types.Worker{
+		ID:         w.id,
+		Models:     append([]types.Model(nil), models...),
+		LastSeen:   w.lastHeartbeat,
+		ActiveJobs: w.activeJobs,
+		TotalVRAM:  w.totalVRAM,
+		FreeVRAM:   w.freeVRAM,
+		Load:       w.load,
+		GPUType:    w.gpuType,
+		Status:     status,
+	}
+}
+
+// isStale reports whether the worker has missed heartbeats past timeout. A
+// worker that has never sent a heartbeat (zero lastHeartbeat) is graced until
+// its first one; the writer seeds lastHeartbeat at registration so this holds.
+func (w *worker) isStale(now time.Time, timeout time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.lastHeartbeat.IsZero() {
+		return false
+	}
+	return now.Sub(w.lastHeartbeat) > timeout
+}
+
+// available reports whether the worker may receive new jobs: it must be neither
+// draining nor stale.
+func (w *worker) available(now time.Time, timeout time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.draining {
+		return false
+	}
+	if !w.lastHeartbeat.IsZero() && now.Sub(w.lastHeartbeat) > timeout {
+		return false
+	}
+	return true
 }
 
 func (w *worker) addPending(jobID string) chan types.JobResult {
@@ -86,9 +190,34 @@ type Server struct {
 	authz *authz.Authorizer
 	quota *quota.Engine
 
+	// now is the injectable clock used for heartbeat stamping and eviction
+	// (defaults to time.Now). Tests fast-forward it instead of sleeping.
+	now func() time.Time
+	// heartbeatTimeout is the window after a worker's last heartbeat before it is
+	// evicted as stale.
+	heartbeatTimeout time.Duration
+	// evictScan is the wall-clock cadence at which the eviction loop wakes to
+	// re-evaluate staleness against the (possibly injected) clock. Defaults to
+	// heartbeatTimeout/2; tests set it small so the loop reacts promptly to a
+	// fast-forwarded clock without real sleeps approaching the timeout.
+	evictScan time.Duration
+	// onDrain, if set, is invoked with a worker's id the moment the server marks
+	// it draining in response to a Deregister message — before the subsequent
+	// stream-close removeWorker. nil by default; set via WithDrainObserver. It
+	// gives operators (and tests) a synchronization point on the graceful-drain
+	// transition that does not depend on observing the brief draining→removed
+	// window through a polling race.
+	onDrain func(workerID string)
+
 	mu      sync.RWMutex
 	workers map[string]*worker // by worker id
 	nextSes uint64
+
+	// evictDone is closed when the background eviction loop exits; nil until Run
+	// (started lazily on first Connect) launches it.
+	evictOnce sync.Once
+	evictStop chan struct{}
+	evictDone chan struct{}
 }
 
 // Option configures a Server.
@@ -133,15 +262,71 @@ func WithQuota(q *quota.Engine) Option {
 	}
 }
 
+// WithClock overrides the time source used for heartbeat stamping and stale
+// eviction (for tests). A nil clock is ignored. Defaults to time.Now.
+func WithClock(now func() time.Time) Option {
+	return func(s *Server) {
+		if now != nil {
+			s.now = now
+		}
+	}
+}
+
+// WithHeartbeatTimeout sets how long a worker may go without a heartbeat before
+// it is evicted as stale. A non-positive value is ignored. Defaults to
+// DefaultHeartbeatTimeout.
+func WithHeartbeatTimeout(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.heartbeatTimeout = d
+		}
+	}
+}
+
+// WithEvictScanInterval overrides the wall-clock cadence at which the eviction
+// loop wakes to re-check staleness. A non-positive value is ignored. Defaults
+// to heartbeatTimeout/2. Primarily a test seam so the loop reacts to a
+// fast-forwarded clock without real sleeps.
+func WithEvictScanInterval(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.evictScan = d
+		}
+	}
+}
+
+// WithDrainObserver registers a callback invoked with a worker's id the moment
+// the server marks it draining in response to a graceful Deregister, before the
+// subsequent stream-close cleanup. A nil callback is ignored. Primarily an
+// observability seam (e.g. operator notifications, tests asserting the drain
+// transition without racing the brief draining→removed window).
+func WithDrainObserver(fn func(workerID string)) Option {
+	return func(s *Server) {
+		if fn != nil {
+			s.onDrain = fn
+		}
+	}
+}
+
 // New constructs a Server.
 func New(opts ...Option) *Server {
 	s := &Server{
-		log:     slog.Default(),
-		store:   store.NewMemory(),
-		workers: make(map[string]*worker),
+		log:              slog.Default(),
+		store:            store.NewMemory(),
+		now:              time.Now,
+		heartbeatTimeout: DefaultHeartbeatTimeout,
+		workers:          make(map[string]*worker),
+		evictStop:        make(chan struct{}),
+		evictDone:        make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(s)
+	}
+	if s.evictScan <= 0 {
+		s.evictScan = s.heartbeatTimeout / 2
+		if s.evictScan <= 0 {
+			s.evictScan = DefaultHeartbeatTimeout / 2
+		}
 	}
 	// Default the authorizer to one auditing through the (possibly overridden)
 	// server logger, after options have run.
@@ -172,6 +357,82 @@ func (s *Server) WorkerCount() int {
 	return len(s.workers)
 }
 
+// Start launches the background eviction loop that marks workers stale and
+// evicts them after the configured heartbeat timeout. It is idempotent and
+// safe to call before serving begins; Close stops the loop. Calling Start is
+// optional — Connect lazily starts the loop on the first worker — but the cmd
+// layer calls it explicitly so the lifecycle is tied to process shutdown.
+func (s *Server) Start() {
+	s.evictOnce.Do(func() {
+		go s.evictLoop()
+	})
+}
+
+// Close stops the eviction loop and waits for it to exit. Safe to call once;
+// further calls are no-ops. It does not tear down active worker streams (the
+// gRPC server's GracefulStop owns that).
+func (s *Server) Close() error {
+	// Ensure the loop was started so the wait below cannot block forever.
+	s.Start()
+	select {
+	case <-s.evictStop:
+		// already closed
+	default:
+		close(s.evictStop)
+	}
+	<-s.evictDone
+	return nil
+}
+
+// evictLoop periodically evicts workers that have missed heartbeats past the
+// timeout. It is driven by the injected clock for staleness decisions but wakes
+// on a wall-clock ticker so it makes progress regardless of the clock source.
+func (s *Server) evictLoop() {
+	defer close(s.evictDone)
+	ticker := time.NewTicker(s.evictScan)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.evictStop:
+			return
+		case <-ticker.C:
+			s.evictStale()
+		}
+	}
+}
+
+// evictStale removes every worker whose last heartbeat is older than the
+// timeout, failing its pending jobs with a worker_stale error. Stale ids are
+// collected under s.mu first, then removed in a second pass so removeWorker can
+// take the lock itself (no reentrancy).
+func (s *Server) evictStale() {
+	now := s.now()
+	var stale []*worker
+	s.mu.RLock()
+	for _, w := range s.workers {
+		if w.isStale(now, s.heartbeatTimeout) {
+			stale = append(stale, w)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, w := range stale {
+		s.log.Warn("evicting stale worker", "worker", w.id, "timeout", s.heartbeatTimeout.String())
+		s.evictWorker(w, &types.JobError{Code: "worker_stale", Message: "worker missed heartbeats"})
+	}
+}
+
+// evictWorker removes w from the registry (only if it is still the registered
+// stream for its id) and fails its pending jobs with err.
+func (s *Server) evictWorker(w *worker, err *types.JobError) {
+	s.mu.Lock()
+	if cur, ok := s.workers[w.id]; ok && cur == w {
+		delete(s.workers, w.id)
+	}
+	s.mu.Unlock()
+	w.failAllPending(err)
+}
+
 // Connect implements the ControlPlane bidirectional stream. One call per
 // connected worker; it runs until the worker disconnects or the server's
 // context is cancelled.
@@ -191,11 +452,19 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		return status.Error(codes.InvalidArgument, "register: worker_id is required")
 	}
 
+	// Ensure the eviction loop is running. Start is idempotent, so workers that
+	// connect before an explicit Start (e.g. in tests) still get evicted.
+	s.Start()
+
 	w := &worker{
 		id:      reg.GetWorkerId(),
 		models:  types.ModelsFromProto(reg.GetModels()),
 		send:    make(chan *agentgpuv1.ServerMessage, 16),
 		pending: make(map[string]chan types.JobResult),
+		// Seed lastHeartbeat at registration so a worker that registers but has
+		// not yet sent its first heartbeat is graced for one full timeout window
+		// rather than being treated as never-seen.
+		lastHeartbeat: s.now(),
 	}
 
 	ses := s.addWorker(w)
@@ -245,9 +514,22 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 
 		switch p := msg.Payload.(type) {
 		case *agentgpuv1.WorkerMessage_Heartbeat:
-			s.log.Debug("heartbeat", "worker", w.id, "active_jobs", p.Heartbeat.GetActiveJobs())
+			hb := types.HeartbeatFromProto(p.Heartbeat)
+			w.applyHeartbeat(hb, s.now())
+			s.log.Debug("heartbeat", "worker", w.id,
+				"active_jobs", hb.ActiveJobs, "load", hb.Load,
+				"free_vram", hb.FreeVRAM, "total_vram", hb.TotalVRAM)
 		case *agentgpuv1.WorkerMessage_Result:
 			w.resolve(types.JobResultFromProto(p.Result))
+		case *agentgpuv1.WorkerMessage_Deregister:
+			// Graceful drain: stop routing new jobs to this worker, but let its
+			// in-flight pending jobs finish. The worker closes the stream once it
+			// has drained, at which point removeWorker (deferred) cleans it up.
+			w.markDraining()
+			s.log.Info("worker draining", "worker", w.id)
+			if s.onDrain != nil {
+				s.onDrain(w.id)
+			}
 		case *agentgpuv1.WorkerMessage_Register:
 			// Re-registration on an established stream is a protocol error.
 			return status.Error(codes.FailedPrecondition, "duplicate Register on established stream")
@@ -281,15 +563,55 @@ func (s *Server) removeWorker(w *worker) {
 	w.failAllPending(&types.JobError{Code: "worker_disconnected", Message: "worker stream closed"})
 }
 
-// pickWorker returns any currently connected worker. This is a placeholder for
-// the capacity-aware scheduler introduced by a later epic.
+// pickWorker returns any currently connected worker that is eligible to
+// receive new jobs (neither draining nor stale). This is a placeholder for the
+// capacity-aware scheduler introduced by #9; that epic replaces the selection
+// policy but the draining/stale skip established here must remain.
 func (s *Server) pickWorker() (*worker, bool) {
+	now := s.now()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, w := range s.workers {
-		return w, true
+		if w.available(now, s.heartbeatTimeout) {
+			return w, true
+		}
 	}
 	return nil, false
+}
+
+// Fleet returns a point-in-time snapshot of every connected worker, including
+// its reported capacity and computed status (online/draining/stale). It is the
+// observability seam for admin endpoints (#4) and the scheduler (#9).
+func (s *Server) Fleet() []types.Worker {
+	now := s.now()
+	s.mu.RLock()
+	ws := make([]*worker, 0, len(s.workers))
+	for _, w := range s.workers {
+		ws = append(ws, w)
+	}
+	s.mu.RUnlock()
+
+	out := make([]types.Worker, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, w.snapshot(now, s.heartbeatTimeout))
+	}
+	return out
+}
+
+// DrainWorker marks the worker with the given id as draining: pickWorker stops
+// selecting it while its in-flight jobs finish. It is the admin seam for #4
+// (operator-initiated drain), distinct from a worker self-deregistering on
+// graceful shutdown. Returns ErrWorkerNotFound if no such worker is connected.
+func (s *Server) DrainWorker(id string) error {
+	s.mu.RLock()
+	w, ok := s.workers[id]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrWorkerNotFound
+	}
+	w.markDraining()
+	s.log.Info("worker drain requested", "worker", id)
+	return nil
 }
 
 // SubmitAuthorizedJob authorizes an already-authenticated key for inference on

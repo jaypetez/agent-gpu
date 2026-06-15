@@ -72,11 +72,32 @@ message RegisterAck {
 }
 
 // Heartbeat is sent periodically by the worker to prove liveness and report
-// lightweight load signals. Capacity-aware scheduling fields are added later.
+// load and capacity signals the server uses to mark workers stale and (in a
+// later epic, #9) to schedule. Real GPU detection arrives with #16; until then
+// workers report stub/configured capacity.
 message Heartbeat {
   string worker_id = 1;
   // Number of jobs the worker is currently executing.
   uint32 active_jobs = 2;
+  // Total VRAM on the worker's GPU(s), in bytes (0 = unknown).
+  uint64 total_vram_bytes = 3;
+  // Currently free VRAM, in bytes (0 = unknown).
+  uint64 free_vram_bytes = 4;
+  // Coarse load signal in the range 0-100 (0 = idle, 100 = saturated).
+  uint32 load = 5;
+  // Human-readable GPU type/description (e.g. "NVIDIA RTX 4090"); empty if
+  // unknown.
+  string gpu_type = 6;
+  // Models the worker currently has available to serve. Lets the server's
+  // fleet view reflect model availability without re-registration.
+  repeated Model available_models = 7;
+}
+
+// Deregister is sent by a worker that is shutting down gracefully. The server
+// marks the worker draining: it routes no new jobs to it, lets in-flight jobs
+// finish, then removes it when the stream closes.
+message Deregister {
+  string worker_id = 1;
 }
 
 // WorkerMessage is the worker -> server side of the bidi stream.
@@ -85,6 +106,7 @@ message WorkerMessage {
     Register register = 1;
     Heartbeat heartbeat = 2;
     JobResult result = 3;
+    Deregister deregister = 4;
   }
 }
 

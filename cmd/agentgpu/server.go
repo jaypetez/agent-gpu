@@ -33,11 +33,13 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	tpm := fs.Uint64("default-tpm", 0, "global default tokens per minute (0 = unlimited)")
 	daily := fs.Uint64("default-daily-tokens", 0, "global default daily token budget (0 = unlimited)")
 	monthly := fs.Uint64("default-monthly-tokens", 0, "global default monthly token budget (0 = unlimited)")
+	hbTimeout := fs.Duration("heartbeat-timeout", 0, "evict a worker after this long without a heartbeat (default 45s or $AGENTGPU_HEARTBEAT_TIMEOUT)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 
 	cfg := config.ResolveServer(config.ServerConfig{Listen: *listen}, nil)
+	heartbeatTimeout := config.ResolveHeartbeatTimeout(*hbTimeout, nil)
 	qcfg := config.ResolveQuota(config.QuotaConfig{
 		Path:                 *quotaPath,
 		DefaultRPM:           *rpm,
@@ -45,13 +47,13 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		DefaultDailyTokens:   *daily,
 		DefaultMonthlyTokens: *monthly,
 	}, nil, nil)
-	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg)
+	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg, heartbeatTimeout)
 }
 
 // serveControlPlane starts the gRPC control-plane server and blocks until ctx
 // is cancelled (SIGINT/SIGTERM), then shuts down gracefully, checkpointing the
 // quota counters on the way out.
-func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig) error {
+func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, heartbeatTimeout time.Duration) error {
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.Listen, err)
@@ -87,10 +89,20 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 			Timeout: server.DefaultKeepaliveTimeout,
 		}),
 	)
-	srv := server.New(server.WithLogger(logger), server.WithStore(st), server.WithQuota(eng))
+	srv := server.New(
+		server.WithLogger(logger),
+		server.WithStore(st),
+		server.WithQuota(eng),
+		server.WithHeartbeatTimeout(heartbeatTimeout),
+	)
 	srv.Register(gs)
+	// Start the stale-worker eviction loop; Close stops it on shutdown.
+	srv.Start()
+	defer func() { _ = srv.Close() }()
 
-	logger.Info("control-plane server listening", "addr", lis.Addr().String(), "quota_path", qcfg.Path)
+	logger.Info("control-plane server listening",
+		"addr", lis.Addr().String(), "quota_path", qcfg.Path,
+		"heartbeat_timeout", heartbeatTimeout.String())
 
 	// Periodic checkpoint so a crash loses at most quotaCheckpointInterval of usage.
 	ticker := time.NewTicker(quotaCheckpointInterval)

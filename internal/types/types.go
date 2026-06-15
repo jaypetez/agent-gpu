@@ -8,6 +8,7 @@ package types
 
 import (
 	"errors"
+	"time"
 
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
 )
@@ -53,6 +54,61 @@ type JobResult struct {
 	// whitespace token count; real counts arrive with Ollama (#11). Zero means
 	// "no tokens reported".
 	Tokens uint64
+}
+
+// Heartbeat is a worker's periodic liveness-and-capacity report. It mirrors the
+// agentgpuv1.Heartbeat wire message as an ergonomic, transport-neutral type.
+type Heartbeat struct {
+	WorkerID        string
+	ActiveJobs      uint32
+	TotalVRAM       uint64
+	FreeVRAM        uint64
+	Load            uint32
+	GPUType         string
+	AvailableModels []Model
+}
+
+// WorkerStatus is the lifecycle state of a worker in the server's fleet view.
+type WorkerStatus int
+
+const (
+	// WorkerOnline is a healthy worker eligible to receive new jobs.
+	WorkerOnline WorkerStatus = iota
+	// WorkerDraining is a worker that requested graceful shutdown: it receives
+	// no new jobs but its in-flight jobs are allowed to finish.
+	WorkerDraining
+	// WorkerStale is a worker that has missed heartbeats past the timeout and is
+	// about to be (or has been) evicted.
+	WorkerStale
+)
+
+// String renders a WorkerStatus for logs and fleet snapshots.
+func (s WorkerStatus) String() string {
+	switch s {
+	case WorkerOnline:
+		return "online"
+	case WorkerDraining:
+		return "draining"
+	case WorkerStale:
+		return "stale"
+	default:
+		return "unknown"
+	}
+}
+
+// Worker is a read-only snapshot of one worker in the server's fleet view. It
+// is assembled on demand for observability and (later) scheduling; it is not a
+// live handle to the worker's stream.
+type Worker struct {
+	ID         string
+	Models     []Model
+	LastSeen   time.Time
+	ActiveJobs uint32
+	TotalVRAM  uint64
+	FreeVRAM   uint64
+	Load       uint32
+	GPUType    string
+	Status     WorkerStatus
 }
 
 // ErrInvalidJob is returned when a Job fails validation.
@@ -144,6 +200,35 @@ func (r JobResult) Proto() *agentgpuv1.JobResult {
 		Output: r.Output,
 		Error:  r.Err.Proto(),
 		Tokens: r.Tokens,
+	}
+}
+
+// Proto converts a Heartbeat to its protobuf representation.
+func (h Heartbeat) Proto() *agentgpuv1.Heartbeat {
+	return &agentgpuv1.Heartbeat{
+		WorkerId:        h.WorkerID,
+		ActiveJobs:      h.ActiveJobs,
+		TotalVramBytes:  h.TotalVRAM,
+		FreeVramBytes:   h.FreeVRAM,
+		Load:            h.Load,
+		GpuType:         h.GPUType,
+		AvailableModels: ModelsToProto(h.AvailableModels),
+	}
+}
+
+// HeartbeatFromProto converts a protobuf Heartbeat to the domain type.
+func HeartbeatFromProto(p *agentgpuv1.Heartbeat) Heartbeat {
+	if p == nil {
+		return Heartbeat{}
+	}
+	return Heartbeat{
+		WorkerID:        p.GetWorkerId(),
+		ActiveJobs:      p.GetActiveJobs(),
+		TotalVRAM:       p.GetTotalVramBytes(),
+		FreeVRAM:        p.GetFreeVramBytes(),
+		Load:            p.GetLoad(),
+		GPUType:         p.GetGpuType(),
+		AvailableModels: ModelsFromProto(p.GetAvailableModels()),
 	}
 }
 

@@ -85,6 +85,44 @@ For each job the scheduler scores candidate workers by:
 If no worker currently fits, the job is **queued** (never silently dropped) and re-evaluated as
 capacity frees up. Queue depth and per-worker load are exported as metrics.
 
+## Worker lifecycle / heartbeats
+
+Each worker holds one long-lived bidirectional stream to the server and moves through a small
+lifecycle the server tracks in its in-memory fleet view (`Server.Fleet()`):
+
+1. **Registration.** The worker's first message is a `Register` (worker id + advertised models). The
+   server acknowledges with a `RegisterAck` carrying a session id and adds the worker to the
+   registry as **online**.
+2. **Heartbeats.** The worker sends a `Heartbeat` every `heartbeat interval` (default **15s**,
+   configurable via `--heartbeat-interval` / `AGENTGPU_HEARTBEAT_INTERVAL`). Each heartbeat reports
+   liveness plus capacity signals: GPU type, total/free VRAM, a coarse load value (0–100), the
+   current active-job count, and the models the worker has available. The server folds these into
+   the worker's fleet entry and stamps its last-seen time. (Real GPU detection arrives with a later
+   epic; until then capacity fields are configured/stub values.)
+3. **Stale eviction.** A background loop on the server marks a worker **stale** and evicts it once it
+   has gone longer than the `heartbeat timeout` without a heartbeat (default **45s** — three missed
+   intervals — configurable via `--heartbeat-timeout` / `AGENTGPU_HEARTBEAT_TIMEOUT`). Eviction
+   removes the worker from the registry, stops routing to it, and fails any of its in-flight jobs
+   with a `worker_stale` error so callers are not left hanging. The loop re-checks roughly every
+   `timeout / 2`.
+4. **Graceful drain / deregister.** On graceful shutdown a worker sends a `Deregister` before
+   closing its stream; an operator can also drain a worker out-of-band (admin seam). A draining
+   worker is **skipped by the router for new jobs** but its already-dispatched, in-flight jobs are
+   allowed to finish; it is removed once its stream closes.
+
+The router only ever selects workers that are neither draining nor stale. Selecting *which* healthy
+worker should run a job (the capacity-aware scoring above) is a separate concern; until it lands the
+router picks any healthy worker.
+
+The lifecycle states are summarized below:
+
+```text
+online   -> stale     (missed heartbeats past the timeout; evicted, pending jobs fail)
+online   -> draining  (Deregister or admin drain; no new jobs, in-flight jobs finish)
+draining -> removed   (stream closes after in-flight jobs drain)
+stale    -> removed   (evicted by the background loop)
+```
+
 ## Permissions
 
 Authentication (who you are, `internal/auth`) and authorization (what you may do,
