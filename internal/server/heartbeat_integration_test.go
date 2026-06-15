@@ -20,13 +20,19 @@ import (
 // counted as active in the worker's heartbeats while it is in flight.
 type blockingExecutor struct{ release chan struct{} }
 
-func (b blockingExecutor) Execute(ctx context.Context, job types.Job) types.JobResult {
+func (b blockingExecutor) Execute(ctx context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
 	select {
 	case <-b.release:
 	case <-ctx.Done():
 	}
+	if emit != nil {
+		emit(types.JobChunk{JobID: job.ID, Delta: "done"})
+	}
 	return types.JobResult{JobID: job.ID, Output: "done"}
 }
+
+func (b blockingExecutor) ListModels(context.Context) ([]types.Model, error) { return nil, nil }
+func (b blockingExecutor) Pull(context.Context, string) error                { return nil }
 
 // testClock is a mutable, mutex-guarded clock so the eviction loop's staleness
 // decisions can be fast-forwarded without real sleeps.

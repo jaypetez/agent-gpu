@@ -56,6 +56,32 @@ message JobResult {
   uint64 tokens = 4;
 }
 
+// JobChunk is an incremental piece of a streaming job's output, sent
+// worker -> server as tokens are produced. The server accumulates the deltas
+// per job_id and, on the terminal chunk (done = true), resolves the pending
+// job waiter with the final JobResult. This carries inference output as a true
+// stream rather than a single final JobResult so the request path (#13) can
+// forward it to clients as SSE.
+//
+// Per-token chunks carry delta (and done = false); the final chunk carries
+// done = true plus the total tokens count, or done = true plus error on
+// failure. delta is empty on the terminal chunk.
+message JobChunk {
+  // Echoes Job.id so the server can correlate and accumulate.
+  string job_id = 1;
+  // Incremental output produced since the previous chunk (empty on the
+  // terminal chunk).
+  string delta = 2;
+  // True on the final chunk for this job; no further chunks follow.
+  bool done = 3;
+  // Set on the terminal chunk when the job failed; accumulated output is then
+  // discarded by the server in favor of the error.
+  Error error = 4;
+  // Total tokens generated/consumed by the job, reported on the terminal chunk
+  // for quota accounting (#5). Zero means "no tokens reported".
+  uint64 tokens = 5;
+}
+
 // Register is the first message a worker sends on the stream. It identifies
 // the worker and advertises the models it can serve.
 message Register {
@@ -100,6 +126,16 @@ message Deregister {
   string worker_id = 1;
 }
 
+// PullModel instructs a worker to fetch a model onto its local Ollama. The
+// server sends it only after authorizing the requesting key for the Pull
+// action (#11); the worker pulls the model and refreshes its advertised model
+// list on its next heartbeat. This is an additive, fire-and-forget control
+// message; pull progress/results are not streamed back today.
+message PullModel {
+  // Name of the model to pull (e.g. "llama3").
+  string model = 1;
+}
+
 // WorkerMessage is the worker -> server side of the bidi stream.
 message WorkerMessage {
   oneof payload {
@@ -107,6 +143,7 @@ message WorkerMessage {
     Heartbeat heartbeat = 2;
     JobResult result = 3;
     Deregister deregister = 4;
+    JobChunk chunk = 5;
   }
 }
 
@@ -115,6 +152,7 @@ message ServerMessage {
   oneof payload {
     RegisterAck register_ack = 1;
     Job job = 2;
+    PullModel pull_model = 3;
   }
 }
 

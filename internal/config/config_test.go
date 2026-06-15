@@ -180,6 +180,22 @@ func TestResolveHeartbeatInterval(t *testing.T) {
 	}
 }
 
+func TestResolveOllamaURL(t *testing.T) {
+	t.Parallel()
+	// Flag wins over env.
+	if got := ResolveOllamaURL("http://flag:1", env(map[string]string{EnvOllamaURL: "http://env:2"})); got != "http://flag:1" {
+		t.Fatalf("flag precedence: got %q", got)
+	}
+	// Env when no flag.
+	if got := ResolveOllamaURL("", env(map[string]string{EnvOllamaURL: "http://env:2"})); got != "http://env:2" {
+		t.Fatalf("env precedence: got %q", got)
+	}
+	// Default when neither.
+	if got := ResolveOllamaURL("", env(nil)); got != DefaultOllamaURL {
+		t.Fatalf("default: got %q", got)
+	}
+}
+
 func TestResolveHeartbeatTimeout(t *testing.T) {
 	t.Parallel()
 	if got := ResolveHeartbeatTimeout(90*time.Second, env(map[string]string{EnvHeartbeatTimeout: "120s"})); got != 90*time.Second {

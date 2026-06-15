@@ -215,6 +215,75 @@ draining -> removed   (stream closes after in-flight jobs drain)
 stale    -> removed   (evicted by the background loop)
 ```
 
+## Ollama integration
+
+Each worker runs inference against a **local Ollama instance** it reaches over Ollama's REST API
+(default `http://localhost:11434`, configurable via `--ollama-url` / `AGENTGPU_OLLAMA_URL`). The
+integration lives in two layers: `internal/ollama` is a thin stdlib-`net/http` client for Ollama;
+`worker.OllamaExecutor` adapts it to the worker's `Executor` interface. The echo executor remains the
+default test stub and implements the same interface.
+
+### Backend detection and model listing
+
+On startup the worker probes `GET /api/version`. If Ollama answers, the worker logs the version and
+seeds its model cache from `GET /api/tags`. If Ollama is **unreachable**, the worker logs a clear
+warning and continues **degraded** — it still registers and heartbeats (advertising whatever models
+it last knew, possibly none) rather than crashing, so the fleet sees the worker and it recovers once
+Ollama comes back. The worker refreshes the model cache before each heartbeat, so the server's fleet
+view reflects models being pulled or removed without re-registration. The `--models` flag is a
+fallback/override that seeds the advertisement until `/api/tags` is reachable.
+
+### Streaming inference (worker → server)
+
+Inference output is carried as a **true token stream**, not a single final result. The worker runs
+`POST /api/chat` with `stream: true`, decodes the NDJSON response line-by-line, and emits one
+`JobChunk{delta}` per produced token over the control stream, followed by a terminal
+`JobChunk{done=true, tokens=N}` (or `{done=true, error=...}` on failure). The token count is Ollama's
+`eval_count + prompt_eval_count` from the terminal object, not a guess.
+
+The server **accumulates** chunks per `job_id` into a per-job buffer and, on the terminal chunk,
+resolves the existing pending waiter with the final `JobResult` (accumulated output + tokens, or the
+error). `SubmitJob` therefore stays **synchronous** — it still returns one final result — while the
+wire carries an incremental stream. A failed inference always produces a terminal error chunk, so a
+waiter is resolved exactly once and never hangs. (The client-facing SSE forwarding of these chunks is
+the OpenAI-API epic, #13; carrying a real stream now is why that hop is incremental rather than a
+single result.)
+
+```text
+Ollama NDJSON     worker emits            server accumulates        SubmitJob caller
+--------------    --------------------    ----------------------    -------------------
+{content:"po"} -> JobChunk{delta:"po"} -> buf["job"]="po"
+{content:"ng"} -> JobChunk{delta:"ng"} -> buf["job"]="pong"
+{done,eval=3}  -> JobChunk{done,tok=5} -> resolve(JobResult{...}) -> returns "pong", 5 tokens
+```
+
+### Permission-gated pull
+
+A model is fetched onto a worker via `Server.PullModel(ctx, key, workerID, model)`. It mirrors the
+dispatch path's authorize-before-act ordering: it calls `authz.Authorize(key, model, authz.Pull)`
+first, and a denied key returns `authz.ErrForbidden` with **no** `PullModel` message sent — so an
+unauthorized caller never reaches Ollama's `/api/pull`. A permitted pull sends a fire-and-forget
+`PullModel` control message; the worker drives `POST /api/pull` (draining its NDJSON progress stream)
+and advertises the new model on its next heartbeat. Auto-pull on a dispatch miss is intentionally a
+**seam**, not built here.
+
+### Error contract
+
+Ollama failures map onto `types.JobError` with stable, machine-readable codes the request path (#13)
+can translate to HTTP statuses:
+
+```text
+model_not_found     model is not present on the worker (404, or "not found" in the body/stream)
+ollama_unreachable  the Ollama server could not be contacted (connection refused, DNS, etc.)
+ollama_error        a generic Ollama-reported failure with no more specific code
+timeout             the context deadline was exceeded or the job was cancelled mid-stream
+invalid_request     Ollama rejected the request as malformed (400)
+```
+
+Long inference is bounded by the **caller's context**, not a short global HTTP timeout, so a slow
+generation is not spuriously killed; cancelling the context aborts the in-flight HTTP request and
+stops emitting.
+
 ## Permissions
 
 Authentication (who you are, `internal/auth`) and authorization (what you may do,

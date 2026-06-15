@@ -56,6 +56,19 @@ type JobResult struct {
 	Tokens uint64
 }
 
+// JobChunk is an incremental piece of a streaming job's output, sent
+// worker -> server as tokens are produced. It mirrors the agentgpuv1.JobChunk
+// wire message. Per-token chunks carry Delta (with Done false); the terminal
+// chunk carries Done true plus the total Tokens, or Done true plus Err on
+// failure.
+type JobChunk struct {
+	JobID  string
+	Delta  string
+	Done   bool
+	Err    *JobError
+	Tokens uint64
+}
+
 // Heartbeat is a worker's periodic liveness-and-capacity report. It mirrors the
 // agentgpuv1.Heartbeat wire message as an ergonomic, transport-neutral type.
 type Heartbeat struct {
@@ -200,6 +213,31 @@ func (r JobResult) Proto() *agentgpuv1.JobResult {
 		Output: r.Output,
 		Error:  r.Err.Proto(),
 		Tokens: r.Tokens,
+	}
+}
+
+// Proto converts a JobChunk to its protobuf representation.
+func (c JobChunk) Proto() *agentgpuv1.JobChunk {
+	return &agentgpuv1.JobChunk{
+		JobId:  c.JobID,
+		Delta:  c.Delta,
+		Done:   c.Done,
+		Error:  c.Err.Proto(),
+		Tokens: c.Tokens,
+	}
+}
+
+// JobChunkFromProto converts a protobuf JobChunk to the domain type.
+func JobChunkFromProto(p *agentgpuv1.JobChunk) JobChunk {
+	if p == nil {
+		return JobChunk{}
+	}
+	return JobChunk{
+		JobID:  p.GetJobId(),
+		Delta:  p.GetDelta(),
+		Done:   p.GetDone(),
+		Err:    JobErrorFromProto(p.GetError()),
+		Tokens: p.GetTokens(),
 	}
 }
 

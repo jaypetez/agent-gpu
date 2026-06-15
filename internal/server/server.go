@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +64,13 @@ type worker struct {
 
 	mu      sync.Mutex
 	pending map[string]chan types.JobResult // job id -> result waiter
+	// streams accumulates the output deltas of in-flight streaming jobs, keyed by
+	// job id. The worker sends per-token JobChunks (#11); the server appends each
+	// delta here and, on the terminal chunk, resolves the pending waiter with the
+	// fully accumulated JobResult. This keeps SubmitJob synchronous (it still
+	// returns one final result) while the wire carries a true token stream that
+	// the request path (#13) will forward as SSE. Guarded by mu.
+	streams map[string]*strings.Builder
 
 	// Capacity/liveness fields reported via heartbeats, guarded by mu. models is
 	// seeded from the registration advertisement and refreshed from each
@@ -176,11 +184,62 @@ func (w *worker) resolve(res types.JobResult) {
 	}
 }
 
-// failAllPending unblocks any outstanding job waiters when the stream drops.
+// accumulate folds one streaming JobChunk into the worker's per-job output
+// buffer. Non-terminal chunks append their delta. On the terminal chunk
+// (Done = true) it resolves the pending waiter exactly once with the final
+// JobResult — the accumulated output plus the reported tokens, or the error if
+// the chunk carries one — and discards the buffer. This is the single point
+// that turns the worker's token stream back into the synchronous JobResult that
+// SubmitJob returns. The request path (#13) will tap the same chunks for SSE.
+func (w *worker) accumulate(chunk types.JobChunk) {
+	if !chunk.Done {
+		w.mu.Lock()
+		b := w.streams[chunk.JobID]
+		if b == nil {
+			b = &strings.Builder{}
+			w.streams[chunk.JobID] = b
+		}
+		b.WriteString(chunk.Delta)
+		w.mu.Unlock()
+		return
+	}
+
+	// Terminal chunk: assemble the final result, drop the buffer, and resolve the
+	// waiter (resolve already removes the pending entry and is a no-op if the
+	// caller has gone).
+	w.mu.Lock()
+	var output string
+	if b := w.streams[chunk.JobID]; b != nil {
+		output = b.String()
+		delete(w.streams, chunk.JobID)
+	}
+	// A late delta on the terminal chunk (some backends include trailing content)
+	// is honored.
+	output += chunk.Delta
+	w.mu.Unlock()
+
+	res := types.JobResult{
+		JobID:  chunk.JobID,
+		Output: output,
+		Err:    chunk.Err,
+		Tokens: chunk.Tokens,
+	}
+	if chunk.Err != nil {
+		// On failure the partial output is discarded in favor of the error so the
+		// caller does not mistake a truncated stream for a complete answer.
+		res.Output = ""
+	}
+	w.resolve(res)
+}
+
+// failAllPending unblocks any outstanding job waiters when the stream drops. It
+// also discards any partial stream buffers so a dropped connection leaks no
+// per-job state.
 func (w *worker) failAllPending(err *types.JobError) {
 	w.mu.Lock()
 	pending := w.pending
 	w.pending = make(map[string]chan types.JobResult)
+	w.streams = make(map[string]*strings.Builder)
 	w.mu.Unlock()
 	for id, ch := range pending {
 		ch <- types.JobResult{JobID: id, Err: err}
@@ -601,6 +660,7 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		models:  types.ModelsFromProto(reg.GetModels()),
 		send:    make(chan *agentgpuv1.ServerMessage, 16),
 		pending: make(map[string]chan types.JobResult),
+		streams: make(map[string]*strings.Builder),
 		// Seed lastHeartbeat at registration so a worker that registers but has
 		// not yet sent its first heartbeat is graced for one full timeout window
 		// rather than being treated as never-seen.
@@ -669,6 +729,13 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 			w.resolve(types.JobResultFromProto(p.Result))
 			// A completed job frees a worker slot: re-attempt queued jobs.
 			s.signalCapacity()
+		case *agentgpuv1.WorkerMessage_Chunk:
+			chunk := types.JobChunkFromProto(p.Chunk)
+			w.accumulate(chunk)
+			// The terminal chunk frees a worker slot: re-attempt queued jobs.
+			if chunk.Done {
+				s.signalCapacity()
+			}
 		case *agentgpuv1.WorkerMessage_Deregister:
 			// Graceful drain: stop routing new jobs to this worker, but let its
 			// in-flight pending jobs finish. The worker closes the stream once it
@@ -919,9 +986,10 @@ func (s *Server) DrainWorker(id string) error {
 // Authorization and quota both read the key passed in (freshly read by
 // Authenticate), so changes take effect without a restart.
 //
-// NOTE (#11): the pull/load operations have no dispatch path yet. When they
-// land, gate them the same way with authz.Pull / authz.Load before touching a
-// worker.
+// NOTE: the pull path is now gated the same way — see PullModel, which calls
+// authz.Authorize with authz.Pull before sending a worker any PullModel
+// message. The load action (authz.Load) still has no dispatch path; gate it the
+// same way when it lands.
 func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job types.Job) (types.JobResult, error) {
 	if err := job.Validate(); err != nil {
 		return types.JobResult{}, err
@@ -950,6 +1018,38 @@ func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job 
 // Quota exposes the configured quota engine (a seam for usage inspection and
 // graceful-shutdown checkpointing by the cmd layer).
 func (s *Server) Quota() *quota.Engine { return s.quota }
+
+// PullModel authorizes an already-authenticated key for the Pull action on
+// model and, if permitted, instructs the named worker to fetch it onto its
+// local Ollama. It mirrors SubmitAuthorizedJob's authorize-before-act ordering:
+// a denied key returns authz.ErrForbidden and NO PullModel message is sent to
+// the worker, so an unauthorized caller never reaches Ollama. The pull itself
+// is fire-and-forget: the worker pulls asynchronously and advertises the new
+// model on its next heartbeat (auto-pull-on-dispatch-miss is intentionally not
+// built here — it is a documented seam for a later epic). Returns
+// ErrWorkerNotFound if no such worker is connected.
+func (s *Server) PullModel(ctx context.Context, key store.APIKey, workerID, model string) error {
+	if err := s.authz.Authorize(ctx, key, model, authz.Pull); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	w, ok := s.workers[workerID]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrWorkerNotFound
+	}
+	select {
+	case w.send <- &agentgpuv1.ServerMessage{
+		Payload: &agentgpuv1.ServerMessage_PullModel{
+			PullModel: &agentgpuv1.PullModel{Model: model},
+		},
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.log.Info("pull requested", "key_id", key.ID, "worker", workerID, "model", model)
+	return nil
+}
 
 // SubmitJob dispatches a job to a worker and waits for the result. This is the
 // minimal foundational dispatch primitive with no authorization; callers on the
