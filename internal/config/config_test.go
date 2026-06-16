@@ -39,6 +39,27 @@ func TestResolveServer(t *testing.T) {
 			t.Fatalf("Listen = %q, want flag value", got.Listen)
 		}
 	})
+	t.Run("http listen default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveServer(ServerConfig{}, env(nil))
+		if got.HTTPListen != DefaultHTTPListen {
+			t.Fatalf("HTTPListen = %q, want default %q", got.HTTPListen, DefaultHTTPListen)
+		}
+	})
+	t.Run("http listen env overrides default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveServer(ServerConfig{}, env(map[string]string{EnvHTTPListen: "0.0.0.0:8443"}))
+		if got.HTTPListen != "0.0.0.0:8443" {
+			t.Fatalf("HTTPListen = %q, want env value", got.HTTPListen)
+		}
+	})
+	t.Run("http listen flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveServer(ServerConfig{HTTPListen: "1.2.3.4:80"}, env(map[string]string{EnvHTTPListen: "0.0.0.0:8443"}))
+		if got.HTTPListen != "1.2.3.4:80" {
+			t.Fatalf("HTTPListen = %q, want flag value", got.HTTPListen)
+		}
+	})
 }
 
 func TestResolveStorePath(t *testing.T) {
