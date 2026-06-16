@@ -249,6 +249,59 @@ func TestResolveOllamaURL(t *testing.T) {
 	}
 }
 
+func TestResolveGPUDetect(t *testing.T) {
+	t.Parallel()
+	// Flag wins when explicitly set (flagSet true), even against env.
+	if got := ResolveGPUDetect(false, true, env(map[string]string{EnvGPUDetect: "true"})); got != false {
+		t.Fatalf("explicit flag should win: got %v", got)
+	}
+	if got := ResolveGPUDetect(true, true, env(map[string]string{EnvGPUDetect: "false"})); got != true {
+		t.Fatalf("explicit flag should win: got %v", got)
+	}
+	// Env when flag not set.
+	if got := ResolveGPUDetect(true, false, env(map[string]string{EnvGPUDetect: "false"})); got != false {
+		t.Fatalf("env precedence when flag unset: got %v", got)
+	}
+	// Default (true) when neither flag nor env.
+	if got := ResolveGPUDetect(true, false, env(nil)); got != DefaultGPUDetect {
+		t.Fatalf("default: got %v", got)
+	}
+	// Unparseable env falls back to default.
+	if got := ResolveGPUDetect(true, false, env(map[string]string{EnvGPUDetect: "maybe"})); got != DefaultGPUDetect {
+		t.Fatalf("bad env should fall back to default: got %v", got)
+	}
+}
+
+func TestResolveGPUType(t *testing.T) {
+	t.Parallel()
+	if got := ResolveGPUType("flag-gpu", env(map[string]string{EnvGPUType: "env-gpu"})); got != "flag-gpu" {
+		t.Fatalf("flag precedence: got %q", got)
+	}
+	if got := ResolveGPUType("", env(map[string]string{EnvGPUType: "env-gpu"})); got != "env-gpu" {
+		t.Fatalf("env precedence: got %q", got)
+	}
+	if got := ResolveGPUType("", env(nil)); got != "" {
+		t.Fatalf("default empty: got %q", got)
+	}
+}
+
+func TestResolveTotalVRAM(t *testing.T) {
+	t.Parallel()
+	if got := ResolveTotalVRAM(100, env(map[string]string{EnvTotalVRAM: "200"})); got != 100 {
+		t.Fatalf("flag precedence: got %d", got)
+	}
+	if got := ResolveTotalVRAM(0, env(map[string]string{EnvTotalVRAM: "200"})); got != 200 {
+		t.Fatalf("env precedence: got %d", got)
+	}
+	if got := ResolveTotalVRAM(0, env(nil)); got != 0 {
+		t.Fatalf("default zero: got %d", got)
+	}
+	// Unparseable env falls back to 0.
+	if got := ResolveTotalVRAM(0, env(map[string]string{EnvTotalVRAM: "lots"})); got != 0 {
+		t.Fatalf("bad env should fall back to 0: got %d", got)
+	}
+}
+
 func TestResolveHeartbeatTimeout(t *testing.T) {
 	t.Parallel()
 	if got := ResolveHeartbeatTimeout(90*time.Second, env(map[string]string{EnvHeartbeatTimeout: "120s"})); got != 90*time.Second {

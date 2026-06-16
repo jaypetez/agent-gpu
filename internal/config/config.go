@@ -23,6 +23,14 @@ const (
 	EnvOllamaURL         = "AGENTGPU_OLLAMA_URL"
 	EnvSessionPath       = "AGENTGPU_SESSION_PATH"
 	EnvSessionTTL        = "AGENTGPU_SESSION_TTL"
+	// EnvGPUDetect toggles automatic GPU detection on the worker (#16). When
+	// false, detection is skipped and the manual EnvGPUType/EnvTotalVRAM (or their
+	// flags) describe the worker's capacity instead.
+	EnvGPUDetect = "AGENTGPU_GPU_DETECT"
+	// EnvGPUType / EnvTotalVRAM are manual capacity overrides used when detection
+	// is disabled or the vendor CLI is not on PATH. EnvTotalVRAM is in bytes.
+	EnvGPUType   = "AGENTGPU_GPU_TYPE"
+	EnvTotalVRAM = "AGENTGPU_TOTAL_VRAM"
 	// EnvGlobalRPM / EnvGlobalTPM configure the server-wide (global) rate limits
 	// enforced at the HTTP request boundary (#6), independent of per-key quota.
 	EnvGlobalRPM = "AGENTGPU_GLOBAL_RPM"
@@ -49,6 +57,9 @@ const (
 	// DefaultSessionMaxBytes is the default per-session cumulative-content byte
 	// cap (1 MiB), bounding history memory growth from a long conversation.
 	DefaultSessionMaxBytes = 1 << 20
+	// DefaultGPUDetect is the default for the worker's automatic GPU detection
+	// (#16): on, so a worker advertises real hardware capacity out of the box.
+	DefaultGPUDetect = true
 )
 
 // ServerConfig configures the server process.
@@ -147,6 +158,18 @@ func uintEnvOr(look EnvLookup, key string, fallback uint64) uint64 {
 	return fallback
 }
 
+// boolEnvOr returns the boolean parsed from the env value if set and parseable
+// (via strconv.ParseBool, so "1"/"true"/"0"/"false"/etc.), else the fallback. An
+// unparseable value falls back silently so a typo cannot wedge startup.
+func boolEnvOr(look EnvLookup, key string, fallback bool) bool {
+	if v, ok := look(key); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return fallback
+}
+
 // ResolveServer applies env-then-default resolution to a ServerConfig whose
 // fields hold flag values (empty meaning "unset"). The CLI layer passes flag
 // values in; this fills the gaps from the environment and defaults.
@@ -198,6 +221,48 @@ func ResolveOllamaURL(flagValue string, look EnvLookup) string {
 		return flagValue
 	}
 	return envOr(look, EnvOllamaURL, DefaultOllamaURL)
+}
+
+// ResolveGPUDetect resolves the worker's automatic-GPU-detection toggle (#16)
+// with flag > env > default precedence. Because the flag is a bool whose zero
+// value (false) is indistinguishable from "unset", the caller passes flagSet to
+// signal whether the user actually provided --gpu-detect; only then does the
+// flag win. Otherwise AGENTGPU_GPU_DETECT, then DefaultGPUDetect (true), apply.
+func ResolveGPUDetect(flagValue, flagSet bool, look EnvLookup) bool {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagSet {
+		return flagValue
+	}
+	return boolEnvOr(look, EnvGPUDetect, DefaultGPUDetect)
+}
+
+// ResolveGPUType resolves the manual GPU-type override (#16) with flag > env >
+// default("") precedence. An empty flag value means "unset". It is used as the
+// reported GPU type when detection is disabled or the vendor CLI is unavailable;
+// empty means "no manual override".
+func ResolveGPUType(flagValue string, look EnvLookup) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvGPUType, "")
+}
+
+// ResolveTotalVRAM resolves the manual total-VRAM override in bytes (#16) with
+// flag > env > default(0) precedence. A zero flag value means "unset". It pairs
+// with ResolveGPUType for hosts where automatic detection is off or impossible.
+func ResolveTotalVRAM(flagValue uint64, look EnvLookup) uint64 {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != 0 {
+		return flagValue
+	}
+	return uintEnvOr(look, EnvTotalVRAM, 0)
 }
 
 // DefaultStorePath returns the default keys-file location, ~/.agentgpu/keys.json,
