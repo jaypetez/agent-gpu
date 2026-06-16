@@ -205,10 +205,11 @@ parser ends cleanly rather than hanging.
 
 ### Out of scope / seams
 
-The formal OpenAPI 3.1 spec (#14) and dedicated HTTP rate-limit middleware (#6)
-are out of scope here; the typed `code`s, the `usage` object, and the unplumbed inference parameters
-are the seams those land on. Quota is already enforced (and `429`-mapped) because
-`SubmitAuthorizedJob*` reserves against it.
+The formal OpenAPI 3.1 spec (#14) is out of scope here; the typed `code`s, the `usage` object, and
+the unplumbed inference parameters are the seams it lands on. Per-key quota is enforced (and
+`429`-mapped) because `SubmitAuthorizedJob*` reserves against it, and the inference routes are
+fronted by the global rate limiter with `Retry-After` on every `429` (see
+[Rate limiting](#rate-limiting)).
 
 ## Admin API
 
@@ -608,6 +609,76 @@ disk writes, the server **checkpoints** the counters to a JSON file (`--quota-pa
 loads the checkpoint on startup — rolling any windows that expired while the process was down. The
 interface is shaped so a Redis-backed counter store (atomic `INCR` per window key) can slot in later
 without touching the engine.
+
+## Rate limiting
+
+On top of per-key quota, the HTTP layer (`internal/httpapi/ratelimit.go`, #6) enforces a
+**server-wide (global) rate limit** at the request boundary and attaches a `Retry-After` hint to
+every `429`. The two scopes are distinct and complementary:
+
+- **Global** — a single fleet-wide cap (`GlobalRPM` / `GlobalTPM`) that protects the whole server
+  from aggregate overload regardless of which key is calling. It is enforced by `rateLimitMiddleware`
+  via `quota.CheckAndReserveGlobal`, which reserves against a reserved global counter (the
+  `__global__` sentinel key — it cannot collide with a real `agpu_…` key). The two dimensions are fed
+  the same way the per-key engine handles them: **RPM is reserved per request** in the middleware
+  (the reservation must fit), while **TPM is checked as an already-consumed budget** — a request is
+  admitted if the global minute-token counter is below `GlobalTPM`, and the tokens a job actually
+  produces are added to that counter **after** dispatch via `quota.RecordGlobalTokens` (called
+  alongside the per-key `RecordTokens` in both the non-streaming and streaming submit paths). So once
+  fleet-wide usage reaches `GlobalTPM`, the next request denies on TPM (`429` + `Retry-After`).
+  `RecordGlobalTokens` short-circuits when no global limit is configured, so the global counter never
+  grows on a default install.
+- **Per-key** — each key's own `RPM`/`TPM`/daily/monthly quota (see [Quotas](#quotas)), enforced on
+  the dispatch path by `CheckAndReserve`. Rate limiting **does not re-check** per-key quota; it adds
+  only the new global check plus the `Retry-After`/metrics around the existing 429.
+
+### Where it applies
+
+Only the **inference surface** is rate-limited: `POST /v1/chat/completions` and `POST
+/v1/completions`. `rateLimitMiddleware` runs **inside** the auth middleware (so the authenticated key
+is available for the throttle log) but **before** the handler, so a global `429` short-circuits with
+no per-key counter touched and no dispatch. Model discovery, session, and admin routes are
+deliberately not rate-limited — they do not consume inference capacity.
+
+### Order on the inference path
+
+```text
+authenticate → rateLimitMiddleware (global RPM reserve + global TPM check) → handler
+  → quota.CheckAndReserve (per-key) → dispatch
+  → quota.RecordTokens (per-key) + quota.RecordGlobalTokens (global TPM)
+```
+
+A global denial returns `429` before the per-key check ever runs; an admitted request then goes
+through the normal per-key quota enforcement (no double-counting in either direction). After the job
+returns, its token count is recorded against **both** the per-key counters and the global minute-token
+counter, so a later request sees the updated global TPM budget.
+
+### Retry-After
+
+Every `429` carries a `Retry-After` header — **integer seconds, minimum 1**, computed against the
+quota engine's clock (deterministic under an injected clock in tests):
+
+- **Global** — seconds until the global minute window resets (`GlobalMinuteReset`).
+- **Per-key** — seconds until the soonest **exhausted** window resets (RPM/TPM minute, daily, or
+  monthly), from the key's `UsageForKey` snapshot; if no dimension reads at/over its limit it falls
+  back to the soonest forward-looking reset. A `429` with no resolvable key omits the header.
+
+### Throttle metrics
+
+Throttling is counted on the HTTP server and exposed via `RateLimitStats() {GlobalThrottled,
+KeyThrottled}` (mutex-guarded counters, mirroring `server.AffinityStats` / `QueueStats`) — the seam
+the metrics epic (#24, Prometheus export) will read; no Prometheus export ships here. Each throttle
+also logs a `slog` `Warn` carrying `scope` (`global`/`key`), `key_id`, and `retry_after` — never a
+secret or token.
+
+### Configuration (load-time)
+
+Global limits are set with `--global-rpm` / `--global-tpm` (or `AGENTGPU_GLOBAL_RPM` /
+`AGENTGPU_GLOBAL_TPM`), resolved flag > env > `0`. **`0` means unlimited**, so with no configuration
+the global limiter short-circuits and behavior is byte-identical to before #6. Limits are read **at
+load time** and wired via `quota.WithGlobalLimits`; there is **no hot-reload** today — changing a
+global limit requires a restart (this is the "where feasible" caveat on runtime reconfiguration).
+Per-key limits remain hot (read fresh from the store per request, as in [Quotas](#quotas)).
 
 ## Sessions
 

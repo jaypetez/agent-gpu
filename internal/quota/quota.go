@@ -35,10 +35,11 @@
 // # Scope
 //
 // This package owns the quota *engine*, the enforcement primitive
-// (ErrQuotaExceeded), the in-memory counter store, and its checkpoint
-// persistence. HTTP enforcement + 429 mapping (#6), admin HTTP endpoints (#4),
-// a Redis counter backend, and real Ollama token counts (#11) are out of scope;
-// ErrQuotaExceeded is the typed seam #6 maps to HTTP 429.
+// (ErrQuotaExceeded), the server-wide global limiter (CheckAndReserveGlobal,
+// #6), the in-memory counter store, and its checkpoint persistence. A Redis
+// counter backend and real Ollama token counts (#11) are out of scope;
+// ErrQuotaExceeded is the typed seam the HTTP layer maps to HTTP 429 (both for
+// per-key quota and the global rate limit).
 package quota
 
 import (
@@ -183,4 +184,58 @@ type Snapshot struct {
 	MinuteResetsAt time.Time
 	DayResetsAt    time.Time
 	MonthResetsAt  time.Time
+}
+
+// RetryAfter returns when the soonest exhausted limit dimension in the snapshot
+// next resets, given the current time now. It is the seam the request path uses
+// to set a Retry-After hint on a per-key quota 429:
+//
+//   - Among the dimensions at or over their (non-zero) limit, it returns the
+//     soonest reset — that window must clear before another request is admitted.
+//   - If no dimension is reported at/over its limit (e.g. a concurrent reset, or
+//     a denial whose cause already rolled), it falls back to the soonest reset
+//     strictly after now, so a caller always receives a forward-looking hint.
+//
+// The boolean is false only when no window resets after now (no limits in play),
+// in which case the caller should omit Retry-After. now is supplied (rather than
+// read from a clock) so the computation is deterministic under an injected
+// engine clock.
+func (s Snapshot) RetryAfter(now time.Time) (time.Time, bool) {
+	now = now.UTC()
+	var (
+		best  time.Time
+		found bool
+	)
+	consider := func(reset time.Time) {
+		if !reset.After(now) {
+			return
+		}
+		if !found || reset.Before(best) {
+			best, found = reset, true
+		}
+	}
+
+	// Prefer the soonest reset among dimensions that are actually at/over limit.
+	if s.Limits.RPM != 0 && s.RequestsThisMinute >= s.Limits.RPM {
+		consider(s.MinuteResetsAt)
+	}
+	if s.Limits.TPM != 0 && s.TokensThisMinute >= s.Limits.TPM {
+		consider(s.MinuteResetsAt)
+	}
+	if s.Limits.DailyTokens != 0 && s.TokensToday >= s.Limits.DailyTokens {
+		consider(s.DayResetsAt)
+	}
+	if s.Limits.MonthlyTokens != 0 && s.TokensThisMonth >= s.Limits.MonthlyTokens {
+		consider(s.MonthResetsAt)
+	}
+	if found {
+		return best, true
+	}
+
+	// Fallback: no dimension reported at/over its limit. Return the soonest
+	// window reset strictly after now so the hint is still forward-looking.
+	consider(s.MinuteResetsAt)
+	consider(s.DayResetsAt)
+	consider(s.MonthResetsAt)
+	return best, found
 }

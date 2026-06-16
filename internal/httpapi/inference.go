@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
@@ -106,12 +107,49 @@ func statusForError(err error) (status int, code, msg string) {
 // written (both for non-streaming and for a streaming request whose gating
 // failed before the stream began). Server-fault (500) errors are logged with
 // the underlying cause; client-fault errors are not, to keep logs signal-rich.
-func (s *Server) writeSubmitError(w http.ResponseWriter, err error) {
+//
+// On a per-key quota 429 (quota.ErrQuotaExceeded) it also sets a Retry-After
+// header (integer seconds, minimum 1) computed from the soonest exhausted
+// window's reset for the request's authenticated key, increments the per-key
+// throttle metric, and logs the throttle. The request r is threaded in so the
+// key can be read from the context; a 429 without a known key (none on the
+// context, or no quota engine) still returns 429 but omits Retry-After.
+func (s *Server) writeSubmitError(w http.ResponseWriter, r *http.Request, err error) {
 	status, code, msg := statusForError(err)
 	if status == http.StatusInternalServerError {
 		s.log.Error("inference submit failed", "err", err)
 	}
+	if status == http.StatusTooManyRequests && errors.Is(err, quota.ErrQuotaExceeded) {
+		s.annotatePerKey429(w, r)
+	}
 	writeError(w, status, code, msg)
+}
+
+// annotatePerKey429 sets the Retry-After header for a per-key quota 429 and
+// records the throttle. It reads the authenticated key from the request context
+// and asks the quota engine when the key's soonest-exhausted window resets,
+// computing seconds against the engine clock. If the key or engine is absent,
+// or usage cannot be read, it records the throttle but omits Retry-After rather
+// than emitting a misleading hint. It must be called before writeError so the
+// header is set before the status line is written.
+func (s *Server) annotatePerKey429(w http.ResponseWriter, r *http.Request) {
+	s.incKeyThrottled()
+	keyID := ""
+	retryAfter := 0
+	if key, ok := keyFromContext(r.Context()); ok && s.quota != nil {
+		keyID = key.ID
+		if snap, err := s.quota.UsageForKey(r.Context(), key); err == nil {
+			if reset, ok := snap.RetryAfter(s.quotaNow()); ok {
+				retryAfter = secondsUntil(reset, s.quotaNow())
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			}
+		}
+	}
+	s.log.Warn("request throttled",
+		"scope", "key",
+		"key_id", keyID,
+		"retry_after", retryAfter,
+	)
 }
 
 // decodePost requires POST and decodes the JSON request body into v. OpenAI

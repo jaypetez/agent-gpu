@@ -213,7 +213,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.engine.SubmitAuthorizedJob(r.Context(), key, job)
 	if err != nil {
-		s.writeSubmitError(w, err)
+		s.writeSubmitError(w, r, err)
 		return
 	}
 
@@ -273,7 +273,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 	chunks, err := s.engine.SubmitAuthorizedJobStream(r.Context(), key, job)
 	if err != nil {
 		// Failed before any byte: a normal JSON error with the mapped status.
-		s.writeSubmitError(w, err)
+		s.writeSubmitError(w, r, err)
 		return
 	}
 

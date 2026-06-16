@@ -6,6 +6,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -22,6 +23,10 @@ const (
 	EnvOllamaURL         = "AGENTGPU_OLLAMA_URL"
 	EnvSessionPath       = "AGENTGPU_SESSION_PATH"
 	EnvSessionTTL        = "AGENTGPU_SESSION_TTL"
+	// EnvGlobalRPM / EnvGlobalTPM configure the server-wide (global) rate limits
+	// enforced at the HTTP request boundary (#6), independent of per-key quota.
+	EnvGlobalRPM = "AGENTGPU_GLOBAL_RPM"
+	EnvGlobalTPM = "AGENTGPU_GLOBAL_TPM"
 )
 
 // Defaults.
@@ -79,6 +84,15 @@ type QuotaConfig struct {
 	DefaultDailyTokens uint64
 	// DefaultMonthlyTokens is the global default monthly token budget (0 = unlimited).
 	DefaultMonthlyTokens uint64
+
+	// GlobalRPM is the server-wide requests-per-minute cap enforced at the HTTP
+	// boundary across the whole fleet, independent of per-key quota (#6). It is
+	// resolved with flag > env > default precedence (0 = unlimited; global rate
+	// limiting off). It is applied at load time; there is no hot-reload.
+	GlobalRPM uint64
+	// GlobalTPM is the server-wide tokens-per-minute cap, the token-budget analog
+	// of GlobalRPM (0 = unlimited).
+	GlobalTPM uint64
 }
 
 // SessionConfig configures the conversation-session subsystem (#33): where
@@ -116,6 +130,18 @@ func durationEnvOr(look EnvLookup, key string, fallback time.Duration) time.Dura
 	if v, ok := look(key); ok && v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
+		}
+	}
+	return fallback
+}
+
+// uintEnvOr returns the unsigned integer parsed from the env value if set and
+// parseable, else the fallback. An unparseable value falls back silently so a
+// typo cannot wedge startup (mirroring durationEnvOr).
+func uintEnvOr(look EnvLookup, key string, fallback uint64) uint64 {
+	if v, ok := look(key); ok && v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n
 		}
 	}
 	return fallback
@@ -227,11 +253,22 @@ func ResolveQuotaPath(flagValue string, look EnvLookup, homeDir func() (string, 
 	return envOr(look, EnvQuotaPath, DefaultQuotaPath(homeDir))
 }
 
-// ResolveQuota fills a QuotaConfig's Path with flag > env > default precedence
-// (limit defaults are passed through as-is; they have no env override today).
+// ResolveQuota fills a QuotaConfig with flag > env > default precedence. The
+// per-key default limits are passed through as-is (no env override today), but
+// the server-wide global limits (#6) resolve flag > env > 0 (unlimited): a zero
+// flag value means "unset" so the AGENTGPU_GLOBAL_RPM/TPM env is consulted.
 func ResolveQuota(flags QuotaConfig, look EnvLookup, homeDir func() (string, error)) QuotaConfig {
+	if look == nil {
+		look = os.LookupEnv
+	}
 	out := flags
 	out.Path = ResolveQuotaPath(flags.Path, look, homeDir)
+	if out.GlobalRPM == 0 {
+		out.GlobalRPM = uintEnvOr(look, EnvGlobalRPM, 0)
+	}
+	if out.GlobalTPM == 0 {
+		out.GlobalTPM = uintEnvOr(look, EnvGlobalTPM, 0)
+	}
 	return out
 }
 

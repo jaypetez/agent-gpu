@@ -86,7 +86,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.engine.SubmitAuthorizedJob(r.Context(), key, job)
 	if err != nil {
-		s.writeSubmitError(w, err)
+		s.writeSubmitError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, completionResponse{
@@ -110,7 +110,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, key store.APIKey, job types.Job, model string) {
 	chunks, err := s.engine.SubmitAuthorizedJobStream(r.Context(), key, job)
 	if err != nil {
-		s.writeSubmitError(w, err)
+		s.writeSubmitError(w, r, err)
 		return
 	}
 

@@ -1196,8 +1196,11 @@ func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job 
 	prio := scheduler.PriorityForRoles(key.Roles)
 	res, err := s.submit(ctx, job, key.ID, prio)
 	// Record whatever tokens the job produced (zero on dispatch failure). The
-	// request itself was already reserved against RPM above.
+	// request itself was already reserved against RPM above. Mirror the tokens
+	// onto the global minute-token counter so a configured global TPM reflects
+	// fleet-wide usage (no-op when no global limits are set).
 	s.quota.RecordTokens(ctx, key.ID, res.Tokens)
+	s.quota.RecordGlobalTokens(ctx, res.Tokens)
 	if err != nil {
 		return res, err
 	}
@@ -1287,6 +1290,7 @@ func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey
 					// Drain the dispatch result for quota accounting.
 					res := <-done
 					s.quota.RecordTokens(ctx, key.ID, res.Tokens)
+					s.quota.RecordGlobalTokens(ctx, res.Tokens)
 					return
 				}
 				select {

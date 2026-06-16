@@ -51,6 +51,8 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	tpm := fs.Uint64("default-tpm", 0, "global default tokens per minute (0 = unlimited)")
 	daily := fs.Uint64("default-daily-tokens", 0, "global default daily token budget (0 = unlimited)")
 	monthly := fs.Uint64("default-monthly-tokens", 0, "global default monthly token budget (0 = unlimited)")
+	globalRPM := fs.Uint64("global-rpm", 0, "server-wide requests-per-minute cap across the whole fleet (0 = unlimited or $AGENTGPU_GLOBAL_RPM)")
+	globalTPM := fs.Uint64("global-tpm", 0, "server-wide tokens-per-minute cap across the whole fleet (0 = unlimited or $AGENTGPU_GLOBAL_TPM)")
 	hbTimeout := fs.Duration("heartbeat-timeout", 0, "evict a worker after this long without a heartbeat (default 45s or $AGENTGPU_HEARTBEAT_TIMEOUT)")
 	sessionPath := fs.String("session-path", "", "path to the session+history checkpoint (default $AGENTGPU_SESSION_PATH or ~/.agentgpu/sessions.json)")
 	sessionTTL := fs.Duration("session-ttl", 0, "per-session idle timeout (default 30m or $AGENTGPU_SESSION_TTL)")
@@ -66,6 +68,8 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		DefaultTPM:           *tpm,
 		DefaultDailyTokens:   *daily,
 		DefaultMonthlyTokens: *monthly,
+		GlobalRPM:            *globalRPM,
+		GlobalTPM:            *globalTPM,
 	}, nil, nil)
 	scfg := config.ResolveSession(config.SessionConfig{
 		Path: *sessionPath,
@@ -105,6 +109,9 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 			DailyTokens:   qcfg.DefaultDailyTokens,
 			MonthlyTokens: qcfg.DefaultMonthlyTokens,
 		}),
+		// Server-wide (global) rate limits enforced at the HTTP boundary (#6),
+		// independent of per-key quota. Load-time only — there is no hot-reload.
+		quota.WithGlobalLimits(qcfg.GlobalRPM, qcfg.GlobalTPM),
 	)
 
 	// Session subsystem (#36): in-memory session + history stores, restored from
@@ -165,6 +172,7 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 
 	logger.Info("control-plane server listening",
 		"addr", lis.Addr().String(), "http_addr", cfg.HTTPListen, "quota_path", qcfg.Path,
+		"global_rpm", qcfg.GlobalRPM, "global_tpm", qcfg.GlobalTPM,
 		"session_path", sessPath, "session_ttl", scfg.TTL.String(),
 		"heartbeat_timeout", heartbeatTimeout.String())
 
