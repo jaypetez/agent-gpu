@@ -55,6 +55,12 @@ type Server struct {
 	log    *slog.Logger
 	listen string
 
+	// httpSrv is constructed in NewServer (not in ListenAndServe) so the pointer
+	// is non-nil and stable before any goroutine starts or any Shutdown call
+	// races startup. This gives a happens-before edge between construction and
+	// both ListenAndServe and Shutdown, so there is no data race on the field and
+	// no window where Shutdown sees nil and silently no-ops while the listener is
+	// still being brought up.
 	httpSrv *http.Server
 }
 
@@ -66,13 +72,21 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{
+	s := &Server{
 		fleet:  grpcSrv,
 		auth:   authSvc,
 		authz:  az,
 		log:    log,
 		listen: listen,
 	}
+	// Build the *http.Server up front so the pointer is stable before any
+	// ListenAndServe goroutine or Shutdown call observes it (see field doc).
+	s.httpSrv = &http.Server{
+		Addr:              listen,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	return s
 }
 
 // Handler returns the routed http.Handler for the API. Every route is wrapped
@@ -90,21 +104,16 @@ func (s *Server) Handler() http.Handler {
 // Shutdown is called. It returns http.ErrServerClosed on a graceful shutdown,
 // which the caller treats as a clean stop.
 func (s *Server) ListenAndServe() error {
-	s.httpSrv = &http.Server{
-		Addr:              s.listen,
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
 	s.log.Info("http api listening", "addr", s.listen)
 	return s.httpSrv.ListenAndServe()
 }
 
 // Shutdown gracefully drains in-flight requests and stops the server, bounded by
-// ctx. It is safe to call before ListenAndServe (a no-op) so shutdown ordering
-// in the caller need not race startup.
+// ctx. The underlying *http.Server is constructed in NewServer, so this always
+// acts on a stable, non-nil pointer regardless of whether ListenAndServe has
+// started yet: calling Shutdown before (or concurrently with) ListenAndServe is
+// race-free and correctly prevents the listener from ever serving (a subsequent
+// ListenAndServe returns http.ErrServerClosed).
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.httpSrv == nil {
-		return nil
-	}
 	return s.httpSrv.Shutdown(ctx)
 }

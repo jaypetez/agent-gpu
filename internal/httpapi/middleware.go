@@ -40,6 +40,11 @@ func keyFromContext(ctx context.Context) (store.APIKey, bool) {
 // A 401 never reveals whether the key was unknown, revoked, or malformed, and
 // no downstream handler runs, so the catalog is never leaked to an
 // unauthenticated caller.
+//
+// Note: a successful Authenticate bumps the key's UsageCount/LastUsedAt, so
+// discovery calls to /v1/models and /models count as key usage. When HTTP
+// rate-limiting / usage metrics land (#6), they must not double-count these
+// discovery requests against inference usage.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := bearerToken(r)
