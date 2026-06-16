@@ -114,24 +114,91 @@ func TestCheckAndReserveGlobal_DoesNotTouchPerKeyCounters(t *testing.T) {
 // TestCheckAndReserveGlobal_TPMBudget proves the global token budget denies only
 // once already exhausted (>= limit), mirroring the per-key TPM semantics:
 // CheckAndReserveGlobal admits the request whose tokens are not yet known and
-// denies the next once recorded tokens reach the limit.
+// denies the next once recorded tokens reach the limit. It drives the real
+// RecordGlobalTokens path (the request path's post-dispatch accounting), not a
+// raw cs.AddTokens, so the test exercises the seam production actually uses.
 func TestCheckAndReserveGlobal_TPMBudget(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	clk := newClock(time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC))
-	eng, cs := newGlobalEngine(clk, 0, 10)
+	eng, _ := newGlobalEngine(clk, 0, 10)
 
 	// Under budget: admitted (RPM is unlimited here, only TPM is set).
 	if err := eng.CheckAndReserveGlobal(ctx); err != nil {
 		t.Fatalf("under token budget: %v", err)
 	}
-	// Record the global tokens (the request path would call AddTokens on the
-	// global counter when global TPM is in play).
-	if err := cs.AddTokens(ctx, globalKeyID, clk.now(), 10); err != nil {
-		t.Fatalf("add tokens: %v", err)
-	}
+	// Record the global tokens via the engine, exactly as the server does after a
+	// job completes; this drives the global minute-token counter to the limit.
+	eng.RecordGlobalTokens(ctx, 10)
 	if err := eng.CheckAndReserveGlobal(ctx); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("over token budget: want ErrQuotaExceeded, got %v", err)
+	}
+}
+
+// TestCheckAndReserveGlobal_TPMResetsOnMinuteBoundary proves the global token
+// budget is a fixed minute window: after recording enough tokens to exhaust it
+// (denying the next request), crossing the minute boundary fully resets the
+// allowance and requests are admitted again — the same window discipline as RPM.
+func TestCheckAndReserveGlobal_TPMResetsOnMinuteBoundary(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	clk := newClock(time.Date(2026, 6, 16, 10, 0, 30, 0, time.UTC))
+	eng, _ := newGlobalEngine(clk, 0, 10)
+
+	if err := eng.CheckAndReserveGlobal(ctx); err != nil {
+		t.Fatalf("under token budget: %v", err)
+	}
+	eng.RecordGlobalTokens(ctx, 10)
+	if err := eng.CheckAndReserveGlobal(ctx); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("over token budget: want ErrQuotaExceeded, got %v", err)
+	}
+
+	clk.set(time.Date(2026, 6, 16, 10, 1, 0, 0, time.UTC))
+	if err := eng.CheckAndReserveGlobal(ctx); err != nil {
+		t.Fatalf("after minute reset: unexpected error: %v", err)
+	}
+}
+
+// TestRecordGlobalTokens_ShortCircuitsWhenUnlimited proves RecordGlobalTokens
+// never touches the counter store when no global limits are configured
+// (RPM==0 && TPM==0 — the default), so the default install has zero global
+// counter growth, consistent with CheckAndReserveGlobal's short-circuit.
+func TestRecordGlobalTokens_ShortCircuitsWhenUnlimited(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	clk := newClock(time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC))
+	eng, cs := newGlobalEngine(clk, 0, 0)
+
+	eng.RecordGlobalTokens(ctx, 1000)
+
+	c, err := cs.Get(ctx, globalKeyID, clk.now())
+	if err != nil {
+		t.Fatalf("get global counter: %v", err)
+	}
+	if c.MinuteTokens != 0 {
+		t.Errorf("global MinuteTokens = %d, want 0 (short-circuit must not record)", c.MinuteTokens)
+	}
+}
+
+// TestRecordGlobalTokens_RecordsWhenLimited proves RecordGlobalTokens does drive
+// the global minute-token counter when a global limit is configured, so the TPM
+// budget is actually enforced end-to-end (the bug this fixes: nothing recorded
+// onto the global counter, making global TPM silently non-functional).
+func TestRecordGlobalTokens_RecordsWhenLimited(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	clk := newClock(time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC))
+	eng, cs := newGlobalEngine(clk, 0, 100)
+
+	eng.RecordGlobalTokens(ctx, 7)
+	eng.RecordGlobalTokens(ctx, 0) // n==0 is a no-op.
+
+	c, err := cs.Get(ctx, globalKeyID, clk.now())
+	if err != nil {
+		t.Fatalf("get global counter: %v", err)
+	}
+	if c.MinuteTokens != 7 {
+		t.Errorf("global MinuteTokens = %d, want 7", c.MinuteTokens)
 	}
 }
 

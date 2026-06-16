@@ -2,6 +2,7 @@ package httpapi_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"testing"
@@ -165,6 +166,85 @@ func TestGlobalRateLimitRetryAfter(t *testing.T) {
 	_ = resp.Body.Close()
 	if status != http.StatusOK {
 		t.Fatalf("after global window reset: status = %d, want 200", status)
+	}
+}
+
+// TestGlobalTPMRateLimit proves global TPM is enforced end-to-end: with a small
+// GlobalTPM and a scripted executor returning a known token count per request,
+// the request whose recorded tokens push the global minute-token counter to the
+// limit succeeds, and the NEXT request — on a distinct under-quota key, so the
+// denial can only be the global limit — returns 429 rate_limit_exceeded with a
+// numeric Retry-After. GlobalThrottled increments (proving the global scope) and
+// KeyThrottled does not (the keys are well under their own quota). This guards
+// the fix for the previously silent global TPM: nothing recorded onto the global
+// counter made the configured budget never deny. (AC2 token dimension.)
+func TestGlobalTPMRateLimit(t *testing.T) {
+	clk := &testClock{now: time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)}
+	// Each request produces promptTokens+completionTokens = 2 tokens. GlobalTPM=2
+	// lets the first request through (counter starts at 0 < 2); recording its 2
+	// tokens then exhausts the budget so the next request is denied on TPM.
+	const globalTPM = 2
+	eng := quota.NewEngine(quota.NewMemoryCounterStore(),
+		quota.WithClock(clk.nowFn),
+		quota.WithGlobalLimits(0, globalTPM),
+	)
+
+	exec := &scriptedExecutor{deltas: []string{"ok"}, promptTokens: 1, completionTokens: 1}
+	h := newInferenceHarnessWith(t, exec, "llama3", server.WithQuota(eng))
+
+	body := `{"model":"llama3","messages":[{"role":"user","content":"hi"}]}`
+
+	// First request: under the token budget (global RPM is unlimited here). Its 2
+	// tokens are recorded onto the global counter after the job completes — the
+	// non-streaming response only returns post-dispatch, so the budget is updated
+	// by the time we issue the next request.
+	token := mintUserKey(t, h.authSvc, "llama3", 0)
+	resp := h.postAs(t, token, "/v1/chat/completions", body)
+	status := resp.StatusCode
+	_ = resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200", status)
+	}
+
+	// Next request, on a distinct fresh under-quota key, trips the GLOBAL TPM
+	// budget (already exhausted), not any per-key limit.
+	token = mintUserKey(t, h.authSvc, "llama3", 0)
+	resp = h.postAs(t, token, "/v1/chat/completions", body)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		_ = resp.Body.Close()
+		t.Fatalf("over-global-TPM request: status = %d, want 429", resp.StatusCode)
+	}
+	ra := retryAfterSeconds(t, resp)
+	var eb quotaErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("decode error body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if eb.Error.Code != "rate_limit_exceeded" {
+		t.Errorf("error.code = %q, want rate_limit_exceeded", eb.Error.Code)
+	}
+	if ra > 60 {
+		t.Errorf("Retry-After = %d, want <= 60 (global minute window)", ra)
+	}
+
+	stats := h.httpSrv.RateLimitStats()
+	if stats.GlobalThrottled != 1 {
+		t.Errorf("GlobalThrottled = %d, want 1 (proves global TPM, not per-key)", stats.GlobalThrottled)
+	}
+	if stats.KeyThrottled != 0 {
+		t.Errorf("KeyThrottled = %d, want 0 (the key was under its own quota)", stats.KeyThrottled)
+	}
+
+	// Cross the minute boundary: the global token window resets and a fresh key is
+	// admitted again, proving the TPM budget is a rolling minute window.
+	clk.advance(time.Minute)
+	token = mintUserKey(t, h.authSvc, "llama3", 0)
+	resp = h.postAs(t, token, "/v1/chat/completions", body)
+	status = resp.StatusCode
+	_ = resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("after global TPM window reset: status = %d, want 200", status)
 	}
 }
 

@@ -243,6 +243,32 @@ func (e *Engine) RecordTokens(ctx context.Context, keyID string, n uint64) {
 	e.log.Log(ctx, slog.LevelDebug, "quota tokens recorded", "key_id", keyID, "tokens", n)
 }
 
+// RecordGlobalTokens adds n tokens to the server-wide (global) minute-token
+// counter, AFTER a job returns, so the global TPM budget enforced by
+// CheckAndReserveGlobal reflects fleet-wide usage. It mirrors RecordTokens but
+// targets the reserved global counter (globalKeyID) instead of a real key, and
+// is the token dimension's counterpart to the global RPM reservation that
+// CheckAndReserveGlobal already performs per request.
+//
+// When no global limits are configured (RPM==0 && TPM==0 — the default), it
+// short-circuits without touching the counter store, so a server without global
+// limits behaves exactly as before and the global counter never grows. n==0 is
+// a no-op for the same reason as RecordTokens.
+func (e *Engine) RecordGlobalTokens(ctx context.Context, n uint64) {
+	if n == 0 {
+		return
+	}
+	if e.global.RPM == 0 && e.global.TPM == 0 {
+		return // global limiting disabled: never touch the store (zero overhead).
+	}
+	now := e.now().UTC()
+	if err := e.cs.AddTokens(ctx, globalKeyID, now, n); err != nil {
+		e.log.Log(ctx, slog.LevelError, "quota record global tokens failed", "key_id", globalKeyID, "tokens", n, "err", err)
+		return
+	}
+	e.log.Log(ctx, slog.LevelDebug, "quota global tokens recorded", "key_id", globalKeyID, "tokens", n)
+}
+
 // Usage returns a Snapshot of keyID's current usage versus the supplied
 // effective limits. Callers pass the limits (resolved from the key) so Usage
 // does not need the full APIKey; UsageForKey is the convenience wrapper.

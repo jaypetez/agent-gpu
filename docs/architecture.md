@@ -619,7 +619,15 @@ every `429`. The two scopes are distinct and complementary:
 - **Global** — a single fleet-wide cap (`GlobalRPM` / `GlobalTPM`) that protects the whole server
   from aggregate overload regardless of which key is calling. It is enforced by `rateLimitMiddleware`
   via `quota.CheckAndReserveGlobal`, which reserves against a reserved global counter (the
-  `__global__` sentinel key — it cannot collide with a real `agpu_…` key).
+  `__global__` sentinel key — it cannot collide with a real `agpu_…` key). The two dimensions are fed
+  the same way the per-key engine handles them: **RPM is reserved per request** in the middleware
+  (the reservation must fit), while **TPM is checked as an already-consumed budget** — a request is
+  admitted if the global minute-token counter is below `GlobalTPM`, and the tokens a job actually
+  produces are added to that counter **after** dispatch via `quota.RecordGlobalTokens` (called
+  alongside the per-key `RecordTokens` in both the non-streaming and streaming submit paths). So once
+  fleet-wide usage reaches `GlobalTPM`, the next request denies on TPM (`429` + `Retry-After`).
+  `RecordGlobalTokens` short-circuits when no global limit is configured, so the global counter never
+  grows on a default install.
 - **Per-key** — each key's own `RPM`/`TPM`/daily/monthly quota (see [Quotas](#quotas)), enforced on
   the dispatch path by `CheckAndReserve`. Rate limiting **does not re-check** per-key quota; it adds
   only the new global check plus the `Retry-After`/metrics around the existing 429.
@@ -635,11 +643,15 @@ deliberately not rate-limited — they do not consume inference capacity.
 ### Order on the inference path
 
 ```text
-authenticate → rateLimitMiddleware (global) → handler → quota.CheckAndReserve (per-key) → dispatch
+authenticate → rateLimitMiddleware (global RPM reserve + global TPM check) → handler
+  → quota.CheckAndReserve (per-key) → dispatch
+  → quota.RecordTokens (per-key) + quota.RecordGlobalTokens (global TPM)
 ```
 
 A global denial returns `429` before the per-key check ever runs; an admitted request then goes
-through the normal per-key quota enforcement (no double-counting in either direction).
+through the normal per-key quota enforcement (no double-counting in either direction). After the job
+returns, its token count is recorded against **both** the per-key counters and the global minute-token
+counter, so a later request sees the updated global TPM budget.
 
 ### Retry-After
 
