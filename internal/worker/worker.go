@@ -382,10 +382,14 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 				// Always send a terminal chunk so the server's accumulator resolves the
 				// waiter exactly once — even on failure, so the waiter never hangs.
 				emit(types.JobChunk{
-					JobID:  job.ID,
-					Done:   true,
-					Err:    res.Err,
-					Tokens: res.Tokens,
+					JobID:            job.ID,
+					Done:             true,
+					Err:              res.Err,
+					Tokens:           res.Tokens,
+					ToolCalls:        res.ToolCalls,
+					FinishReason:     res.FinishReason,
+					PromptTokens:     res.PromptTokens,
+					CompletionTokens: res.CompletionTokens,
 				})
 				atomic.AddInt32(&activeJobs, -1)
 			}

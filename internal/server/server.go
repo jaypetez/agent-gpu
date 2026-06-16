@@ -71,6 +71,13 @@ type worker struct {
 	// returns one final result) while the wire carries a true token stream that
 	// the request path (#13) will forward as SSE. Guarded by mu.
 	streams map[string]*strings.Builder
+	// observers maps a job id to a channel the streaming request path
+	// (SubmitAuthorizedJobStream) subscribes to. When set, accumulate forwards a
+	// copy of every JobChunk (per-token deltas AND the terminal chunk) to the
+	// observer so the HTTP layer can emit SSE as tokens arrive, in addition to
+	// the synchronous accumulate-and-resolve path. The non-streaming pending
+	// waiter is independent and unaffected. Guarded by mu.
+	observers map[string]chan types.JobChunk
 
 	// Capacity/liveness fields reported via heartbeats, guarded by mu. models is
 	// seeded from the registration advertisement and refreshed from each
@@ -172,6 +179,29 @@ func (w *worker) addPending(jobID string) chan types.JobResult {
 	return ch
 }
 
+// addObserver registers a streaming observer for jobID. accumulate forwards a
+// copy of every chunk for the job to the returned channel (buffered so a brief
+// consumer stall does not block the worker reader). It is the seam the
+// streaming request path uses to emit SSE as tokens arrive.
+func (w *worker) addObserver(jobID string) chan types.JobChunk {
+	ch := make(chan types.JobChunk, 64)
+	w.mu.Lock()
+	if w.observers == nil {
+		w.observers = make(map[string]chan types.JobChunk)
+	}
+	w.observers[jobID] = ch
+	w.mu.Unlock()
+	return ch
+}
+
+// removeObserver detaches the observer for jobID so a client that disconnected
+// (or a completed stream) leaves no per-job state behind. It is idempotent.
+func (w *worker) removeObserver(jobID string) {
+	w.mu.Lock()
+	delete(w.observers, jobID)
+	w.mu.Unlock()
+}
+
 func (w *worker) resolve(res types.JobResult) {
 	w.mu.Lock()
 	ch, ok := w.pending[res.JobID]
@@ -200,7 +230,13 @@ func (w *worker) accumulate(chunk types.JobChunk) {
 			w.streams[chunk.JobID] = b
 		}
 		b.WriteString(chunk.Delta)
+		obs := w.observers[chunk.JobID]
 		w.mu.Unlock()
+		// Fan a copy of the per-token chunk out to any streaming observer so the
+		// HTTP layer can emit SSE as tokens arrive. Non-blocking: a slow/gone
+		// consumer must not wedge the worker reader (the synchronous accumulate
+		// path below still resolves the waiter regardless).
+		forwardChunk(obs, chunk)
 		return
 	}
 
@@ -216,13 +252,26 @@ func (w *worker) accumulate(chunk types.JobChunk) {
 	// A late delta on the terminal chunk (some backends include trailing content)
 	// is honored.
 	output += chunk.Delta
+	obs := w.observers[chunk.JobID]
+	delete(w.observers, chunk.JobID)
 	w.mu.Unlock()
 
+	// Forward the terminal chunk to the streaming observer and close its channel
+	// so the SSE writer flushes the final delta/finish_reason and then ends.
+	if obs != nil {
+		forwardChunk(obs, chunk)
+		close(obs)
+	}
+
 	res := types.JobResult{
-		JobID:  chunk.JobID,
-		Output: output,
-		Err:    chunk.Err,
-		Tokens: chunk.Tokens,
+		JobID:            chunk.JobID,
+		Output:           output,
+		Err:              chunk.Err,
+		Tokens:           chunk.Tokens,
+		ToolCalls:        chunk.ToolCalls,
+		FinishReason:     chunk.FinishReason,
+		PromptTokens:     chunk.PromptTokens,
+		CompletionTokens: chunk.CompletionTokens,
 	}
 	if chunk.Err != nil {
 		// On failure the partial output is discarded in favor of the error so the
@@ -232,17 +281,39 @@ func (w *worker) accumulate(chunk types.JobChunk) {
 	w.resolve(res)
 }
 
+// forwardChunk delivers chunk to a streaming observer without blocking: a slow
+// or gone consumer drops the chunk rather than wedging the worker reader. A nil
+// channel is a no-op. The channel is closed by the terminal-chunk path in
+// accumulate (or failAllPending on a drop), never here.
+func forwardChunk(obs chan types.JobChunk, chunk types.JobChunk) {
+	if obs == nil {
+		return
+	}
+	select {
+	case obs <- chunk:
+	default:
+	}
+}
+
 // failAllPending unblocks any outstanding job waiters when the stream drops. It
-// also discards any partial stream buffers so a dropped connection leaks no
-// per-job state.
+// also discards any partial stream buffers and closes any streaming observers
+// so a dropped connection leaks no per-job state and the SSE writer unblocks.
 func (w *worker) failAllPending(err *types.JobError) {
 	w.mu.Lock()
 	pending := w.pending
 	w.pending = make(map[string]chan types.JobResult)
 	w.streams = make(map[string]*strings.Builder)
+	observers := w.observers
+	w.observers = make(map[string]chan types.JobChunk)
 	w.mu.Unlock()
 	for id, ch := range pending {
 		ch <- types.JobResult{JobID: id, Err: err}
+	}
+	for id, obs := range observers {
+		// Deliver a terminal error chunk then close so the SSE writer emits an
+		// error event and ends rather than hanging on a now-dead worker.
+		forwardChunk(obs, types.JobChunk{JobID: id, Done: true, Err: err})
+		close(obs)
 	}
 }
 
@@ -656,11 +727,12 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 	s.Start()
 
 	w := &worker{
-		id:      reg.GetWorkerId(),
-		models:  types.ModelsFromProto(reg.GetModels()),
-		send:    make(chan *agentgpuv1.ServerMessage, 16),
-		pending: make(map[string]chan types.JobResult),
-		streams: make(map[string]*strings.Builder),
+		id:        reg.GetWorkerId(),
+		models:    types.ModelsFromProto(reg.GetModels()),
+		send:      make(chan *agentgpuv1.ServerMessage, 16),
+		pending:   make(map[string]chan types.JobResult),
+		streams:   make(map[string]*strings.Builder),
+		observers: make(map[string]chan types.JobChunk),
 		// Seed lastHeartbeat at registration so a worker that registers but has
 		// not yet sent its first heartbeat is graced for one full timeout window
 		// rather than being treated as never-seen.
@@ -1013,6 +1085,97 @@ func (s *Server) SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job 
 		return res, err
 	}
 	return res, nil
+}
+
+// SubmitAuthorizedJobStream is the streaming counterpart of SubmitAuthorizedJob
+// for /v1/chat/completions and /v1/completions with stream=true. It gates the
+// key exactly as the non-streaming path (authz.Infer → quota.CheckAndReserve)
+// BEFORE any worker is touched, then dispatches the job and returns a channel
+// the caller drains for live JobChunks (per-token deltas plus the terminal
+// chunk), which the HTTP layer forwards as Server-Sent Events.
+//
+// Ordering and cleanup:
+//
+//   - Validate → Authorize (authz.ErrForbidden) → CheckAndReserve
+//     (quota.ErrQuotaExceeded) → pick a worker. A streaming request needs a live
+//     worker to attach its observer to, so if no worker can run the model right
+//     now it returns queue.ErrQueueFull (the HTTP layer maps that to 503); unlike
+//     the non-streaming path it does not queue-and-block, since there is no
+//     stream to attach to until a worker exists.
+//   - The returned channel is closed by the worker's accumulate path on the
+//     terminal chunk (or by failAllPending if the worker drops), so the caller's
+//     range loop ends cleanly.
+//   - Tokens are recorded against the key when the terminal chunk arrives, in a
+//     goroutine that also drives dispatch and ctx-cancel cleanup.
+//   - Cancelling ctx (client disconnect) aborts the upstream dispatch: the
+//     dispatch goroutine's dispatchTo returns on ctx.Done, removing the worker's
+//     pending entry; the observer is detached so no per-job state leaks.
+//
+// The returned error is non-nil only when gating/dispatch-setup fails before any
+// chunk could flow; once a non-nil channel is returned, all outcomes (including
+// errors) surface as a terminal JobChunk on it.
+func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey, job types.Job) (<-chan types.JobChunk, error) {
+	if err := job.Validate(); err != nil {
+		return nil, err
+	}
+	if err := s.authz.Authorize(ctx, key, job.Model, authz.Infer); err != nil {
+		return nil, err
+	}
+	if err := s.quota.CheckAndReserve(ctx, key); err != nil {
+		return nil, err
+	}
+	w, ok := s.pickWorker(job.Model)
+	if !ok {
+		// No live worker for the model: there is nothing to attach a stream to.
+		// Surface backpressure the same way the queue would, mapped to 503.
+		return nil, queue.ErrQueueFull
+	}
+
+	// Register the observer BEFORE dispatching so no chunk can be produced and
+	// folded by accumulate before the observer is listening.
+	obs := w.addObserver(job.ID)
+
+	out := make(chan types.JobChunk, 64)
+	go func() {
+		defer close(out)
+		// Drive dispatch in a sibling goroutine: dispatchTo blocks until the
+		// terminal result (which also resolves the pending waiter accumulate uses),
+		// returns its token count for quota accounting, and — crucially — removes
+		// the worker's pending entry on ctx cancellation so a client disconnect
+		// aborts the upstream job.
+		done := make(chan types.JobResult, 1)
+		go func() {
+			res, _ := s.dispatchTo(ctx, w, job)
+			done <- res
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				// Client disconnected: detach the observer and stop forwarding. The
+				// dispatch goroutine observes ctx.Done too and tears down the pending
+				// entry; tokens for an aborted stream are not recorded.
+				w.removeObserver(job.ID)
+				return
+			case chunk, alive := <-obs:
+				if !alive {
+					// Observer closed by accumulate/failAllPending: stream complete.
+					// Drain the dispatch result for quota accounting.
+					res := <-done
+					s.quota.RecordTokens(ctx, key.ID, res.Tokens)
+					return
+				}
+				select {
+				case out <- chunk:
+				case <-ctx.Done():
+					w.removeObserver(job.ID)
+					return
+				}
+			}
+		}
+	}()
+
+	return out, nil
 }
 
 // Quota exposes the configured quota engine (a seam for usage inspection and

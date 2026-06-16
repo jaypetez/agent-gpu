@@ -30,15 +30,69 @@ message Error {
   string message = 2;
 }
 
+// ChatMessage is one entry in an OpenAI-style chat conversation, carried on a
+// Job so chat semantics round-trip from the public API through the worker to
+// Ollama and back. Added by the OpenAI-API epic (#13); additive to the plain
+// prompt Job carried for /v1/completions and the foundational stub.
+message ChatMessage {
+  // Role of the author: "system", "user", "assistant", or "tool".
+  string role = 1;
+  // Text content of the message (may be empty for an assistant turn that only
+  // carries tool_calls, or a tool result whose content is structured).
+  string content = 2;
+  // For a "tool" message: the id of the assistant tool call this result answers.
+  string tool_call_id = 3;
+  // Optional author name (e.g. the function name for a tool message).
+  string name = 4;
+  // For an "assistant" message replaying prior tool calls back to the model.
+  repeated ToolCall tool_calls = 5;
+}
+
+// ToolFunction is the JSON-schema function definition the client offers the
+// model. parameters_json is the function's JSON-schema parameter object encoded
+// as a JSON string, kept opaque on the wire so the schema passes through
+// unchanged.
+message ToolFunction {
+  string name = 1;
+  string description = 2;
+  string parameters_json = 3;
+}
+
+// Tool is one tool the model may call. Only function tools exist today, so type
+// is "function" and function carries the definition.
+message Tool {
+  string type = 1;
+  ToolFunction function = 2;
+}
+
+// ToolCall is a function invocation the model emitted (response side) or a
+// prior assistant tool call replayed to the model (request side).
+// arguments_json is the call arguments encoded as a JSON string, opaque on the
+// wire.
+message ToolCall {
+  string id = 1;
+  string type = 2;
+  string function_name = 3;
+  string arguments_json = 4;
+}
+
 // Job is a single unit of inference work dispatched from server to worker.
 message Job {
   // Server-assigned unique id for correlating dispatch with result.
   string id = 1;
   // Name of the model to run the job against.
   string model = 2;
-  // Free-form prompt/input. The real schema (chat messages, params) is built
-  // by the OpenAI-API epic; for the foundational stub this is a plain prompt.
+  // Free-form prompt/input for /v1/completions and the foundational stub. The
+  // chat schema below (messages, tools) is the OpenAI-API epic (#13) extension;
+  // a chat job leaves prompt empty and carries messages instead.
   string prompt = 3;
+  // OpenAI chat messages for /v1/chat/completions. Additive: when non-empty the
+  // worker runs Ollama /api/chat with the full conversation; when empty the
+  // plain prompt path is used (back-compat with the echo stub and #11).
+  repeated ChatMessage messages = 4;
+  // Tools (function definitions) the model may call. Threaded to Ollama
+  // /api/chat so the model can emit tool_calls.
+  repeated Tool tools = 5;
 }
 
 // JobResult is the worker's response to a dispatched Job.
@@ -54,6 +108,17 @@ message JobResult {
   // count; real counts arrive with the Ollama integration (#11). Zero means
   // "no tokens reported".
   uint64 tokens = 4;
+  // Tool calls the model emitted (OpenAI function-calling). Empty for an
+  // ordinary text completion. Added by the OpenAI-API epic (#13).
+  repeated ToolCall tool_calls = 5;
+  // OpenAI finish_reason for this result: "stop", "length", "tool_calls", etc.
+  // Empty when the worker reports none. Added by the OpenAI-API epic (#13).
+  string finish_reason = 6;
+  // Prompt-side token count (Ollama prompt_eval_count) for OpenAI usage
+  // accounting; tokens above remains the total for quota. Zero if unknown.
+  uint64 prompt_tokens = 7;
+  // Completion-side token count (Ollama eval_count). Zero if unknown.
+  uint64 completion_tokens = 8;
 }
 
 // JobChunk is an incremental piece of a streaming job's output, sent
@@ -80,6 +145,16 @@ message JobChunk {
   // Total tokens generated/consumed by the job, reported on the terminal chunk
   // for quota accounting (#5). Zero means "no tokens reported".
   uint64 tokens = 5;
+  // Tool calls the model emitted, carried on the terminal chunk so a streaming
+  // function call surfaces as delta tool_calls + finish_reason "tool_calls".
+  // Added by the OpenAI-API epic (#13).
+  repeated ToolCall tool_calls = 6;
+  // OpenAI finish_reason on the terminal chunk ("stop", "length",
+  // "tool_calls"). Empty on non-terminal chunks. Added by the OpenAI-API epic.
+  string finish_reason = 7;
+  // Prompt/completion token split on the terminal chunk for OpenAI usage.
+  uint64 prompt_tokens = 8;
+  uint64 completion_tokens = 9;
 }
 
 // Register is the first message a worker sends on the stream. It identifies
