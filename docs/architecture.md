@@ -205,11 +205,11 @@ parser ends cleanly rather than hanging.
 
 ### Out of scope / seams
 
-The formal OpenAPI 3.1 spec (#14) is out of scope here; the typed `code`s, the `usage` object, and
-the unplumbed inference parameters are the seams it lands on. Per-key quota is enforced (and
-`429`-mapped) because `SubmitAuthorizedJob*` reserves against it, and the inference routes are
-fronted by the global rate limiter with `Retry-After` on every `429` (see
-[Rate limiting](#rate-limiting)).
+The formal OpenAPI 3.1 spec (#14) lives at [`openapi.yaml`](../openapi.yaml) (validated and rendered
+in CI by the `openapi` job); the typed `code`s, the `usage` object, and the unplumbed inference
+parameters are the seams it documents. Per-key quota is enforced (and `429`-mapped) because
+`SubmitAuthorizedJob*` reserves against it, and the inference routes are fronted by the global rate
+limiter with `Retry-After` on every `429` (see [Rate limiting](#rate-limiting)).
 
 ## Admin API
 
@@ -275,7 +275,7 @@ Responses are explicit request/response structs that project `store.APIKey` into
 view — the stored `SecretHash`/`Salt` are **never** serialized or logged. The plaintext token is
 returned exactly once, only on create and rotate; it cannot be recovered afterward.
 
-The formal OpenAPI 3.1 spec for these endpoints lands in #14.
+The formal OpenAPI 3.1 spec for these endpoints lives at [`openapi.yaml`](../openapi.yaml) (#14).
 
 ## Capacity-aware scheduling
 
@@ -806,8 +806,8 @@ The cmd wiring mirrors the quota subsystem: `--session-path` / `--session-ttl` f
 boot (dropping expired sessions and purging orphaned history), a periodic 30 s checkpoint goroutine,
 and a checkpoint on graceful shutdown.
 
-> The formal OpenAPI 3.1 spec is a separate milestone (#14); it must include these session endpoints
-> and the two chat modes. This document is the interim contract until that spec lands.
+> The formal OpenAPI 3.1 spec ([`openapi.yaml`](../openapi.yaml), #14) documents these session
+> endpoints and the two chat modes. This document remains the prose companion to that spec.
 
 ## State
 
