@@ -34,6 +34,38 @@ flowchart LR
 
 See [docs/architecture.md](docs/architecture.md) for the request-flow diagram and details.
 
+## Install
+
+Pre-built, statically-linked binaries are published for Windows, macOS, and Linux on both
+x64 (`amd64`) and ARM64 from the
+[Releases page](https://github.com/jaypetez/agent-gpu/releases).
+
+1. Download the archive for your OS/arch (`agentgpu_<version>_<os>_<arch>.tar.gz`, or `.zip`
+   on Windows).
+2. Verify it against the published `checksums.txt`:
+
+   ```bash
+   # Linux / macOS
+   sha256sum --check --ignore-missing checksums.txt
+   ```
+
+   ```powershell
+   # Windows (PowerShell)
+   (Get-FileHash .\agentgpu_<version>_windows_amd64.zip -Algorithm SHA256).Hash
+   ```
+
+3. Extract the archive and put the `agentgpu` binary on your `PATH`, then confirm it runs:
+
+   ```bash
+   agentgpu --version
+   ```
+
+Alternatively, install from source with the Go toolchain:
+
+```bash
+go install github.com/jaypetez/agent-gpu/cmd/agentgpu@latest
+```
+
 ## Quickstart
 
 > Pre-1.0: commands below reflect the intended CLI surface ([tracked here](https://github.com/jaypetez/agent-gpu/issues/19)).
@@ -58,6 +90,7 @@ curl http://SERVER_HOST:PORT/v1/chat/completions \
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Releasing](docs/releasing.md)
 - [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Changelog](CHANGELOG.md)
 - Developer Guide — see [#26](https://github.com/jaypetez/agent-gpu/issues/26)
 - API Reference — see [#27](https://github.com/jaypetez/agent-gpu/issues/27)

@@ -30,3 +30,5 @@ tmp/
 coverage.txt
 # We use Go modules, not vendoring
 /vendor/
+# GoReleaser build output
+/dist/
