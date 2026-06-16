@@ -238,6 +238,34 @@ be outweighed by the sum of every lower term in its expected range:
 `Pick` filters to runnable candidates, scores each, and returns the highest. **Ties are broken by
 worker ID (ascending)** so the choice is stable across calls.
 
+### Session affinity (warm KV cache)
+
+A conversation's follow-up turns are routed back to the worker that already holds the session's model
+(its warm KV cache), avoiding a cold prompt reprocess on a different GPU. Affinity is a **strong
+preference, not a hard pin**:
+
+- A `Session` records a `BoundWorkerID` — set on the **first turn** (after the first successful
+  dispatch) and **rebound** whenever a different worker is chosen. A `types.Job` carries an optional
+  `SessionID` that is a **server-side routing hint only**: it never crosses the gRPC wire to the worker
+  (`Job.Proto` omits it), so the worker contract is unchanged.
+- `scheduler.PickPreferring(workers, model, preferredWorkerID)` adds a **bound-worker bonus**
+  (`weightBoundWorkerBonus`, 1e8) to the bound worker **only when it is already in the runnable
+  candidate set**. The bonus sits **between** the capacity terms and the model-loaded weight (1e9): a
+  warm bound worker reliably wins over a fresher peer, but a *different* worker that already has the
+  model loaded still wins, and the bonus **never** makes a draining/stale/VRAM-unfit worker selectable
+  (the runnability filter is untouched). `Pick` is `PickPreferring` with no preference, so the
+  no-session path is byte-identical and `Pick`/`Score` stay pure and deterministic.
+- **Rebind on loss.** When the bound worker drains, is evicted, goes stale, or no longer fits, it is
+  simply not a candidate, so the best-fit healthy worker is chosen and the session is rebound to it —
+  the next turn succeeds on a new worker with no client-visible failure.
+- Resolving the binding and recording it is **server-side bookkeeping**: the dispatch paths
+  (`submit` fast path, the placement loop, and the streaming path) look the session up by the owning
+  key id, pass its `BoundWorkerID` as the preference, and after a successful dispatch `Bind` the
+  session (first-turn or rebind). A bind error is logged and **never fails the inference turn**.
+- **Affinity metric.** `Server.AffinityStats()` exposes mutex-guarded `Hits`/`Misses`: a **hit** when a
+  turn routes back to its bound worker, a **miss** when it rebinds to a different one. A session's first
+  turn (no prior binding) and any session-less job count neither. It is the metrics seam for #24.
+
 ### Fit approximation (no model-size data yet)
 
 There is no per-model VRAM-requirement data yet (real GPU/model-size detection is #16), so "fit" is
@@ -518,11 +546,14 @@ without touching the engine.
 ## Sessions
 
 A **session** is a persisted, owner-scoped handle to a model conversation, owned by `internal/session`.
-It is the foundation of the sessions epic; affinity routing, `keep_alive`, and the HTTP session API
-build on it in later milestones. This milestone ships the domain model, the persistence interfaces +
-in-memory/checkpointing implementations, the lifecycle `Manager`, and the idle-expiry sweeper only —
-the cmd/HTTP wiring (constructing the `Manager`, calling `Start`/`Close`, exposing the API) lands with
-the HTTP session API milestone and is left as a documented seam.
+It is the foundation of the sessions epic. **Session-affinity scheduling is wired** (see
+[Session affinity](#session-affinity-warm-kv-cache) under Capacity-aware scheduling): the `Manager`'s
+`Bind` records a session→worker binding and the scheduler prefers it. `keep_alive` and the HTTP session
+API build on this in later milestones. The session domain model, persistence interfaces +
+in-memory/checkpointing implementations, the lifecycle `Manager`, and the idle-expiry sweeper ship
+here; the cmd/HTTP wiring (constructing the `Manager`, calling `Start`/`Close`, exposing the API, and
+setting `Job.SessionID` on requests) lands with the HTTP session API milestone and is left as a
+documented seam — the server enables affinity via `WithSessionManager` (nil by default = disabled).
 
 ### Model
 
@@ -531,7 +562,7 @@ type Session struct {
     ID            string        // "sess_" + crypto/rand hex — stable, unguessable
     OwnerKeyID    string        // public API-key id (never a secret/hash)
     Model         string
-    BoundWorkerID string        // affinity hint, stored only (routing is a later milestone)
+    BoundWorkerID string        // affinity binding — the scheduler prefers this worker (#34)
     CreatedAt     time.Time
     LastActiveAt  time.Time     // touched on create/resume/append
     TTL           time.Duration // per-session idle timeout (<=0 = never idles out)

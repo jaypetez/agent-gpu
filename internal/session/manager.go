@@ -245,6 +245,29 @@ func (m *Manager) deleteSession(id string) error {
 	return m.sessions.Delete(id)
 }
 
+// Bind records the worker a session is affinity-bound to (#34): the worker that
+// holds the conversation's warm KV cache, which the scheduler then prefers for
+// subsequent turns. It is owner-checked (ErrSessionNotFound for a missing,
+// not-owned, or expired session, so existence never leaks), sets BoundWorkerID,
+// touches LastActiveAt (a routed turn is activity), and persists. It returns a
+// copy of the updated session. The server calls it after the first successful
+// dispatch (first-turn binding) and again whenever the chosen worker differs
+// from the bound one (rebind after the bound worker drains/evicts/goes stale).
+func (m *Manager) Bind(_ context.Context, id, ownerKeyID, workerID string) (Session, error) {
+	now := m.now()
+	s, err := m.ownedActive(id, ownerKeyID, now)
+	if err != nil {
+		return Session{}, err
+	}
+	s.BoundWorkerID = workerID
+	s.LastActiveAt = now
+	if err := m.sessions.Put(s); err != nil {
+		return Session{}, err
+	}
+	m.log.Debug("session bound", "session", s.ID, "key_id", ownerKeyID, "worker", workerID)
+	return s.clone(), nil
+}
+
 // AppendTurn appends a chat turn to the owner's session history and touches the
 // session's LastActiveAt (a turn is activity, so it keeps the session alive).
 // Returns ErrSessionNotFound if missing, not owned, or expired. The history

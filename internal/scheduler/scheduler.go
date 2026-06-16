@@ -82,6 +82,15 @@ const (
 	// weightActiveJobPenalty is the final tie-break: fewer active jobs scores
 	// higher. Small so it only separates workers that are otherwise equal.
 	weightActiveJobPenalty = 1
+
+	// weightBoundWorkerBonus is added to a session's affinity-bound worker when it
+	// is among the runnable candidates (#34). It is large enough to outrank every
+	// capacity term — so a warm bound worker reliably wins over a fresher peer —
+	// yet strictly BELOW weightModelLoaded, so a different worker that already has
+	// the model loaded still dominates a bound worker that does not. It only ranks
+	// among already-runnable candidates and can never make a draining/stale or
+	// VRAM-unfit worker selectable: affinity is a strong preference, not a pin.
+	weightBoundWorkerBonus = 100_000_000
 )
 
 // runnable reports whether w can be considered for the given model: it must be
@@ -131,7 +140,26 @@ func Score(w types.Worker, model string) int64 {
 // Pick is pure and deterministic: it copies and sorts candidate IDs rather than
 // relying on the input slice order or any map iteration, so identical fleets
 // always yield the same choice.
+//
+// Pick applies no session affinity; it is PickPreferring with no preferred
+// worker. The existing keyless/internal callers use it unchanged.
 func Pick(workers []types.Worker, model string) (workerID string, ok bool) {
+	return PickPreferring(workers, model, "")
+}
+
+// PickPreferring is Pick with session affinity (#34): preferredWorkerID names
+// the worker a conversation is bound to (its warm KV cache). When that worker is
+// among the runnable candidates, it receives weightBoundWorkerBonus so it wins
+// over fresher peers — but the bonus sits strictly below the model-loaded weight,
+// so a different worker that already has the model loaded still wins, and the
+// bonus never lets a non-runnable (draining/stale/VRAM-unfit) worker be chosen.
+// Net: a warm bound worker is reused; a gone/draining/stale bound worker simply
+// is not a candidate, so the best-fit fresh worker is picked instead (rebind).
+//
+// An empty preferredWorkerID (or one not in the candidate set) makes PickPreferring
+// behave exactly like Pick, so the no-affinity path is byte-identical. It remains
+// pure and deterministic.
+func PickPreferring(workers []types.Worker, model, preferredWorkerID string) (workerID string, ok bool) {
 	// Index runnable candidates by ID so the decision does not depend on the
 	// input slice's order. Sorting the IDs gives the deterministic tie-break.
 	byID := make(map[string]types.Worker, len(workers))
@@ -148,10 +176,22 @@ func Pick(workers []types.Worker, model string) (workerID string, ok bool) {
 	}
 	sort.Strings(ids)
 
+	// scoreFor applies the affinity bonus only when id is the preferred worker AND
+	// that worker is in the runnable candidate set (it is, by construction of byID).
+	// A non-runnable preferred worker never reaches here, so the bonus can never
+	// override the runnability filter.
+	scoreFor := func(id string) int64 {
+		s := Score(byID[id], model)
+		if preferredWorkerID != "" && id == preferredWorkerID {
+			s += weightBoundWorkerBonus
+		}
+		return s
+	}
+
 	bestID := ids[0]
-	bestScore := Score(byID[bestID], model)
+	bestScore := scoreFor(bestID)
 	for _, id := range ids[1:] {
-		if s := Score(byID[id], model); s > bestScore {
+		if s := scoreFor(id); s > bestScore {
 			bestScore = s
 			bestID = id
 		}

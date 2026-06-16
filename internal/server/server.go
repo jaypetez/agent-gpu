@@ -25,6 +25,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/scheduler"
+	"github.com/jaypetez/agent-gpu/internal/session"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
@@ -326,6 +327,19 @@ type Server struct {
 	authz *authz.Authorizer
 	quota *quota.Engine
 
+	// sessionMgr enables session-affinity routing (#34) when set. nil by default,
+	// so affinity is disabled and dispatch behaves exactly as before — every
+	// existing scheduler/dispatch/quota/authz path is unchanged. Wired by #36.
+	sessionMgr *session.Manager
+
+	// affinityMu guards the affinity hit/miss counters below. A hit is counted
+	// when a turn routes to the worker its session was already bound to; a miss
+	// when the session had a binding but a different worker was chosen (a rebind).
+	// No counting happens when there is no session or no prior binding.
+	affinityMu     sync.Mutex
+	affinityHits   uint64
+	affinityMisses uint64
+
 	// now is the injectable clock used for heartbeat stamping and eviction
 	// (defaults to time.Now). Tests fast-forward it instead of sleeping.
 	now func() time.Time
@@ -420,6 +434,19 @@ func WithQuota(q *quota.Engine) Option {
 	return func(s *Server) {
 		if q != nil {
 			s.quota = q
+		}
+	}
+}
+
+// WithSessionManager enables session-affinity routing (#34): when a dispatched
+// job carries a SessionID, the dispatcher prefers the worker the session is
+// bound to (warm KV cache) and records/updates the binding after dispatch. A nil
+// manager (the default) disables affinity entirely, leaving dispatch byte-
+// identical to the no-session behavior. The cmd layer (#36) wires the manager.
+func WithSessionManager(m *session.Manager) Option {
+	return func(s *Server) {
+		if m != nil {
+			s.sessionMgr = m
 		}
 	}
 }
@@ -862,8 +889,11 @@ func (s *Server) removeWorker(w *worker) {
 // with available() under the registry lock to close the obvious cases; a job
 // dispatched into a worker that drops immediately after still fails cleanly via
 // the worker's failAllPending.
-func (s *Server) pickWorker(model string) (*worker, bool) {
-	id, ok := scheduler.Pick(s.Fleet(), model)
+//
+// preferredWorkerID, when non-empty, names the session's affinity-bound worker;
+// the scheduler gives it a weighted bonus among the runnable candidates (#34).
+func (s *Server) pickWorker(model, preferredWorkerID string) (*worker, bool) {
+	id, ok := scheduler.PickPreferring(s.Fleet(), model, preferredWorkerID)
 	if !ok {
 		return nil, false
 	}
@@ -875,6 +905,69 @@ func (s *Server) pickWorker(model string) (*worker, bool) {
 	}
 	s.mu.RUnlock()
 	return w, ok
+}
+
+// affinityFor resolves the worker a job's session is bound to, for affinity
+// routing (#34). It returns "" — meaning "no preference" — unless a session
+// manager is configured AND the job carries a SessionID AND the (owner-checked)
+// session has a non-empty BoundWorkerID. A missing/not-owned/expired session is
+// treated as "no preference" (the lookup error is non-fatal: affinity is only a
+// hint). keyID is the owning API key, required to look the session up.
+func (s *Server) affinityFor(ctx context.Context, job types.Job, keyID string) string {
+	if s.sessionMgr == nil || job.SessionID == "" || keyID == "" {
+		return ""
+	}
+	sess, err := s.sessionMgr.Get(ctx, job.SessionID, keyID)
+	if err != nil {
+		s.log.Debug("affinity: session lookup failed",
+			"session", job.SessionID, "key_id", keyID, "err", err)
+		return ""
+	}
+	return sess.BoundWorkerID
+}
+
+// recordAffinity updates the session→worker binding after a successful dispatch
+// and counts the affinity hit/miss (#34). preferred is the worker the session
+// was bound to before this turn (from affinityFor); chosen is the worker the
+// scheduler actually selected. It is a no-op when there is no session.
+//
+//   - First-turn binding: preferred == "" → bind the session to chosen (no hit/miss
+//     counted; there was no prior affinity to honor or break).
+//   - Hit: chosen == preferred → the warm worker was reused; count a hit only.
+//   - Miss (rebind): chosen != preferred (preferred non-empty) → the bound worker
+//     was gone/draining/stale/unfit, so a fresh worker was picked; re-bind the
+//     session to chosen and count a miss.
+//
+// Bind failures are logged and swallowed: a bookkeeping error must never fail an
+// inference turn that already succeeded.
+func (s *Server) recordAffinity(ctx context.Context, job types.Job, keyID, chosen, preferred string) {
+	if s.sessionMgr == nil || job.SessionID == "" || keyID == "" {
+		return
+	}
+	switch {
+	case preferred == "":
+		// First turn for this session: record the binding.
+		if _, err := s.sessionMgr.Bind(ctx, job.SessionID, keyID, chosen); err != nil {
+			s.log.Debug("affinity: first-turn bind failed",
+				"session", job.SessionID, "key_id", keyID, "worker", chosen, "err", err)
+		}
+	case chosen == preferred:
+		// Routed back to the bound worker: affinity hit, binding already current.
+		s.affinityMu.Lock()
+		s.affinityHits++
+		s.affinityMu.Unlock()
+	default:
+		// Bound worker was not chosen (rebind): affinity miss, update the binding.
+		s.affinityMu.Lock()
+		s.affinityMisses++
+		s.affinityMu.Unlock()
+		s.log.Debug("affinity: rebinding session",
+			"session", job.SessionID, "key_id", keyID, "old_worker", preferred, "new_worker", chosen)
+		if _, err := s.sessionMgr.Bind(ctx, job.SessionID, keyID, chosen); err != nil {
+			s.log.Debug("affinity: rebind failed",
+				"session", job.SessionID, "key_id", keyID, "worker", chosen, "err", err)
+		}
+	}
 }
 
 // dispatchTo hands job to worker w and blocks until the worker returns a result,
@@ -958,7 +1051,10 @@ func (s *Server) placeItem(ctx context.Context, item queue.Item) {
 	defer ticker.Stop()
 
 	for {
-		if w, ok := s.pickWorker(item.Job.Model); ok {
+		// Resolve affinity each attempt: the session's bound worker may appear,
+		// drain, or go stale while the job is queued, so re-read it per placement try.
+		preferred := s.affinityFor(ctx, item.Job, item.Key)
+		if w, ok := s.pickWorker(item.Job.Model, preferred); ok {
 			s.log.Info("placing queued job", "key_id", item.Key, "model", item.Job.Model,
 				"priority", int(item.Priority), "worker", w.id)
 			// Dispatch and forward the result to the original caller's waiter. A
@@ -968,6 +1064,9 @@ func (s *Server) placeItem(ctx context.Context, item queue.Item) {
 			res, err := s.dispatchTo(ctx, w, item.Job)
 			if err != nil {
 				res = types.JobResult{JobID: item.Job.ID, Err: jobErr(err)}
+			} else {
+				// Record/update the session binding only after a successful turn.
+				s.recordAffinity(ctx, item.Job, item.Key, w.id, preferred)
 			}
 			s.resolveWaiter(res)
 			return
@@ -1000,6 +1099,24 @@ func jobErr(err error) *types.JobError {
 // per-priority breakdown). It delegates to the queue and is the metrics seam for
 // #24 (Prometheus) until that lands.
 func (s *Server) QueueStats() queue.Stats { return s.queue.Stats() }
+
+// AffinityStats is an observable snapshot of session-affinity routing (#34):
+// Hits counts turns that routed back to the worker their session was already
+// bound to (warm KV cache reused); Misses counts turns that rebound to a
+// different worker because the bound one was gone/draining/stale/unfit. Neither
+// counts a session's first turn (no prior binding) nor any non-session job.
+type AffinityStats struct {
+	Hits   uint64
+	Misses uint64
+}
+
+// AffinityStats returns a point-in-time snapshot of the affinity hit/miss
+// counters. It mirrors QueueStats as the metrics seam for #24 (Prometheus).
+func (s *Server) AffinityStats() AffinityStats {
+	s.affinityMu.Lock()
+	defer s.affinityMu.Unlock()
+	return AffinityStats{Hits: s.affinityHits, Misses: s.affinityMisses}
+}
 
 // Fleet returns a point-in-time snapshot of every connected worker, including
 // its reported capacity and computed status (online/draining/stale). It is the
@@ -1124,12 +1241,19 @@ func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey
 	if err := s.quota.CheckAndReserve(ctx, key); err != nil {
 		return nil, err
 	}
-	w, ok := s.pickWorker(job.Model)
+	// Resolve session affinity (#34): prefer the worker this conversation is bound
+	// to. Empty when there is no session/manager.
+	preferred := s.affinityFor(ctx, job, key.ID)
+	w, ok := s.pickWorker(job.Model, preferred)
 	if !ok {
 		// No live worker for the model: there is nothing to attach a stream to.
 		// Surface backpressure the same way the queue would, mapped to 503.
 		return nil, queue.ErrQueueFull
 	}
+	// Record/update the binding now that a worker is committed for this turn. The
+	// stream still flows the same chunks; affinity is bookkeeping only and a Bind
+	// error never blocks the stream.
+	s.recordAffinity(ctx, job, key.ID, w.id, preferred)
 
 	// Register the observer BEFORE dispatching so no chunk can be produced and
 	// folded by accumulate before the observer is listening.
@@ -1239,9 +1363,18 @@ func (s *Server) submit(ctx context.Context, job types.Job, keyID string, prio q
 		return types.JobResult{}, err
 	}
 
+	// Resolve session affinity (#34): prefer the worker this conversation is bound
+	// to. Empty when there is no session/manager, leaving placement unchanged.
+	preferred := s.affinityFor(ctx, job, keyID)
+
 	// Fast path: a worker fits right now. Dispatch synchronously.
-	if w, ok := s.pickWorker(job.Model); ok {
-		return s.dispatchTo(ctx, w, job)
+	if w, ok := s.pickWorker(job.Model, preferred); ok {
+		res, err := s.dispatchTo(ctx, w, job)
+		if err == nil {
+			// Record/update the binding only after a successful turn.
+			s.recordAffinity(ctx, job, keyID, w.id, preferred)
+		}
+		return res, err
 	}
 
 	// No worker fits: queue the job and block on a waiter the placement loop will
