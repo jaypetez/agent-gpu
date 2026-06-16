@@ -47,7 +47,13 @@ Every change should ship with tests:
 - **Integration tests** for cross-component flows (registration, routing, quota/permission
   enforcement).
 
-Run the suite locally before opening a PR. Coverage is reported in CI.
+Run the suite locally before opening a PR (`go test -race ./...`, as CI does). Coverage is reported
+in CI.
+
+See [docs/testing.md](docs/testing.md) for the integration-test layout and the rules that keep the
+suite deterministic — poll with `waitFor` instead of `time.Sleep`, inject a clock and fast-forward
+instead of sleeping through real windows, keep real timeouts short, guard cross-goroutine state with
+a mutex, and run `-race`.
 
 ## Commit & PR conventions
 
