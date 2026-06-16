@@ -96,6 +96,17 @@ func WithMaxDepth(n int) Option {
 	}
 }
 
+// WithClock overrides the time source used to stamp Item.EnqueuedAt (for tests
+// and so the server can stamp enqueue times against the same injected clock it
+// uses to measure time-in-queue). A nil clock is ignored. Defaults to time.Now.
+func WithClock(now func() time.Time) Option {
+	return func(q *Queue) {
+		if now != nil {
+			q.now = now
+		}
+	}
+}
+
 // Queue is a concurrency-safe, priority-ordered, FIFO-within-priority job queue.
 // All state is guarded by a single mutex; a paired condition variable wakes
 // callers blocked in DequeueWait. The zero value is not usable; construct with
@@ -107,11 +118,15 @@ type Queue struct {
 	seq      uint64 // monotonic sequence assigned at enqueue, gives FIFO-within-level
 	maxDepth int    // 0 == unbounded
 	closed   bool
+	// now stamps Item.EnqueuedAt; injectable so the server can measure
+	// time-in-queue against the same clock it advances in tests. Defaults to
+	// time.Now.
+	now func() time.Time
 }
 
 // New constructs an empty Queue with the supplied options.
 func New(opts ...Option) *Queue {
-	q := &Queue{}
+	q := &Queue{now: time.Now}
 	q.cond = sync.NewCond(&q.mu)
 	for _, opt := range opts {
 		opt(q)
@@ -139,7 +154,7 @@ func (q *Queue) Enqueue(job types.Job, key string, p Priority) error {
 		Key:        key,
 		Priority:   p,
 		Seq:        q.seq,
-		EnqueuedAt: time.Now(),
+		EnqueuedAt: q.now(),
 	}
 	q.seq++
 	heap.Push(&q.items, it)

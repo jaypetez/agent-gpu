@@ -242,6 +242,7 @@ handler.
 | `GET /v1/admin/keys/{id}/quota` | Usage snapshot vs effective limits + reset windows |
 | `GET /v1/admin/workers` | Fleet snapshot |
 | `POST /v1/admin/workers/{id}/drain` | Drain a worker → `204` |
+| `GET /v1/admin/stats` | Consolidated monitoring: queue depth + per-worker load + time-in-queue distribution (see [Queue depth / monitoring](#queue-depth--monitoring)) |
 
 `PUT .../permissions` is a full replace (not a merge): an omitted/null list clears that dimension.
 `PUT .../quota` is per-dimension: an omitted field defaults to `0` ("unlimited" for that dimension),
@@ -276,6 +277,33 @@ view — the stored `SecretHash`/`Salt` are **never** serialized or logged. The 
 returned exactly once, only on create and rotate; it cannot be recovered afterward.
 
 The formal OpenAPI 3.1 spec for these endpoints lands in #14.
+
+### Queue depth / monitoring
+
+`GET /v1/admin/stats` (#10) is the operator-facing monitoring view: one consolidated JSON document
+combining three live snapshots, read on every request (no caching) so the numbers track the fleet in
+near-real-time. It is admin-gated like every other admin route (non-admin `403`, unauthenticated
+`401`) and exposes no secrets. The same accessors are the instrumentation seam the Prometheus
+`/metrics` endpoint (#24) will scrape.
+
+- **Queue depth** — `Server.QueueStats()` returns `queue.Stats{Total, ByPriority}`: the global pending
+  count and a per-priority breakdown. A growing backlog (jobs submitted while no worker can run them)
+  is reflected immediately as `Total` rises; the breakdown attributes each queued job to its lane
+  (`high`/`normal`/`low`). In the response: `queue.total` and `queue.by_priority`.
+- **Per-worker load** — `Server.Fleet()` returns the live worker snapshots; the stats view projects
+  each to `{id, active_jobs, load, status}` (the fuller VRAM/model detail stays on `GET
+  /v1/admin/workers`). In the response: `workers[]`.
+- **Time-in-queue distribution** — `Server.WaitTimeStats()` returns `WaitTimeStats{Count, SumMs, MaxMs,
+  Buckets}`, a mutex-guarded counter recorded in the placement loop. When a job that **queued** is
+  dispatched, the server records `now − EnqueuedAt` (both on the same injected clock): it bumps the
+  count, adds the wait to the running sum, raises the max, and increments every cumulative `le`-bucket
+  whose bound (`{10, 100, 1000, 10000}` ms) is `≥` the wait, plus a trailing `+Inf` bucket (`le_ms ==
+  0`). Jobs dispatched on the synchronous fast path **never queued**, so their near-zero wait is
+  deliberately **excluded** from the distribution. In the response: `wait_time.{count, sum_ms, max_ms,
+  mean_ms, buckets[]}`, where `mean_ms = sum_ms / count` (`0` when `count == 0`).
+
+Prometheus export (a registry and a `/metrics` endpoint scraping these accessors) is **out of scope**
+here and deferred to #24; #10 provides the instrumentation and the JSON view over it.
 
 ## Capacity-aware scheduling
 

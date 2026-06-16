@@ -12,6 +12,7 @@ import (
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
@@ -81,6 +82,7 @@ func allAdminRoutes() []adminRoute {
 		{http.MethodGet, "/v1/admin/keys/abc/quota", ""},
 		{http.MethodGet, "/v1/admin/workers", ""},
 		{http.MethodPost, "/v1/admin/workers/abc/drain", ""},
+		{http.MethodGet, "/v1/admin/stats", ""},
 	}
 }
 
@@ -363,6 +365,149 @@ func TestAdminWorkers(t *testing.T) {
 	}
 	if code := errorCode(t, rec); code != "not_found" {
 		t.Errorf("error code = %q, want not_found", code)
+	}
+}
+
+// TestAdminStats proves AC1/AC4 for the consolidated monitoring endpoint (#10):
+// GET /v1/admin/stats returns the documented shape — queue depth (total +
+// per-priority), per-worker load, and the time-in-queue distribution
+// (count/sum/max/mean + cumulative buckets) — built live from QueueStats(),
+// Fleet(), and WaitTimeStats(). Admin gating (non-admin 403, unauth 401) is
+// proven for this route by the table-driven authz tests above.
+func TestAdminStats(t *testing.T) {
+	fleet := &fakeFleet{
+		snapshot: []types.Worker{
+			{ID: "w1", Status: types.WorkerOnline, ActiveJobs: 2, Load: 50},
+			{ID: "w2", Status: types.WorkerDraining, ActiveJobs: 0, Load: 10},
+		},
+		queueStats: queue.Stats{
+			Total:      3,
+			ByPriority: map[queue.Priority]int{queue.PriorityHigh: 1, queue.PriorityNormal: 2},
+		},
+		waitStats: server.WaitTimeStats{
+			Count: 2,
+			SumMs: 150,
+			MaxMs: 120,
+			Buckets: []server.WaitBucket{
+				{LeMs: 10, Count: 0},
+				{LeMs: 100, Count: 1},
+				{LeMs: 1000, Count: 2},
+				{LeMs: 10000, Count: 2},
+				{LeMs: 0, Count: 2}, // +Inf
+			},
+		},
+	}
+	s, authSvc := adminTestServer(t, fleet)
+	adminToken := mustKey(t, authSvc, adminPerms())
+
+	rec := req(t, s, http.MethodGet, "/v1/admin/stats", adminToken, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stats status = %d, want 200", rec.Code)
+	}
+
+	var out struct {
+		Queue struct {
+			Total      int            `json:"total"`
+			ByPriority map[string]int `json:"by_priority"`
+		} `json:"queue"`
+		Workers []struct {
+			ID         string `json:"id"`
+			ActiveJobs uint32 `json:"active_jobs"`
+			Load       uint32 `json:"load"`
+			Status     string `json:"status"`
+		} `json:"workers"`
+		WaitTime struct {
+			Count   uint64 `json:"count"`
+			SumMs   uint64 `json:"sum_ms"`
+			MaxMs   uint64 `json:"max_ms"`
+			MeanMs  uint64 `json:"mean_ms"`
+			Buckets []struct {
+				LeMs  uint64 `json:"le_ms"`
+				Count uint64 `json:"count"`
+			} `json:"buckets"`
+		} `json:"wait_time"`
+	}
+	decode(t, rec, &out)
+
+	// Queue depth: total plus the per-priority breakdown keyed by name.
+	if out.Queue.Total != 3 {
+		t.Errorf("queue total = %d, want 3", out.Queue.Total)
+	}
+	if out.Queue.ByPriority["high"] != 1 || out.Queue.ByPriority["normal"] != 2 {
+		t.Errorf("by_priority = %v, want high:1 normal:2", out.Queue.ByPriority)
+	}
+
+	// Per-worker load projection (id/active_jobs/load/status), order-preserving.
+	if len(out.Workers) != 2 {
+		t.Fatalf("workers len = %d, want 2", len(out.Workers))
+	}
+	if out.Workers[0].ID != "w1" || out.Workers[0].ActiveJobs != 2 ||
+		out.Workers[0].Load != 50 || out.Workers[0].Status != "online" {
+		t.Errorf("worker[0] = %+v, want w1 active=2 load=50 online", out.Workers[0])
+	}
+	if out.Workers[1].ID != "w2" || out.Workers[1].Status != "draining" {
+		t.Errorf("worker[1] = %+v, want w2 draining", out.Workers[1])
+	}
+
+	// Wait-time: summary + computed mean + cumulative buckets (incl. +Inf).
+	if out.WaitTime.Count != 2 || out.WaitTime.SumMs != 150 || out.WaitTime.MaxMs != 120 {
+		t.Errorf("wait_time summary = %+v, want count=2 sum=150 max=120", out.WaitTime)
+	}
+	if out.WaitTime.MeanMs != 75 { // 150 / 2
+		t.Errorf("wait_time mean = %d, want 75", out.WaitTime.MeanMs)
+	}
+	if len(out.WaitTime.Buckets) != 5 {
+		t.Fatalf("buckets len = %d, want 5 (4 bounds + Inf)", len(out.WaitTime.Buckets))
+	}
+	last := out.WaitTime.Buckets[len(out.WaitTime.Buckets)-1]
+	if last.LeMs != 0 || last.Count != 2 {
+		t.Errorf("+Inf bucket = %+v, want le_ms=0 count=2", last)
+	}
+}
+
+// TestAdminStatsEmpty proves the endpoint is well-formed against a fresh server:
+// an empty queue, no workers, and no recorded waits yield zeroed sections with a
+// zero mean (no divide-by-zero) and a non-null buckets array.
+func TestAdminStatsEmpty(t *testing.T) {
+	// A real server.New() exercises the genuine WaitTimeStats()/QueueStats()
+	// zero state (the +Inf bucket present, mean guarded at Count==0).
+	grpcSrv := server.New()
+	defer func() { _ = grpcSrv.Close() }()
+	st := store.NewMemory()
+	authSvc := auth.NewService(st)
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := &Server{
+		fleet: grpcSrv,
+		auth:  authSvc,
+		authz: authz.NewAuthorizer(authz.WithLogger(discard)),
+		quota: quota.NewEngine(quota.NewMemoryCounterStore()),
+		log:   discard,
+	}
+	adminToken := mustKey(t, authSvc, adminPerms())
+
+	rec := req(t, s, http.MethodGet, "/v1/admin/stats", adminToken, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stats status = %d, want 200", rec.Code)
+	}
+	var out struct {
+		Queue struct {
+			Total int `json:"total"`
+		} `json:"queue"`
+		Workers  []any `json:"workers"`
+		WaitTime struct {
+			Count   uint64 `json:"count"`
+			MeanMs  uint64 `json:"mean_ms"`
+			Buckets []struct {
+				LeMs uint64 `json:"le_ms"`
+			} `json:"buckets"`
+		} `json:"wait_time"`
+	}
+	decode(t, rec, &out)
+	if out.Queue.Total != 0 || out.WaitTime.Count != 0 || out.WaitTime.MeanMs != 0 {
+		t.Errorf("empty stats not zeroed: %+v", out)
+	}
+	if len(out.WaitTime.Buckets) != 5 {
+		t.Errorf("buckets len = %d, want 5 even when empty", len(out.WaitTime.Buckets))
 	}
 }
 

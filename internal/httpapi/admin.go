@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
+	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
@@ -126,6 +127,113 @@ type adminWorkerView struct {
 	Load       uint32   `json:"load"`
 	GPUType    string   `json:"gpu_type"`
 	LastSeen   int64    `json:"last_seen"`
+}
+
+// adminStatsResponse is the GET /v1/admin/stats response (#10): a consolidated,
+// operator-facing snapshot of queue depth, per-worker load, and the time-in-queue
+// distribution. It is a live read (no caching) and contains no secrets. The
+// Prometheus /metrics surface is deferred to #24; this endpoint is the
+// human/JSON view over the same accessors.
+type adminStatsResponse struct {
+	Queue    adminQueueStats   `json:"queue"`
+	Workers  []adminStatWorker `json:"workers"`
+	WaitTime adminWaitTime     `json:"wait_time"`
+}
+
+// adminQueueStats is the queue-depth section: the total pending plus a
+// per-priority breakdown keyed by priority name (only non-empty levels appear,
+// mirroring queue.Stats.ByPriority).
+type adminQueueStats struct {
+	Total      int            `json:"total"`
+	ByPriority map[string]int `json:"by_priority"`
+}
+
+// adminStatWorker is the per-worker load projection in the stats response: id,
+// in-flight jobs, reported load, and status. It deliberately omits VRAM/model
+// detail (available via GET /v1/admin/workers) to keep the operator dashboard
+// focused on load.
+type adminStatWorker struct {
+	ID         string `json:"id"`
+	ActiveJobs uint32 `json:"active_jobs"`
+	Load       uint32 `json:"load"`
+	Status     string `json:"status"`
+}
+
+// adminWaitTime is the time-in-queue section: count/sum/max/mean (ms) over jobs
+// that were placed from the queue (the fast path is excluded), plus the
+// cumulative le-bucketed histogram (trailing bucket is +Inf, le_ms == 0).
+type adminWaitTime struct {
+	Count   uint64            `json:"count"`
+	SumMs   uint64            `json:"sum_ms"`
+	MaxMs   uint64            `json:"max_ms"`
+	MeanMs  uint64            `json:"mean_ms"`
+	Buckets []adminWaitBucket `json:"buckets"`
+}
+
+// adminWaitBucket is one cumulative histogram bucket: the count of waits <= le_ms
+// (le_ms == 0 is the +Inf bucket).
+type adminWaitBucket struct {
+	LeMs  uint64 `json:"le_ms"`
+	Count uint64 `json:"count"`
+}
+
+// priorityName maps a queue.Priority to a stable JSON key for the by_priority
+// breakdown. Unknown levels fall back to "normal" so a future priority never
+// produces an unkeyed entry.
+func priorityName(p queue.Priority) string {
+	switch p {
+	case queue.PriorityLow:
+		return "low"
+	case queue.PriorityHigh:
+		return "high"
+	default:
+		return "normal"
+	}
+}
+
+// handleAdminStats serves GET /v1/admin/stats. It reads queue depth, the fleet
+// snapshot, and the time-in-queue distribution live (no caching) and returns
+// them as one consolidated JSON document. Gated to admin keys (s.admin), so a
+// non-admin gets 403 and an unauthenticated request 401 before this runs.
+func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
+	qs := s.fleet.QueueStats()
+	byPriority := make(map[string]int, len(qs.ByPriority))
+	for p, n := range qs.ByPriority {
+		byPriority[priorityName(p)] += n
+	}
+
+	fleet := s.fleet.Fleet()
+	workers := make([]adminStatWorker, len(fleet))
+	for i, wk := range fleet {
+		workers[i] = adminStatWorker{
+			ID:         wk.ID,
+			ActiveJobs: wk.ActiveJobs,
+			Load:       wk.Load,
+			Status:     wk.Status.String(),
+		}
+	}
+
+	wt := s.fleet.WaitTimeStats()
+	var meanMs uint64
+	if wt.Count > 0 {
+		meanMs = wt.SumMs / wt.Count
+	}
+	buckets := make([]adminWaitBucket, len(wt.Buckets))
+	for i, b := range wt.Buckets {
+		buckets[i] = adminWaitBucket{LeMs: b.LeMs, Count: b.Count}
+	}
+
+	writeJSON(w, http.StatusOK, adminStatsResponse{
+		Queue:   adminQueueStats{Total: qs.Total, ByPriority: byPriority},
+		Workers: workers,
+		WaitTime: adminWaitTime{
+			Count:   wt.Count,
+			SumMs:   wt.SumMs,
+			MaxMs:   wt.MaxMs,
+			MeanMs:  meanMs,
+			Buckets: buckets,
+		},
+	})
 }
 
 // adminQuotaUsageResponse is the GET /v1/admin/keys/{id}/quota response: the
