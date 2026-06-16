@@ -375,8 +375,10 @@ events are logged via structured `slog` (`key_id`, `model`, `priority`, `reason`
 
 - **Anti-starvation / aging.** Strict priority can starve low-priority jobs under sustained
   contention; aging a job's effective priority by its queue wait time is the planned mitigation.
-- **Real VRAM-fit.** Replace the `FreeVRAM > 0` approximation with a comparison against each model's
-  actual VRAM footprint once model-size detection (#16) lands.
+- **Real VRAM-fit.** Workers now report real free VRAM via GPU detection (see *GPU detection* below),
+  but the scheduler still uses the `FreeVRAM > 0` approximation rather than comparing against each
+  model's actual VRAM footprint. Per-model VRAM-fit is future work; a CPU-only worker (free VRAM `0`)
+  is therefore not chosen for a *not-yet-loaded* model, only for one it already has resident.
 - **Metrics export.** Queue depth and per-worker load become Prometheus metrics in #24; today they
   are plain methods (`QueueStats`) and structured logs.
 
@@ -421,8 +423,10 @@ lifecycle the server tracks in its in-memory fleet view (`Server.Fleet()`):
    configurable via `--heartbeat-interval` / `AGENTGPU_HEARTBEAT_INTERVAL`). Each heartbeat reports
    liveness plus capacity signals: GPU type, total/free VRAM, a coarse load value (0–100), the
    current active-job count, and the models the worker has available. The server folds these into
-   the worker's fleet entry and stamps its last-seen time. (Real GPU detection arrives with a later
-   epic; until then capacity fields are configured/stub values.)
+   the worker's fleet entry and stamps its last-seen time. The capacity signals come from real GPU
+   detection (see *GPU detection* below): the immutable identity (type + total VRAM) is captured once
+   at startup, while free VRAM and load — the scheduler-relevant signals — are refreshed before every
+   heartbeat. A GPU-less host reports `cpu` with zero VRAM.
 3. **Stale eviction.** A background loop on the server marks a worker **stale** and evicts it once it
    has gone longer than the `heartbeat timeout` without a heartbeat (default **45s** — three missed
    intervals — configurable via `--heartbeat-timeout` / `AGENTGPU_HEARTBEAT_TIMEOUT`). Eviction
@@ -515,6 +519,43 @@ invalid_request     Ollama rejected the request as malformed (400)
 Long inference is bounded by the **caller's context**, not a short global HTTP timeout, so a slow
 generation is not spuriously killed; cancelling the context aborts the in-flight HTTP request and
 stops emitting.
+
+## GPU detection
+
+Each worker detects its local accelerators (`internal/gpu`) and folds their capacity — type, total
+and free VRAM (always in **bytes**), and a coarse 0–100 load — into its heartbeats, so the server's
+capacity-aware scheduler routes on real hardware rather than configured guesses. The scheduler
+consumes free VRAM and load; total VRAM and the type string are observability signals in the fleet
+view.
+
+- **cgo-free, single-binary.** Rather than linking NVML/CUDA/ROCm/Metal native libraries (which would
+  require cgo and break the one-line cross-compile, see *Language & runtime: Go*), detection shells
+  out to the vendors' own command-line tools via `os/exec` and parses their output. `os/exec` is pure
+  Go, so `GOOS`/`GOARCH` cross-builds stay trivial and the binary stays static. Probes are gated by
+  `runtime.GOOS` — no build-tag-fragmented files.
+- **Per-vendor probes.** NVIDIA via `nvidia-smi --query-gpu=name,memory.total,memory.free,utilization.gpu
+  --format=csv,noheader,nounits` (memory is MiB → converted to bytes); AMD via `amd-smi` when present,
+  else `rocm-smi --showproductname --showmeminfo vram --showuse --json` (VRAM already in bytes, JSON
+  keyed by `card0`/`card1` and parsed defensively across ROCm versions); Apple via
+  `system_profiler SPDisplaysDataType -json` for the chipset name and any discrete VRAM. Apple Silicon
+  has no discrete VRAM (unified memory), so total/free are read from `sysctl -n hw.memsize` to keep the
+  Mac schedulable.
+- **First vendor wins; multi-GPU aggregates.** Probes run in priority order (NVIDIA, then AMD on Linux;
+  Apple on macOS) and the first that reports ≥1 device is used. Multiple devices are aggregated into
+  one capacity: total and free VRAM are summed, load is the mean, and the type string reflects the
+  fleet (e.g. `2x NVIDIA GeForce RTX 4090`).
+- **CPU fallback, never fatal.** A host with no GPU, a missing vendor tool, a timeout, or malformed
+  output degrades cleanly to the CPU profile (`cpu`, zero VRAM, zero load) — detection never errors or
+  panics out the caller, mirroring the backend probe's degrade-don't-crash behavior. Each subprocess
+  is bounded by a short `exec.CommandContext` timeout so a hung tool cannot wedge startup or a
+  heartbeat. The whole external-command surface is behind an injectable `Runner` seam, so detection is
+  unit-tested with captured fixture output and no real GPU.
+- **Static once, dynamic per heartbeat.** The immutable identity (type + total VRAM) is captured once
+  at startup; free VRAM and load are refreshed before each heartbeat. A refresh failure keeps the
+  last-known value rather than blanking the entry. Auto-detection is on by default and can be disabled
+  with `--gpu-detect=false` / `AGENTGPU_GPU_DETECT`; manual `--gpu-type` / `--total-vram`
+  (`AGENTGPU_GPU_TYPE` / `AGENTGPU_TOTAL_VRAM`) describe capacity on hosts where the vendor CLI is not
+  on `PATH`.
 
 ## Permissions
 
