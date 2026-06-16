@@ -1,0 +1,15 @@
+# Redocly CLI configuration for the agent-gpu OpenAPI spec.
+#
+# `redocly lint` validates openapi.yaml against the OpenAPI 3.1 specification and
+# the `recommended` ruleset (descriptions, operationIds, tags, 4xx responses, …);
+# `redocly build-docs` renders it to static HTML via Redoc. Both run in CI
+# (.github/workflows/ci.yml, job `openapi`) and locally via `make openapi-lint`.
+#
+# The ruleset is pinned here (rather than passed on the command line) so the local
+# Makefile target, the CI job, and any editor integration all lint identically.
+extends:
+  - recommended
+
+apis:
+  main:
+    root: openapi.yaml

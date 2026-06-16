@@ -1,0 +1,1606 @@
+openapi: 3.1.0
+info:
+  title: agent-gpu API
+  version: 0.1.0
+  summary: OpenAI-compatible distributed inference API for Ollama.
+  description: |
+    agent-gpu is a distributed inference layer for [Ollama](https://ollama.com): a central server
+    owns this public, OpenAI-compatible HTTP API — authentication, quotas, permissions, and
+    scheduling — while workers run Ollama and execute dispatched jobs.
+
+    This document is the formal contract for the public HTTP surface served by `internal/httpapi`.
+    The server-to-worker control plane is gRPC and is intentionally **not** described here.
+
+    ## Authentication
+
+    Every endpoint requires an API key presented as an HTTP Bearer token
+    (`Authorization: Bearer agpu_<keyid>_<secret>`). See the `bearerAuth` security scheme. Admin
+    endpoints additionally require the key to hold the `admin` role; a non-admin key receives `403`.
+
+    ## Errors
+
+    Every error response uses one consistent envelope — see the `Error` schema — carrying a generic
+    human-readable `message` and a stable machine-readable `code`. Messages never leak secrets or
+    internal detail; clients branch on `code`.
+
+    ## Streaming
+
+    The two inference endpoints (`/v1/chat/completions`, `/v1/completions`) return either a single
+    JSON body or a Server-Sent Events (SSE) stream, selected by the request's `stream` field. When
+    streaming, each event is a `data: <json>\n\n` frame and the stream terminates with the literal
+    `data: [DONE]\n\n` sentinel.
+
+    ## Timestamps
+
+    All timestamp fields (`created`, `last_active`, `last_seen`, `last_used`, and the `*_resets_at`
+    fields) are Unix epoch **seconds** as integers, not RFC 3339 date-time strings.
+  license:
+    name: MIT
+    url: https://github.com/jaypetez/agent-gpu/blob/main/LICENSE
+  contact:
+    name: agent-gpu
+    url: https://github.com/jaypetez/agent-gpu
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Default local listen address (--http-listen / AGENTGPU_HTTP_LISTEN).
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Models
+    description: Model discovery. The catalog is permission-filtered per key — a model appears only if the key may run inference against it.
+  - name: Inference
+    description: OpenAI-compatible chat and text completions, non-streaming or SSE-streaming.
+  - name: Sessions
+    description: Owner-scoped server-side conversation sessions backing the stateful chat mode.
+  - name: Admin
+    description: Admin-only management of API keys, quotas, permissions, and workers. Requires the admin role.
+
+paths:
+  /v1/models:
+    get:
+      operationId: listModelsOpenAI
+      summary: List models (OpenAI-compatible)
+      description: |
+        Returns the per-key, deduplicated catalog of models currently served by online workers, in
+        the OpenAI-canonical `{"object":"list","data":[...]}` shape. The list is permission-filtered:
+        a model appears only if the key may run inference against it. `created` is always `0` (the
+        domain model carries no creation time; a stable value keeps responses cacheable).
+      tags:
+        - Models
+      responses:
+        "200":
+          description: The OpenAI-canonical model list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAIModelList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /models:
+    get:
+      operationId: listModels
+      summary: List models (richer internal shape)
+      description: |
+        Returns the per-key, deduplicated catalog in a richer internal shape: for each model the
+        digest plus the online workers currently serving it (count and ids). Same per-key permission
+        filter and deterministic ordering (by model name) as `GET /v1/models`.
+      tags:
+        - Models
+      responses:
+        "200":
+          description: The internal model catalog.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      summary: Create a chat completion
+      description: |
+        Creates a model response for the given chat conversation, with optional function/tool calling.
+
+        **Streaming.** When `stream` is `false` (default) the response is a single
+        `chat.completion` JSON object. When `stream` is `true` the response is an SSE stream
+        (`Content-Type: text/event-stream`): each frame is `data: <json>\n\n` carrying a
+        `chat.completion.chunk` object (the first frame's delta announces the assistant role,
+        subsequent frames carry content and/or tool-call deltas, the terminal chunk sets
+        `finish_reason`), and the stream ends with the literal `data: [DONE]\n\n` sentinel. An error
+        that occurs **before** the first byte is returned as a normal JSON error with the mapped
+        status; an error **after** streaming has begun is surfaced as a terminal chunk with
+        `finish_reason: "error"` followed by `[DONE]`.
+
+        **Sessions.** Two session-aware modes are supported (see the Sessions tag):
+        - *Affinity (stateless)*: send the full history in `messages` every turn plus the session id
+          in the `X-Session-Id` header; the server stores nothing and only routes the job to the
+          session's warm worker.
+        - *Stateful*: send only the new turn(s) plus the session id in the `session_id` body field;
+          the server reconstructs the full context from stored history and persists the new turn.
+
+        If both are supplied the body `session_id` wins (stateful). Unknown OpenAI parameters
+        (`temperature`, `top_p`, `max_tokens`, …) are accepted and ignored.
+      tags:
+        - Inference
+      parameters:
+        - $ref: "#/components/parameters/SessionIdHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+      responses:
+        "200":
+          description: |
+            A chat completion. The body is a single `ChatCompletionResponse` JSON object when
+            `stream` is false, or an SSE stream of `ChatCompletionChunk` frames terminated by
+            `data: [DONE]\n\n` when `stream` is true.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionResponse"
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionChunk"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /v1/completions:
+    post:
+      operationId: createCompletion
+      summary: Create a text completion
+      description: |
+        Creates a model response for the given text prompt (the legacy OpenAI completions surface).
+
+        **Streaming.** When `stream` is `false` (default) the response is a single `text_completion`
+        JSON object. When `stream` is `true` the response is an SSE stream of `text_completion`
+        frames, each `data: <json>\n\n`, terminated by the literal `data: [DONE]\n\n` sentinel. The
+        same before-first-byte vs mid-stream error handling as the chat endpoint applies.
+
+        Unknown OpenAI parameters (`max_tokens`, `temperature`, …) are accepted and ignored.
+      tags:
+        - Inference
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompletionRequest"
+      responses:
+        "200":
+          description: |
+            A text completion. The body is a single `CompletionResponse` JSON object when `stream`
+            is false, or an SSE stream of `CompletionChunk` frames terminated by `data: [DONE]\n\n`
+            when `stream` is true.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompletionResponse"
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/CompletionChunk"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /v1/sessions:
+    post:
+      operationId: createSession
+      summary: Create a session
+      description: |
+        Mints a new owner-scoped conversation session targeting the requested model and returns its
+        id. The session is owned by the authenticated key; only that key may read, append to, or
+        delete it.
+      tags:
+        - Sessions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: The newly created session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/sessions/{id}:
+    get:
+      operationId: getSession
+      summary: Get a session
+      description: |
+        Returns the owner's session metadata plus its full stored conversation history, rendered in
+        the OpenAI message wire shape so it can be inspected or replayed. A session that is missing,
+        owned by another key, or expired yields `404` uniformly (no existence leak).
+      tags:
+        - Sessions
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: The session metadata and history.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionDetailResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+    delete:
+      operationId: deleteSession
+      summary: Delete a session
+      description: |
+        Ends the owner's session and purges its stored history. A session that is missing or owned
+        by another key yields `404` uniformly (no existence leak).
+      tags:
+        - Sessions
+      parameters:
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "204":
+          description: The session was deleted. No content.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/keys:
+    post:
+      operationId: adminCreateKey
+      summary: Create an API key
+      description: |
+        Mints a new API key with the requested roles and per-model allow/deny lists, and returns its
+        id together with the **one-time** plaintext token. The token is shown exactly once and cannot
+        be recovered afterward. Requires the admin role.
+      tags:
+        - Admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminCreateKeyRequest"
+      responses:
+        "201":
+          description: The created key, including its one-time plaintext token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminCreateKeyResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: adminListKeys
+      summary: List API keys
+      description: Returns metadata for every API key. Secrets are never included. Requires the admin role.
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The list of API keys (metadata only).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminKeyListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/keys/{id}:
+    get:
+      operationId: adminGetKey
+      summary: Get an API key
+      description: Returns one API key's metadata, or `404` if the id is unknown. Requires the admin role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "200":
+          description: The API key metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminKeyView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: adminRevokeKey
+      summary: Revoke an API key
+      description: |
+        Revokes the key so subsequent authentication fails immediately, and returns `204`, or `404`
+        if the id is unknown. Requires the admin role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "204":
+          description: The key was revoked. No content.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/keys/{id}/rotate:
+    post:
+      operationId: adminRotateKey
+      summary: Rotate an API key secret
+      description: |
+        Replaces the key's secret (the old token stops verifying immediately) and returns the new
+        **one-time** plaintext token, or `404` if the id is unknown. Requires the admin role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "200":
+          description: The key id and its new one-time plaintext token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminRotateKeyResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/keys/{id}/permissions:
+    put:
+      operationId: adminSetKeyPermissions
+      summary: Replace an API key's permissions
+      description: |
+        Replaces the key's roles and per-model allow/deny lists (a full replace, not a merge: an
+        omitted or null list clears that dimension) and returns the updated metadata, or `404` if the
+        id is unknown. The change takes effect immediately. Requires the admin role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminPermissionsRequest"
+      responses:
+        "200":
+          description: The updated API key metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminKeyView"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/keys/{id}/quota:
+    put:
+      operationId: adminSetKeyQuota
+      summary: Set or clear an API key's quota override
+      description: |
+        Sets the key's per-key quota override and returns the updated metadata, or `404` if the id is
+        unknown. Each field is optional: an omitted field defaults to `0` ("unlimited" for that
+        dimension), while a body with **every** field omitted clears the override entirely so the key
+        falls back to the global defaults. The change takes effect immediately. Requires the admin
+        role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminQuotaRequest"
+      responses:
+        "200":
+          description: The updated API key metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminKeyView"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      operationId: adminGetKeyQuota
+      summary: Get an API key's quota usage
+      description: |
+        Returns the key's current usage in each window versus its effective limits, plus when each
+        window next resets, or `404` if the id is unknown. Returns `501` when the quota subsystem is
+        disabled. Requires the admin role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "200":
+          description: The key's quota usage snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminQuotaUsageResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/workers:
+    get:
+      operationId: adminListWorkers
+      summary: List workers
+      description: Returns a point-in-time snapshot of every worker in the fleet. Requires the admin role.
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The fleet snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWorkerListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers/{id}/drain:
+    post:
+      operationId: adminDrainWorker
+      summary: Drain a worker
+      description: |
+        Marks the worker draining: it receives no new jobs while its in-flight jobs are allowed to
+        finish. Returns `204`, or `404` if no such worker is connected. Requires the admin role.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+      responses:
+        "204":
+          description: The worker is now draining. No content.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An agent-gpu API key presented as `Authorization: Bearer agpu_<keyid>_<secret>`. Every
+        endpoint requires it. Admin endpoints additionally require the key to hold the `admin` role.
+
+  parameters:
+    SessionId:
+      name: id
+      in: path
+      required: true
+      description: The session id (e.g. `sess_<hex>`).
+      schema:
+        type: string
+    KeyId:
+      name: id
+      in: path
+      required: true
+      description: The API key id (the opaque public key identifier).
+      schema:
+        type: string
+    WorkerId:
+      name: id
+      in: path
+      required: true
+      description: The worker id.
+      schema:
+        type: string
+    SessionIdHeader:
+      name: X-Session-Id
+      in: header
+      required: false
+      description: |
+        Selects the affinity (stateless) session mode: the client keeps the full conversation
+        history client-side and sends it in `messages` every turn, and this header pins the request
+        to the session's warm-cache worker. Mutually exclusive in intent with the `session_id` body
+        field (stateful mode); if both are present the body field wins.
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: The request lacked a valid API key (missing, malformed, unknown, or revoked).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: invalid api key
+              code: unauthorized
+    Forbidden:
+      description: |
+        The authenticated key is not permitted to perform this action (a non-admin key on an admin
+        endpoint, or a key not permitted to use the requested model).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: admin role required
+              code: forbidden
+    NotFound:
+      description: The requested resource does not exist (or is not visible to this key).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: not found
+              code: not_found
+    BadRequest:
+      description: The request body was malformed or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: malformed request body
+              code: invalid_request_error
+    MethodNotAllowed:
+      description: The HTTP method is not allowed on this route.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: method not allowed
+              code: method_not_allowed
+    RateLimited:
+      description: |
+        The request was throttled by the per-key quota or the server-wide rate limiter. The
+        `Retry-After` header gives the integer number of seconds to wait before retrying.
+      headers:
+        Retry-After:
+          description: Integer seconds to wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: rate limit exceeded
+              code: rate_limit_exceeded
+    Unavailable:
+      description: No worker capacity is available, or the server is shutting down.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: no capacity available
+              code: unavailable
+    InternalError:
+      description: An unexpected server-side error occurred.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: internal error
+              code: internal_error
+    NotImplemented:
+      description: The requested subsystem (sessions or quota) is not enabled on this server.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: sessions are not enabled
+              code: not_implemented
+
+  schemas:
+    Error:
+      type: object
+      description: |
+        The consistent error envelope returned by every endpoint on failure. `message` is a generic,
+        human-readable description (never leaking secrets or internal detail); `code` is a stable,
+        machine-readable identifier clients branch on.
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required:
+            - message
+            - code
+          properties:
+            message:
+              type: string
+              description: A generic, human-readable error message.
+            code:
+              type: string
+              description: A stable, machine-readable error code.
+              enum:
+                - unauthorized
+                - forbidden
+                - rate_limit_exceeded
+                - unavailable
+                - invalid_request_error
+                - not_found
+                - method_not_allowed
+                - not_implemented
+                - internal_error
+
+    Usage:
+      type: object
+      description: |
+        OpenAI token-accounting object. When the backend reports only a total, it lands in
+        `completion_tokens` and `total_tokens` with `prompt_tokens` zero.
+      required:
+        - prompt_tokens
+        - completion_tokens
+        - total_tokens
+      properties:
+        prompt_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Tokens consumed by the prompt.
+        completion_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Tokens generated in the completion.
+        total_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total tokens (prompt + completion).
+
+    ToolCall:
+      type: object
+      description: A function call emitted by the model, or a prior assistant tool call replayed back to it.
+      required:
+        - id
+        - type
+        - function
+      properties:
+        id:
+          type: string
+          description: The tool call id, used to correlate the subsequent tool-result message.
+        type:
+          type: string
+          description: The tool type. Only function tools exist today.
+          enum:
+            - function
+        function:
+          type: object
+          required:
+            - name
+            - arguments
+          properties:
+            name:
+              type: string
+              description: The name of the function to call.
+            arguments:
+              type: string
+              description: The function arguments as a JSON-encoded string (not an object).
+
+    ChatMessage:
+      type: object
+      description: One message in an OpenAI-style chat conversation.
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          description: The author role of this message.
+          enum:
+            - system
+            - user
+            - assistant
+            - tool
+        content:
+          type: string
+          description: The textual content of the message. May be empty for a pure tool-call assistant turn.
+        name:
+          type: [string, "null"]
+          description: An optional name; for a tool message, the name of the tool that produced the result.
+        tool_call_id:
+          type: [string, "null"]
+          description: For a tool message, the id of the tool call this message is a result for.
+        tool_calls:
+          type: [array, "null"]
+          description: For an assistant turn, the tool calls the model emitted (or prior calls replayed back to it).
+          items:
+            $ref: "#/components/schemas/ToolCall"
+
+    Tool:
+      type: object
+      description: A function the model may call (OpenAI function calling).
+      required:
+        - type
+        - function
+      properties:
+        type:
+          type: string
+          description: The tool type. Only function tools exist today.
+          enum:
+            - function
+        function:
+          type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+              description: The function name.
+            description:
+              type: [string, "null"]
+              description: A human-readable description of what the function does.
+            parameters:
+              type: [object, "null"]
+              description: |
+                The function parameters as a JSON Schema object. Passed through to the model
+                unchanged; its internal structure is not constrained here.
+              additionalProperties: true
+
+    ChatCompletionRequest:
+      type: object
+      description: |
+        A chat completion request. Only `model` and `messages` are required. Unknown OpenAI
+        parameters (`temperature`, `top_p`, `max_tokens`, `presence_penalty`, …) are accepted and
+        ignored — they are a documented seam and have no effect yet.
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+          description: The model to run inference against. Must be a model the key may use.
+        messages:
+          type: array
+          description: The conversation so far.
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+        stream:
+          type: [boolean, "null"]
+          default: false
+          description: "If true, stream the response as Server-Sent Events terminated by `data: [DONE]`."
+        tools:
+          type: [array, "null"]
+          description: Function/tool definitions the model may call.
+          items:
+            $ref: "#/components/schemas/Tool"
+        session_id:
+          type: [string, "null"]
+          description: |
+            Selects the stateful session mode: the server reconstructs the session's stored history
+            in front of `messages` and persists the new turn. Mutually exclusive in intent with the
+            `X-Session-Id` header (affinity mode); if both are present this body field wins.
+        temperature:
+          type: [number, "null"]
+          description: Accepted for OpenAI compatibility and currently ignored (not yet plumbed to Ollama).
+        top_p:
+          type: [number, "null"]
+          description: Accepted for OpenAI compatibility and currently ignored (not yet plumbed to Ollama).
+        max_tokens:
+          type: [integer, "null"]
+          description: Accepted for OpenAI compatibility and currently ignored (not yet plumbed to Ollama).
+
+    ChatCompletionResponse:
+      type: object
+      description: A non-streaming chat completion.
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+        - usage
+      properties:
+        id:
+          type: string
+          description: A unique id for this completion (e.g. `chatcmpl-<hex>`).
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the completion was created.
+        model:
+          type: string
+          description: The model that produced the completion.
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - index
+              - message
+              - finish_reason
+            properties:
+              index:
+                type: integer
+                description: The index of this choice.
+              message:
+                $ref: "#/components/schemas/ChatMessage"
+              finish_reason:
+                $ref: "#/components/schemas/FinishReason"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    ChatCompletionChunk:
+      type: object
+      description: |
+        One SSE frame of a streaming chat completion. The first frame's delta carries the assistant
+        role; subsequent frames carry content and/or tool-call deltas; the terminal frame sets
+        `finish_reason`.
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion.chunk
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds.
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - index
+              - delta
+              - finish_reason
+            properties:
+              index:
+                type: integer
+              delta:
+                type: object
+                description: The incremental delta for this frame.
+                properties:
+                  role:
+                    type: [string, "null"]
+                    enum:
+                      - assistant
+                      - null
+                    description: Present on the first frame to announce the assistant role.
+                  content:
+                    type: [string, "null"]
+                    description: The incremental content for this frame.
+                  tool_calls:
+                    type: [array, "null"]
+                    items:
+                      $ref: "#/components/schemas/ToolCall"
+              finish_reason:
+                oneOf:
+                  - $ref: "#/components/schemas/FinishReason"
+                  - type: "null"
+                description: Null on non-terminal frames; set on the terminal frame.
+
+    FinishReason:
+      type: string
+      description: Why the model stopped generating.
+      enum:
+        - stop
+        - length
+        - tool_calls
+        - error
+
+    CompletionRequest:
+      type: object
+      description: |
+        A legacy text completion request. Only `model` and `prompt` are meaningful. Unknown OpenAI
+        parameters (`max_tokens`, `temperature`, …) are accepted and ignored.
+      required:
+        - model
+        - prompt
+      properties:
+        model:
+          type: string
+          description: The model to run inference against. Must be a model the key may use.
+        prompt:
+          type: string
+          description: The text prompt to complete.
+        stream:
+          type: [boolean, "null"]
+          default: false
+          description: "If true, stream the response as Server-Sent Events terminated by `data: [DONE]`."
+
+    CompletionResponse:
+      type: object
+      description: A non-streaming text completion.
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+        - usage
+      properties:
+        id:
+          type: string
+          description: A unique id for this completion (e.g. `cmpl-<hex>`).
+        object:
+          type: string
+          const: text_completion
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds.
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - text
+              - index
+              - finish_reason
+            properties:
+              text:
+                type: string
+                description: The generated completion text.
+              index:
+                type: integer
+              finish_reason:
+                $ref: "#/components/schemas/FinishReason"
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    CompletionChunk:
+      type: object
+      description: One SSE frame of a streaming text completion.
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: text_completion
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds.
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required:
+              - text
+              - index
+              - finish_reason
+            properties:
+              text:
+                type: string
+                description: The incremental completion text for this frame.
+              index:
+                type: integer
+              finish_reason:
+                oneOf:
+                  - $ref: "#/components/schemas/FinishReason"
+                  - type: "null"
+                description: Null on non-terminal frames; set on the terminal frame.
+
+    OpenAIModelList:
+      type: object
+      description: The OpenAI-canonical model list.
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/OpenAIModel"
+
+    OpenAIModel:
+      type: object
+      description: One model in the OpenAI-canonical list.
+      required:
+        - id
+        - object
+        - created
+        - owned_by
+      properties:
+        id:
+          type: string
+          description: The model name.
+        object:
+          type: string
+          const: model
+        created:
+          type: integer
+          format: int64
+          description: Always 0 (the domain model carries no creation time).
+        owned_by:
+          type: string
+          description: Always "agent-gpu".
+
+    ModelList:
+      type: object
+      description: The richer internal model catalog.
+      required:
+        - models
+      properties:
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelEntry"
+
+    ModelEntry:
+      type: object
+      description: One aggregated model with its per-model worker availability.
+      required:
+        - name
+        - digest
+        - worker_count
+        - workers
+      properties:
+        name:
+          type: string
+          description: The model name.
+        digest:
+          type: string
+          description: The model digest (e.g. `sha256:...`).
+        worker_count:
+          type: integer
+          description: The number of online workers currently serving this model.
+        workers:
+          type: array
+          description: The ids of the online workers currently serving this model, sorted.
+          items:
+            type: string
+
+    CreateSessionRequest:
+      type: object
+      description: A request to create a session.
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          description: The model the session's conversation targets.
+
+    SessionResponse:
+      type: object
+      description: The minimal handle returned when a session is created.
+      required:
+        - id
+        - object
+        - model
+        - created
+      properties:
+        id:
+          type: string
+          description: The session id (e.g. `sess_<hex>`).
+        object:
+          type: string
+          const: session
+        model:
+          type: string
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the session was created.
+
+    SessionDetailResponse:
+      type: object
+      description: A session's metadata plus its full stored conversation history.
+      required:
+        - id
+        - object
+        - model
+        - created
+        - last_active
+        - messages
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: session
+        model:
+          type: string
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the session was created.
+        last_active:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the session was last active.
+        messages:
+          type: array
+          description: The stored conversation history in the OpenAI message wire shape.
+          items:
+            $ref: "#/components/schemas/ChatMessage"
+
+    Role:
+      type: string
+      description: A built-in API-key role.
+      enum:
+        - admin
+        - user
+        - read-only
+
+    Limits:
+      type: object
+      description: |
+        Per-key quota limits. A value of `0` for any dimension means "unlimited" for that dimension.
+      required:
+        - rpm
+        - tpm
+        - daily_tokens
+        - monthly_tokens
+      properties:
+        rpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Maximum requests per UTC-aligned minute (0 = unlimited).
+        tpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Maximum tokens per UTC-aligned minute (0 = unlimited).
+        daily_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Maximum tokens per UTC calendar day (0 = unlimited).
+        monthly_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Maximum tokens per UTC calendar month (0 = unlimited).
+
+    AdminKeyView:
+      type: object
+      description: |
+        The metadata-only projection of an API key returned by the admin API. The stored secret hash
+        and salt are never serialized.
+      required:
+        - id
+        - name
+        - roles
+        - allow_models
+        - deny_models
+        - revoked
+        - usage_count
+        - created
+      properties:
+        id:
+          type: string
+          description: The opaque public key id.
+        name:
+          type: string
+          description: A human-readable label.
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Role"
+        allow_models:
+          type: array
+          description: The per-key allow-list of model names.
+          items:
+            type: string
+        deny_models:
+          type: array
+          description: The per-key deny-list of model names (deny always wins).
+          items:
+            type: string
+        revoked:
+          type: boolean
+          description: Whether the key has been revoked.
+        usage_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of successful authentications.
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the key was created.
+        last_used:
+          type: [integer, "null"]
+          format: int64
+          description: Unix epoch seconds of the most recent successful authentication. Omitted if never used.
+        limits:
+          oneOf:
+            - $ref: "#/components/schemas/Limits"
+            - type: "null"
+          description: The per-key quota override, or null/omitted when the key uses the global defaults.
+
+    AdminKeyListResponse:
+      type: object
+      description: The list of API keys.
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminKeyView"
+
+    AdminCreateKeyRequest:
+      type: object
+      description: A request to create an API key with initial permissions.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: A human-readable label for the new key.
+        roles:
+          type: [array, "null"]
+          description: The roles to grant the new key.
+          items:
+            $ref: "#/components/schemas/Role"
+        allow_models:
+          type: [array, "null"]
+          description: The per-key allow-list of model names.
+          items:
+            type: string
+        deny_models:
+          type: [array, "null"]
+          description: The per-key deny-list of model names.
+          items:
+            type: string
+
+    AdminCreateKeyResponse:
+      type: object
+      description: |
+        The created key, including its one-time plaintext token. The token is returned exactly once
+        and cannot be recovered afterward.
+      required:
+        - id
+        - name
+        - token
+        - roles
+        - allow_models
+        - deny_models
+        - created
+      properties:
+        id:
+          type: string
+          description: The opaque public key id.
+        name:
+          type: string
+        token:
+          type: string
+          description: The one-time plaintext token (`agpu_<keyid>_<secret>`). Shown once; not recoverable.
+        roles:
+          type: array
+          items:
+            $ref: "#/components/schemas/Role"
+        allow_models:
+          type: array
+          items:
+            type: string
+        deny_models:
+          type: array
+          items:
+            type: string
+        created:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the key was created.
+
+    AdminRotateKeyResponse:
+      type: object
+      description: The key id and its new one-time plaintext token.
+      required:
+        - id
+        - token
+      properties:
+        id:
+          type: string
+          description: The key id.
+        token:
+          type: string
+          description: The new one-time plaintext token. Shown once; not recoverable.
+
+    AdminPermissionsRequest:
+      type: object
+      description: |
+        A full replacement of a key's roles and allow/deny lists. An omitted or null list clears that
+        dimension.
+      properties:
+        roles:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/Role"
+        allow_models:
+          type: [array, "null"]
+          items:
+            type: string
+        deny_models:
+          type: [array, "null"]
+          items:
+            type: string
+
+    AdminQuotaRequest:
+      type: object
+      description: |
+        A request to set or clear a key's per-key quota override. Each field is optional: an omitted
+        field defaults to `0` ("unlimited" for that dimension); a body with **every** field omitted
+        clears the override entirely so the key falls back to the global defaults.
+      properties:
+        rpm:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          description: Maximum requests per UTC-aligned minute (0 = unlimited).
+        tpm:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          description: Maximum tokens per UTC-aligned minute (0 = unlimited).
+        daily_tokens:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          description: Maximum tokens per UTC calendar day (0 = unlimited).
+        monthly_tokens:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+          description: Maximum tokens per UTC calendar month (0 = unlimited).
+
+    AdminQuotaUsageResponse:
+      type: object
+      description: A key's current usage in each window versus its effective limits, plus when each window resets.
+      required:
+        - key_id
+        - limits
+        - requests_this_minute
+        - tokens_this_minute
+        - tokens_today
+        - tokens_this_month
+        - minute_resets_at
+        - day_resets_at
+        - month_resets_at
+      properties:
+        key_id:
+          type: string
+        limits:
+          $ref: "#/components/schemas/Limits"
+        requests_this_minute:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_this_minute:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_today:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_this_month:
+          type: integer
+          format: int64
+          minimum: 0
+        minute_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the minute window next resets.
+        day_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the day window next resets.
+        month_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the month window next resets.
+
+    AdminWorkerView:
+      type: object
+      description: A point-in-time projection of one worker in the fleet.
+      required:
+        - id
+        - models
+        - status
+        - active_jobs
+        - total_vram
+        - free_vram
+        - load
+        - gpu_type
+        - last_seen
+      properties:
+        id:
+          type: string
+        models:
+          type: array
+          description: The model names the worker currently has available.
+          items:
+            type: string
+        status:
+          type: string
+          description: The worker's lifecycle state.
+          enum:
+            - online
+            - draining
+            - stale
+            - unknown
+        active_jobs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of jobs the worker is currently running.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total VRAM in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Free VRAM in bytes.
+        load:
+          type: integer
+          format: int64
+          minimum: 0
+          description: A coarse 0-100 utilization value.
+        gpu_type:
+          type: string
+          description: The worker's reported GPU type.
+        last_seen:
+          type: integer
+          format: int64
+          description: Unix epoch seconds of the worker's last heartbeat.
+
+    AdminWorkerListResponse:
+      type: object
+      description: The fleet snapshot.
+      required:
+        - workers
+      properties:
+        workers:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminWorkerView"

@@ -48,6 +48,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  openapi:
+    name: openapi
+    runs-on: ubuntu-latest
+    env:
+      REDOCLY_TELEMETRY: "off"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Lint OpenAPI spec (validate 3.1 + recommended ruleset)
+        uses: docker://redocly/cli:2.33.2@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
+        with:
+          args: lint openapi.yaml
+
+      - name: Render OpenAPI docs (Redoc)
+        uses: docker://redocly/cli:2.33.2@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
+        with:
+          args: build-docs openapi.yaml -o openapi.html
+
   go:
     name: go
     runs-on: ubuntu-latest
