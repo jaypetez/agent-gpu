@@ -15,6 +15,14 @@
 //     calling, non-streaming and SSE streaming (#13).
 //   - POST /v1/completions      — legacy text completions, non-streaming and SSE
 //     streaming (#13).
+//   - POST   /v1/sessions       — create an owner-scoped conversation session (#36).
+//   - GET    /v1/sessions/{id}  — session metadata + stored history (#36).
+//   - DELETE /v1/sessions/{id}  — end a session and purge its history (#36).
+//
+// The chat endpoint also supports two session-aware conversation modes (#36):
+// AFFINITY (X-Session-Id header — stateless, server only routes to the warm
+// worker) and STATEFUL (session_id body field — server stores history and
+// reconstructs the full context each turn). See chat.go and docs/architecture.md.
 //
 // Every endpoint requires a valid API key (Bearer token). Model discovery is
 // permission-filtered per key — a model appears only if the key may run
@@ -39,6 +47,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/server"
+	"github.com/jaypetez/agent-gpu/internal/session"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 )
@@ -74,6 +83,16 @@ type Server struct {
 	log    *slog.Logger
 	listen string
 
+	// sessionMgr backs the session CRUD endpoints and stateful chat mode (#36).
+	// When nil, sessions are disabled: the /v1/sessions endpoints return 501 and
+	// a chat request carrying a body session_id is rejected. In cmd it is always
+	// set; it is left injectable so unit tests can drive it without standing up
+	// the full session subsystem. The same *session.Manager instance is shared
+	// with the control-plane server (server.WithSessionManager) so the affinity
+	// binding the dispatcher writes and the history this layer reads/writes refer
+	// to one source of truth.
+	sessionMgr *session.Manager
+
 	// httpSrv is constructed in NewServer (not in ListenAndServe) so the pointer
 	// is non-nil and stable before any goroutine starts or any Shutdown call
 	// races startup. This gives a happens-before edge between construction and
@@ -84,20 +103,22 @@ type Server struct {
 }
 
 // NewServer constructs an HTTP API Server. grpcSrv supplies the fleet snapshot,
-// authSvc authenticates Bearer tokens, az permission-filters the catalog, log
-// receives structured logs (defaulting to slog.Default() when nil), and listen
-// is the host:port to bind.
-func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authorizer, log *slog.Logger, listen string) *Server {
+// authSvc authenticates Bearer tokens, az permission-filters the catalog, mgr
+// backs the session API + stateful chat (nil disables sessions), log receives
+// structured logs (defaulting to slog.Default() when nil), and listen is the
+// host:port to bind.
+func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authorizer, mgr *session.Manager, log *slog.Logger, listen string) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	s := &Server{
-		fleet:  grpcSrv,
-		engine: grpcSrv,
-		auth:   authSvc,
-		authz:  az,
-		log:    log,
-		listen: listen,
+		fleet:      grpcSrv,
+		engine:     grpcSrv,
+		auth:       authSvc,
+		authz:      az,
+		sessionMgr: mgr,
+		log:        log,
+		listen:     listen,
 	}
 	// Build the *http.Server up front so the pointer is stable before any
 	// ListenAndServe goroutine or Shutdown call observes it (see field doc).
@@ -119,6 +140,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/models", s.authMiddleware(http.HandlerFunc(s.handleModels)))
 	mux.Handle("/v1/chat/completions", s.authMiddleware(http.HandlerFunc(s.handleChatCompletions)))
 	mux.Handle("/v1/completions", s.authMiddleware(http.HandlerFunc(s.handleCompletions)))
+	// Session CRUD (#36). Go 1.22+ method+path patterns let the same path host
+	// distinct verbs and capture the id segment via r.PathValue("id").
+	mux.Handle("POST /v1/sessions", s.authMiddleware(http.HandlerFunc(s.handleCreateSession)))
+	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
+	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
 	return mux
 }
 
