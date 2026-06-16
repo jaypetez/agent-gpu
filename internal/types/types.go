@@ -67,6 +67,12 @@ type Job struct {
 	Prompt   string
 	Messages []Message
 	Tools    []Tool
+	// SessionID is the owning conversation's session id, used SERVER-SIDE ONLY for
+	// session-affinity routing (#34): it lets the dispatcher prefer the worker the
+	// session is bound to (warm KV cache). It is a routing hint that never crosses
+	// the wire — Proto/JobFromProto deliberately omit it — so the worker contract
+	// is unchanged. Empty for jobs with no session (the default, affinity-free).
+	SessionID string
 }
 
 // JobError is a structured, transport-neutral job failure. It implements the
