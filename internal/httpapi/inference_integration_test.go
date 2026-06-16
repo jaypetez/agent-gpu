@@ -22,6 +22,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/httpapi"
+	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
@@ -101,21 +102,34 @@ func (e *scriptedExecutor) job() *types.Job {
 type inferenceHarness struct {
 	url   string
 	token string
+	// authSvc lets a test mint additional keys or set per-key quota limits
+	// after the harness is up (e.g. the 429 quota test).
+	authSvc *auth.Service
 }
 
 func newInferenceHarness(t *testing.T, exec *scriptedExecutor, model string) inferenceHarness {
+	t.Helper()
+	return newInferenceHarnessWith(t, exec, model)
+}
+
+// newInferenceHarnessWith is the option-taking variant of newInferenceHarness:
+// it threads extra server.Options (e.g. server.WithQuota for the 429 test) into
+// the control-plane server before wiring up the worker and HTTP API. The
+// returned harness exposes the auth.Service so a test can mint scoped keys.
+func newInferenceHarnessWith(t *testing.T, exec *scriptedExecutor, model string, opts ...server.Option) inferenceHarness {
 	t.Helper()
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	st := store.NewMemory()
 	az := authz.NewAuthorizer(authz.WithLogger(discard))
-	grpcSrv := server.New(
+	base := []server.Option{
 		server.WithLogger(discard),
 		server.WithStore(st),
 		server.WithAuthorizer(az),
-		server.WithHeartbeatTimeout(2*time.Second),
-		server.WithEvictScanInterval(50*time.Millisecond),
-	)
+		server.WithHeartbeatTimeout(2 * time.Second),
+		server.WithEvictScanInterval(50 * time.Millisecond),
+	}
+	grpcSrv := server.New(append(base, opts...)...)
 	grpcSrv.Start()
 	t.Cleanup(func() { _ = grpcSrv.Close() })
 
@@ -156,7 +170,7 @@ func newInferenceHarness(t *testing.T, exec *scriptedExecutor, model string) inf
 	})
 	go func() { _ = w.Run(wctx) }()
 
-	h := inferenceHarness{url: ts.URL, token: token}
+	h := inferenceHarness{url: ts.URL, token: token, authSvc: authSvc}
 	// Wait until the model is visible so a dispatch will find a worker.
 	waitFor(t, 2*time.Second, "model in catalog", func() bool {
 		return len(fetchModels(t, h.url, h.token)) == 1
@@ -166,11 +180,18 @@ func newInferenceHarness(t *testing.T, exec *scriptedExecutor, model string) inf
 
 func (h inferenceHarness) post(t *testing.T, path, body string) *http.Response {
 	t.Helper()
+	return h.postAs(t, h.token, path, body)
+}
+
+// postAs issues a POST authenticated with an arbitrary token, so a test can
+// drive the public surface with a scoped (non-admin) key.
+func (h inferenceHarness) postAs(t *testing.T, token, path, body string) *http.Response {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, h.url+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -556,6 +577,103 @@ func TestChatCompletionMalformedBody(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+// testClock is a mutex-guarded mutable clock so the quota engine's window math
+// can be driven deterministically from the test goroutine while the engine
+// reads `now` from the server's request goroutines (race-free under -race).
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *testClock) nowFn() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+// quotaErrorBody mirrors the OpenAI-style error envelope so the 429 body can be
+// asserted (the typed code lets agent-gpu clients branch programmatically).
+type quotaErrorBody struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+	} `json:"error"`
+}
+
+// TestChatCompletionQuotaExceeded429 drives the quota path through the public
+// HTTP surface: with a small per-key RPM, the first two chat completions return
+// 200 and the third returns 429 with the OpenAI error envelope. Advancing the
+// injected clock past the minute window then lets a request succeed again,
+// proving the limit is a rolling window and not a permanent block. (AC2 — the
+// quota 429 flow.)
+func TestChatCompletionQuotaExceeded429(t *testing.T) {
+	clk := &testClock{now: time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)}
+	eng := quota.NewEngine(quota.NewMemoryCounterStore(), quota.WithClock(clk.nowFn))
+
+	exec := &scriptedExecutor{deltas: []string{"ok"}, promptTokens: 1, completionTokens: 1}
+	h := newInferenceHarnessWith(t, exec, "llama3", server.WithQuota(eng))
+
+	// A user key permitted for llama3 with an RPM of 2 (well under the default
+	// admin key, which we deliberately do not reuse here).
+	ctx := context.Background()
+	token, created, err := h.authSvc.CreateWithPermissions(ctx, "user",
+		auth.Permissions{Roles: []string{authz.RoleUser}, AllowModels: []string{"llama3"}})
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	if _, err := h.authSvc.SetLimits(ctx, created.ID, &store.Limits{RPM: 2}); err != nil {
+		t.Fatalf("set limits: %v", err)
+	}
+
+	body := `{"model":"llama3","messages":[{"role":"user","content":"hi"}]}`
+
+	// The first two requests fit under the RPM=2 window.
+	for i := 0; i < 2; i++ {
+		resp := h.postAs(t, token, "/v1/chat/completions", body)
+		status := resp.StatusCode
+		_ = resp.Body.Close()
+		if status != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200", i+1, status)
+		}
+	}
+
+	// The third trips the limit: HTTP 429 with the OpenAI error envelope.
+	resp := h.postAs(t, token, "/v1/chat/completions", body)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		_ = resp.Body.Close()
+		t.Fatalf("over-limit request: status = %d, want 429", resp.StatusCode)
+	}
+	var eb quotaErrorBody
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		_ = resp.Body.Close()
+		t.Fatalf("decode error body: %v", err)
+	}
+	_ = resp.Body.Close()
+	if eb.Error.Message == "" {
+		t.Errorf("error.message empty, want a human-readable message")
+	}
+	if eb.Error.Code != "rate_limit_exceeded" {
+		t.Errorf("error.code = %q, want rate_limit_exceeded", eb.Error.Code)
+	}
+
+	// Advance past the minute window: the rolling RPM resets and a request
+	// succeeds again.
+	clk.advance(time.Minute)
+	resp = h.postAs(t, token, "/v1/chat/completions", body)
+	status := resp.StatusCode
+	_ = resp.Body.Close()
+	if status != http.StatusOK {
+		t.Fatalf("after window reset: status = %d, want 200", status)
 	}
 }
 
