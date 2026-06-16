@@ -297,6 +297,15 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 	var content strings.Builder
 	var toolCalls []types.ToolCall
 	failed := false
+	// sawDone tracks whether a genuine terminal chunk (Done == true) was observed.
+	// A mid-stream client disconnect closes the chunk channel WITHOUT an error
+	// frame (server.go's producer reacts to ctx.Done by detaching the observer and
+	// returning), so the loop below would exit normally with failed == false even
+	// though the upstream job was aborted and the assistant reply is truncated.
+	// Persisting that partial turn would corrupt the next stateful turn's
+	// reconstructed context, so persistence is gated on sawDone — only a clean
+	// terminal chunk proves the inference completed.
+	sawDone := false
 
 	for chunk := range chunks {
 		if chunk.Err != nil {
@@ -319,6 +328,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 		choice.Delta.Content = chunk.Delta
 		choice.Delta.ToolCalls = fromDomainToolCalls(chunk.ToolCalls)
 		if chunk.Done {
+			sawDone = true
 			fr := finishReasonOrStop(chunk.FinishReason)
 			choice.FinishReason = &fr
 		}
@@ -334,11 +344,17 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 
 	writeSSEDone(w, flusher)
 
-	// Persist the turn only after the stream terminated successfully (terminal
-	// chunk, not a mid-stream error), mirroring the non-streaming path. The
-	// request context may be cancelled once the client closes the stream, so use
-	// a detached context for the write — the inference already succeeded.
-	if mode == modeStateful && !failed {
+	// Persist the turn atomically (the new user/tool message(s) AND the assistant
+	// reply together) only after the stream terminated cleanly: a genuine terminal
+	// chunk was observed (sawDone), no mid-stream error occurred (!failed), and the
+	// client did not disconnect (request context not cancelled). On a disconnect
+	// the chunk channel closes with no error frame, so !failed alone is not enough
+	// — sawDone and the context check together ensure NEITHER the user turn nor a
+	// partial assistant turn is persisted for an aborted stream, keeping the
+	// session consistent so the client can simply retry the turn. The request
+	// context may be cancelled once the client closes a SUCCESSFUL stream too, so
+	// the write uses a detached context — the inference already succeeded.
+	if mode == modeStateful && !failed && sawDone && r.Context().Err() == nil {
 		s.persistTurn(context.WithoutCancel(r.Context()), sessionID, key.ID, newMessages, content.String(), toolCalls)
 	}
 }

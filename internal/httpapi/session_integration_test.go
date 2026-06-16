@@ -85,6 +85,43 @@ func (e *recordingExecutor) Pull(context.Context, string) error                {
 
 func (e *recordingExecutor) handled() int64 { return e.count.Load() }
 
+// blockingExecutor is a worker.Executor that emits a couple of deltas, signals
+// that it has done so (via emitted), then blocks until its context is cancelled
+// — never sending a terminal Done chunk. It backs the disconnect test: a stateful
+// streaming turn can be cancelled client-side AFTER the deltas land but BEFORE any
+// terminal chunk, exercising the mid-stream-disconnect path without sleeps. The
+// model field advertises a model so the worker registers and dispatch reaches it.
+type blockingExecutor struct {
+	workerID string
+	models   []types.Model
+	// emitted is closed once the executor has emitted its deltas, so the test can
+	// deterministically wait for tokens to be in flight before cancelling.
+	emitted chan struct{}
+
+	count atomic.Int64
+}
+
+func (e *blockingExecutor) Execute(ctx context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
+	e.count.Add(1)
+	if emit != nil {
+		emit(types.JobChunk{JobID: job.ID, Delta: "par"})
+		emit(types.JobChunk{JobID: job.ID, Delta: "tial"})
+	}
+	close(e.emitted)
+	// Block until the client disconnects (which cancels connCtx upstream). Never
+	// emit a terminal chunk: the worker only sends Done AFTER Execute returns, so
+	// returning here without the client having received a terminal chunk models a
+	// genuine mid-stream abort.
+	<-ctx.Done()
+	return types.JobResult{JobID: job.ID, FinishReason: "stop"}
+}
+
+func (e *blockingExecutor) ListModels(context.Context) ([]types.Model, error) {
+	return e.models, nil
+}
+func (e *blockingExecutor) Pull(context.Context, string) error { return nil }
+func (e *blockingExecutor) handled() int64                     { return e.count.Load() }
+
 func (e *recordingExecutor) job() *types.Job {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -108,6 +145,34 @@ type sessionHarness struct {
 // the executor's workerID), all advertising model. The session manager uses a
 // long TTL so the sweeper never reaps a session during the test.
 func newSessionHarness(t *testing.T, model string, execs ...*recordingExecutor) sessionHarness {
+	t.Helper()
+	named := make([]namedExecutor, len(execs))
+	for i, e := range execs {
+		e.models = []types.Model{{Name: model, Digest: "sha256:test"}}
+		named[i] = namedExecutor{id: e.workerID, exec: e}
+	}
+	h := buildSessionHarness(t, model, named)
+	byID := make(map[string]*recordingExecutor, len(execs))
+	for _, e := range execs {
+		byID[e.workerID] = e
+	}
+	h.execs = byID
+	return h
+}
+
+// namedExecutor pairs a worker.Executor with the worker id it registers under,
+// so buildSessionHarness can wire heterogeneous executor types (recording or
+// blocking) onto the same control plane.
+type namedExecutor struct {
+	id   string
+	exec worker.Executor
+}
+
+// buildSessionHarness wires the control-plane gRPC server, the shared session
+// manager, the HTTP API, and one worker per namedExecutor, then waits for the
+// whole fleet to register. It is the common backbone for the session integration
+// tests; callers that need typed access to their executors set h.execs.
+func buildSessionHarness(t *testing.T, model string, execs []namedExecutor) sessionHarness {
 	t.Helper()
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -152,17 +217,14 @@ func newSessionHarness(t *testing.T, model string, execs ...*recordingExecutor) 
 	}
 
 	models := []types.Model{{Name: model, Digest: "sha256:test"}}
-	byID := make(map[string]*recordingExecutor, len(execs))
 	wctx, wcancel := context.WithCancel(context.Background())
 	t.Cleanup(wcancel)
-	for _, e := range execs {
-		e.models = models
-		byID[e.workerID] = e
+	for _, ne := range execs {
 		w := worker.New(worker.Config{
 			ServerAddr:        "bufconn",
-			WorkerID:          e.workerID,
+			WorkerID:          ne.id,
 			Models:            models,
-			Executor:          e,
+			Executor:          ne.exec,
 			Logger:            discard,
 			HeartbeatInterval: 15 * time.Millisecond,
 			Backoff:           worker.Backoff{Base: 5 * time.Millisecond, Max: 50 * time.Millisecond, Factor: 2.0},
@@ -176,7 +238,7 @@ func newSessionHarness(t *testing.T, model string, execs ...*recordingExecutor) 
 		go func() { _ = w.Run(wctx) }()
 	}
 
-	h := sessionHarness{url: ts.URL, token: token, authSvc: authSvc, mgr: mgr, execs: byID}
+	h := sessionHarness{url: ts.URL, token: token, authSvc: authSvc, mgr: mgr}
 	// Wait until every worker has registered so dispatch reaches the whole fleet.
 	waitFor(t, 3*time.Second, "all workers in fleet", func() bool {
 		return len(grpcSrv.Fleet()) == len(execs)
@@ -507,6 +569,106 @@ func TestSessionStatefulStreaming(t *testing.T) {
 	}
 	if job.Messages[0].Content != "go" || job.Messages[1].Content != "stream-reply" || job.Messages[2].Content != "more" {
 		t.Errorf("stream turn 2 context wrong: %+v", job.Messages)
+	}
+}
+
+// TestSessionStatefulStreamingDisconnect proves the blocking-defect fix: when a
+// client disconnects mid-stream (after deltas land but BEFORE any terminal
+// chunk), NEITHER the new user turn NOR a partial assistant turn is persisted, so
+// the session history stays consistent and the turn can be retried. The blocking
+// executor emits two deltas then waits on its context; the test cancels the
+// client request once the deltas are in flight, modelling a genuine abort with no
+// error frame and no Done chunk.
+func TestSessionStatefulStreamingDisconnect(t *testing.T) {
+	exec := &blockingExecutor{
+		workerID: "worker-1",
+		models:   []types.Model{{Name: "llama3", Digest: "sha256:test"}},
+		emitted:  make(chan struct{}),
+	}
+	h := buildSessionHarness(t, "llama3", []namedExecutor{{id: exec.workerID, exec: exec}})
+
+	sid := h.createSession(t, "llama3")
+
+	// History is empty before the turn; it must be unchanged after the disconnect.
+	if hist := h.history(t, sid); len(hist) != 0 {
+		t.Fatalf("pre-turn history = %d, want 0", len(hist))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.url+"/v1/chat/completions",
+		strings.NewReader(`{"model":"llama3","stream":true,"session_id":"`+sid+`","messages":[{"role":"user","content":"go"}]}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		t.Fatalf("stream status = %d, want 200", resp.StatusCode)
+	}
+
+	// Wait until the executor has emitted its deltas (tokens are in flight), then
+	// abort the client request mid-stream — before any terminal/Done chunk.
+	select {
+	case <-exec.emitted:
+	case <-time.After(3 * time.Second):
+		_ = resp.Body.Close()
+		t.Fatal("executor never emitted deltas")
+	}
+	cancel()
+	_ = resp.Body.Close()
+
+	// The executor unblocks once its context is cancelled (client disconnect tears
+	// down the upstream job). Wait for that so any erroneous persistence would have
+	// had its chance to run.
+	waitFor(t, 3*time.Second, "executor observed disconnect", func() bool {
+		return exec.handled() == 1
+	})
+
+	// The disconnected turn persisted NOTHING: no orphaned user turn, no partial
+	// assistant turn. History stays empty so the client can retry cleanly. Hold
+	// the assertion across a short window to catch a late detached write.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if hist := h.history(t, sid); len(hist) != 0 {
+			t.Fatalf("disconnect persisted a turn: %+v", hist)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestSessionStatefulCrossOwner proves a stateful chat naming a session owned by
+// a DIFFERENT key is rejected with 404 BEFORE any dispatch (no existence leak, no
+// wasted inference): the executor handles zero jobs.
+func TestSessionStatefulCrossOwner(t *testing.T) {
+	exec := &recordingExecutor{workerID: "worker-1", reply: "ok"}
+	h := newSessionHarness(t, "llama3", exec)
+
+	// The session belongs to the harness's admin token.
+	sid := h.createSession(t, "llama3")
+
+	// A second, distinct key tries to drive a stateful turn against it.
+	otherToken, _, err := h.authSvc.CreateWithPermissions(context.Background(), "intruder",
+		auth.Permissions{Roles: []string{authz.RoleAdmin}})
+	if err != nil {
+		t.Fatalf("create other key: %v", err)
+	}
+
+	resp := h.post(t, "/v1/chat/completions",
+		`{"model":"llama3","session_id":"`+sid+`","messages":[{"role":"user","content":"intrude"}]}`,
+		map[string]string{"Authorization": "Bearer " + otherToken})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-owner stateful chat status = %d, want 404", resp.StatusCode)
+	}
+	if exec.handled() != 0 {
+		t.Errorf("worker handled %d jobs, want 0 (no dispatch for cross-owner session)", exec.handled())
 	}
 }
 

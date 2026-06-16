@@ -647,11 +647,16 @@ chat request carrying a session id is rejected `501`.
 - **Stateful.** The client sends **only the new turn(s)** plus the session id in the **`session_id`
   body field**. The server reads the session's stored history, prepends it to the new messages, and
   dispatches the **full reconstructed context** to the worker (`session_id` itself never crosses the
-  gRPC wire — `Job.Messages` is expanded before dispatch). After a **successful** response
-  (non-streaming) or after the **terminal chunk** (streaming), it persists each new request message
-  **and** the assistant reply (content + any `tool_calls`) so the next turn sees them. A failed
-  inference persists nothing. Persistence (`AppendTurn`) errors are logged and **never fail** the
-  inference response the client already received.
+  gRPC wire — `Job.Messages` is expanded before dispatch). A turn is persisted **atomically** — each new
+  request message **and** the assistant reply (content + any `tool_calls`) together — and **only on
+  success**: after a successful response (non-streaming) or after a genuine **terminal chunk**
+  (streaming). A failed inference persists nothing. For streaming this is gated on observing the
+  terminal `Done` chunk (and the request context not being cancelled), not merely on the chunk channel
+  closing: a **mid-stream client disconnect** closes the stream with no error frame and no terminal
+  chunk, so the upstream job is aborted and **nothing is persisted** — no orphaned user turn and no
+  truncated assistant reply. The session therefore stays consistent and the client can simply **retry**
+  the turn. Persistence (`AppendTurn`) errors are logged and **never fail** the inference response the
+  client already received.
 
 The header and body are **mutually-exclusive intents**; if both are set the **body wins** (stateful),
 and the id still tags `Job.SessionID` so a stateful conversation also routes to its warm worker. With
