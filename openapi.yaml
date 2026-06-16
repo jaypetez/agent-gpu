@@ -570,6 +570,32 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/stats:
+    get:
+      operationId: adminGetStats
+      summary: Get fleet and queue stats
+      description: |
+        Returns a consolidated, operator-facing monitoring snapshot read live (no caching): the
+        global job-queue depth (total plus a per-priority breakdown), per-worker load, and the
+        time-in-queue distribution. The wait-time distribution covers only jobs that were queued and
+        then placed on a worker — the synchronous fast path (never queued) is deliberately excluded.
+        Contains no secrets. Requires the admin role.
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The consolidated queue-depth, per-worker-load, and time-in-queue snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminStatsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1604,3 +1630,140 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AdminWorkerView"
+
+    AdminStatsResponse:
+      type: object
+      description: |
+        A consolidated, operator-facing monitoring snapshot read live (no caching): queue depth,
+        per-worker load, and the time-in-queue distribution. Contains no secrets.
+      required:
+        - queue
+        - workers
+        - wait_time
+      properties:
+        queue:
+          $ref: "#/components/schemas/AdminQueueStats"
+        workers:
+          type: array
+          description: Per-worker load across the fleet.
+          items:
+            $ref: "#/components/schemas/AdminStatWorker"
+        wait_time:
+          $ref: "#/components/schemas/AdminWaitTime"
+
+    AdminQueueStats:
+      type: object
+      description: |
+        The queue-depth section: the total pending jobs plus a per-priority breakdown.
+      required:
+        - total
+        - by_priority
+      properties:
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The total number of jobs currently pending in the queue.
+        by_priority:
+          type: object
+          description: |
+            The pending-job count keyed by priority level name. Keys are `low`, `normal`, and `high`;
+            only levels with at least one pending item appear.
+          additionalProperties:
+            type: integer
+            format: int64
+            minimum: 0
+
+    AdminStatWorker:
+      type: object
+      description: |
+        The per-worker load projection in the stats response: id, in-flight jobs, reported load, and
+        status. VRAM and model detail are intentionally omitted here (available via `GET
+        /v1/admin/workers`).
+      required:
+        - id
+        - active_jobs
+        - load
+        - status
+      properties:
+        id:
+          type: string
+          description: The worker id.
+        active_jobs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of jobs the worker is currently running.
+        load:
+          type: integer
+          format: int64
+          minimum: 0
+          description: A coarse 0-100 utilization value.
+        status:
+          type: string
+          description: The worker's lifecycle state.
+          enum:
+            - online
+            - draining
+            - stale
+            - unknown
+
+    AdminWaitTime:
+      type: object
+      description: |
+        The time-in-queue (wait-time) section: count, sum, max, and mean (all in milliseconds) over
+        jobs that were placed from the queue — the synchronous fast path is excluded — plus the
+        cumulative le-bucketed histogram.
+      required:
+        - count
+        - sum_ms
+        - max_ms
+        - mean_ms
+        - buckets
+      properties:
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of placed-from-queue jobs whose wait was recorded.
+        sum_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The sum of all recorded queue waits, in milliseconds.
+        max_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The longest recorded queue wait, in milliseconds.
+        mean_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The mean recorded queue wait, in milliseconds (0 when no waits are recorded).
+        buckets:
+          type: array
+          description: The cumulative le-bucketed wait-time histogram, smallest bound first.
+          items:
+            $ref: "#/components/schemas/AdminWaitBucket"
+
+    AdminWaitBucket:
+      type: object
+      description: |
+        One cumulative histogram bucket: the count of recorded queue waits less than or equal to
+        `le_ms`. A `le_ms` of `0` is the sentinel for the `+Inf` bucket (it holds every recorded
+        wait, so its count equals `wait_time.count`).
+      required:
+        - le_ms
+        - count
+      properties:
+        le_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The bucket's inclusive upper bound in milliseconds; `0` means `+Inf`.
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of recorded waits less than or equal to `le_ms`.

@@ -55,6 +55,7 @@ import (
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/session"
@@ -63,13 +64,17 @@ import (
 )
 
 // fleetSource is the subset of *server.Server the HTTP layer needs: a
-// point-in-time snapshot of the fleet plus the operator-initiated drain used by
-// the admin API (#4). Narrowing to an interface keeps the handlers testable
-// without standing up a full gRPC server and documents the only coupling
-// between this package and the control plane. *server.Server satisfies it.
+// point-in-time snapshot of the fleet, the operator-initiated drain used by the
+// admin API (#4), and the queue-depth and time-in-queue snapshots the admin
+// stats endpoint reports (#10). Narrowing to an interface keeps the handlers
+// testable without standing up a full gRPC server and documents the only
+// coupling between this package and the control plane. *server.Server satisfies
+// it.
 type fleetSource interface {
 	Fleet() []types.Worker
 	DrainWorker(id string) error
+	QueueStats() queue.Stats
+	WaitTimeStats() server.WaitTimeStats
 }
 
 // inferenceEngine is the subset of *server.Server the chat/completions handlers
@@ -207,6 +212,7 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /v1/admin/keys/{id}/quota", s.admin(s.handleAdminGetQuota))
 	mux.Handle("GET /v1/admin/workers", s.admin(s.handleAdminListWorkers))
 	mux.Handle("POST /v1/admin/workers/{id}/drain", s.admin(s.handleAdminDrainWorker))
+	mux.Handle("GET /v1/admin/stats", s.admin(s.handleAdminStats))
 }
 
 // ListenAndServe binds s.listen and serves until the listener is closed or

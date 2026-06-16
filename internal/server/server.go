@@ -340,6 +340,18 @@ type Server struct {
 	affinityHits   uint64
 	affinityMisses uint64
 
+	// waitMu guards the time-in-queue distribution below: the count of placed-
+	// from-queue jobs, the running sum and max of their queue wait (ms), and the
+	// cumulative per-bucket counts (parallel to waitBucketBounds). Only jobs that
+	// actually queued and were later placed by the placement loop are recorded —
+	// the synchronous fast path (a worker fit immediately, wait ≈ 0) is excluded so
+	// it does not swamp the distribution. It is the observability seam for #24.
+	waitMu      sync.Mutex
+	waitCount   uint64
+	waitSumMs   uint64
+	waitMaxMs   uint64
+	waitBuckets []uint64 // cumulative counts, parallel to waitBucketBounds
+
 	// now is the injectable clock used for heartbeat stamping and eviction
 	// (defaults to time.Now). Tests fast-forward it instead of sleeping.
 	now func() time.Time
@@ -358,6 +370,15 @@ type Server struct {
 	// transition that does not depend on observing the brief draining→removed
 	// window through a polling race.
 	onDrain func(workerID string)
+	// onDequeueForPlacement, if set, is invoked with a job's id the moment the
+	// placement loop pops it from the queue to attempt placement — before it parks
+	// waiting for a runnable worker. nil by default; set via WithPlacementObserver.
+	// It is a synchronization seam (chiefly for tests of the time-in-queue
+	// distribution): a queued item leaves the queue the instant the placement loop
+	// dequeues it, so QueueStats().Total drops to zero before a poller can observe
+	// it; this hook gives a deterministic "the job is now queued-and-being-placed"
+	// edge to gate a clock advance on, without racing that window.
+	onDequeueForPlacement func(jobID string)
 
 	mu      sync.RWMutex
 	workers map[string]*worker // by worker id
@@ -521,6 +542,27 @@ func WithDrainObserver(fn func(workerID string)) Option {
 	}
 }
 
+// waitBucketBounds are the fixed cumulative upper bounds (in milliseconds) of the
+// time-in-queue histogram, smallest-first. A job's wait is counted in every
+// bucket whose bound is >= the wait, plus a conceptual +Inf bucket (WaitTimeStats
+// appends it explicitly, see WaitBucket.LeMs == 0). Mirrors a Prometheus
+// le-bucketed histogram so #24 can scrape it directly.
+var waitBucketBounds = []uint64{10, 100, 1000, 10000}
+
+// WithPlacementObserver registers a callback invoked with a job's id the instant
+// the placement loop dequeues it to attempt placement (before it parks waiting
+// for a runnable worker). A nil callback is ignored. Primarily a test seam: it
+// gives a deterministic synchronization edge on "the job has been queued and is
+// now being placed", which a QueueStats().Total poll cannot reliably catch
+// because the item leaves the queue the moment it is dequeued.
+func WithPlacementObserver(fn func(jobID string)) Option {
+	return func(s *Server) {
+		if fn != nil {
+			s.onDequeueForPlacement = fn
+		}
+	}
+}
+
 // New constructs a Server.
 func New(opts ...Option) *Server {
 	s := &Server{
@@ -535,6 +577,7 @@ func New(opts ...Option) *Server {
 		capacity:         make(chan struct{}, 1),
 		placeStop:        make(chan struct{}),
 		placeDone:        make(chan struct{}),
+		waitBuckets:      make([]uint64, len(waitBucketBounds)),
 	}
 	for _, o := range opts {
 		o(s)
@@ -549,7 +592,10 @@ func New(opts ...Option) *Server {
 		s.placeScan = s.evictScan
 	}
 	if s.queue == nil {
-		s.queue = queue.New()
+		// Stamp enqueue times against the server's (possibly injected) clock so the
+		// wait-time distribution recorded in placeItem is measured on one clock and
+		// tests can advance it deterministically.
+		s.queue = queue.New(queue.WithClock(s.now))
 	}
 	// Default the authorizer to one auditing through the (possibly overridden)
 	// server logger, after options have run.
@@ -1025,6 +1071,13 @@ func (s *Server) placeLoop() {
 			// ErrClosed (queue closed on shutdown) or ctx cancelled: stop.
 			return
 		}
+		// Announce the dequeue-for-placement edge (test sync seam): the item has
+		// left the queue and a worker is about to be sought. Fired before placeItem
+		// parks so a test can gate a clock advance on it without racing the window
+		// where QueueStats().Total has already dropped to zero.
+		if s.onDequeueForPlacement != nil {
+			s.onDequeueForPlacement(item.Job.ID)
+		}
 		s.placeItem(ctx, item)
 	}
 }
@@ -1067,6 +1120,11 @@ func (s *Server) placeItem(ctx context.Context, item queue.Item) {
 			} else {
 				// Record/update the session binding only after a successful turn.
 				s.recordAffinity(ctx, item.Job, item.Key, w.id, preferred)
+				// Record the time this job spent queued before being placed, measured
+				// on the same (injected) clock that stamped EnqueuedAt. Only this
+				// dequeue→dispatch path records: the synchronous fast path never
+				// queued, so its near-zero wait is excluded from the distribution.
+				s.recordWait(s.now().Sub(item.EnqueuedAt))
 			}
 			s.resolveWaiter(res)
 			return
@@ -1116,6 +1174,76 @@ func (s *Server) AffinityStats() AffinityStats {
 	s.affinityMu.Lock()
 	defer s.affinityMu.Unlock()
 	return AffinityStats{Hits: s.affinityHits, Misses: s.affinityMisses}
+}
+
+// WaitBucket is one cumulative bucket of the time-in-queue histogram: Count is
+// the number of placed-from-queue jobs whose queue wait was <= LeMs. A LeMs of 0
+// is the sentinel for the +Inf bucket (every recorded job falls in it), so its
+// Count always equals WaitTimeStats.Count.
+type WaitBucket struct {
+	LeMs  uint64 // bucket upper bound in ms; 0 means +Inf
+	Count uint64 // cumulative count of waits <= LeMs (or all, for +Inf)
+}
+
+// WaitTimeStats is an observable snapshot of the time a job spent queued before
+// it was placed on a worker (the dequeue→dispatch path only — the synchronous
+// fast path, which never queues, is excluded). Count/SumMs/MaxMs summarize the
+// distribution; Buckets are the cumulative le-bucketed histogram (the trailing
+// entry, LeMs == 0, is the +Inf bucket). It mirrors AffinityStats as the metrics
+// seam for #24 (Prometheus).
+type WaitTimeStats struct {
+	Count   uint64
+	SumMs   uint64
+	MaxMs   uint64
+	Buckets []WaitBucket
+}
+
+// recordWait folds one placed-from-queue job's queue wait into the time-in-queue
+// distribution: it bumps the count, adds the wait (in ms) to the running sum,
+// raises the max, and increments every cumulative bucket whose bound is >= the
+// wait. Only the placement (was-queued) path calls it; the fast path is excluded
+// so a flood of near-zero waits does not swamp the distribution. A negative wait
+// (clock skew) is clamped to zero. The critical section is a handful of integer
+// updates so the hot path lock is held only briefly.
+func (s *Server) recordWait(d time.Duration) {
+	ms := d.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	waitMs := uint64(ms)
+
+	s.waitMu.Lock()
+	s.waitCount++
+	s.waitSumMs += waitMs
+	if waitMs > s.waitMaxMs {
+		s.waitMaxMs = waitMs
+	}
+	for i, bound := range waitBucketBounds {
+		if waitMs <= bound {
+			s.waitBuckets[i]++
+		}
+	}
+	s.waitMu.Unlock()
+}
+
+// WaitTimeStats returns a point-in-time copy of the time-in-queue distribution.
+// Buckets are cumulative and ordered smallest-bound-first, with a trailing +Inf
+// bucket (LeMs == 0) whose count equals Count.
+func (s *Server) WaitTimeStats() WaitTimeStats {
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	buckets := make([]WaitBucket, 0, len(waitBucketBounds)+1)
+	for i, bound := range waitBucketBounds {
+		buckets = append(buckets, WaitBucket{LeMs: bound, Count: s.waitBuckets[i]})
+	}
+	// The +Inf bucket holds every recorded wait (LeMs == 0 is the sentinel).
+	buckets = append(buckets, WaitBucket{LeMs: 0, Count: s.waitCount})
+	return WaitTimeStats{
+		Count:   s.waitCount,
+		SumMs:   s.waitSumMs,
+		MaxMs:   s.waitMaxMs,
+		Buckets: buckets,
+	}
 }
 
 // Fleet returns a point-in-time snapshot of every connected worker, including

@@ -11,6 +11,8 @@ import (
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/queue"
+	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 )
@@ -27,6 +29,10 @@ type fakeFleet struct {
 	drainErr error
 	// drained records the id DrainWorker was last called with.
 	drained string
+	// queueStats and waitStats back the consolidated admin stats endpoint (#10);
+	// the zero values model an empty queue / no recorded waits.
+	queueStats queue.Stats
+	waitStats  server.WaitTimeStats
 }
 
 func (f *fakeFleet) Fleet() []types.Worker { return f.snapshot }
@@ -35,6 +41,10 @@ func (f *fakeFleet) DrainWorker(id string) error {
 	f.drained = id
 	return f.drainErr
 }
+
+func (f *fakeFleet) QueueStats() queue.Stats { return f.queueStats }
+
+func (f *fakeFleet) WaitTimeStats() server.WaitTimeStats { return f.waitStats }
 
 // testServer builds an httpapi.Server wired to the fake fleet and a real auth
 // service + authorizer over an in-memory store, plus a discarding logger.
