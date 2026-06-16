@@ -119,6 +119,97 @@ entry, and models a key cannot use are hidden. Output is sorted by name for dete
 Both require a valid key and are permission-filtered per key. Responses never include secrets,
 tokens, or hashes.
 
+## OpenAI-compatible API
+
+On top of model discovery, `internal/httpapi` serves the inference surface an unmodified OpenAI
+client library can target with only a base-URL + key change: `POST /v1/chat/completions`,
+`POST /v1/completions`, and the `GET /v1/models` catalog above. Every route is behind the same Bearer
+auth middleware, and authorization + quota are enforced by the control-plane server's
+`SubmitAuthorizedJob` / `SubmitAuthorizedJobStream` — the HTTP layer never re-implements them. The
+inference parameters not yet plumbed to Ollama (`temperature`, `top_p`, `max_tokens`, …) are accepted
+and ignored rather than rejected, so clients that send them still work; wiring them through is a
+documented seam.
+
+### Endpoints
+
+- `POST /v1/chat/completions` — the chat surface. Request:
+  `{"model","messages":[{role,content,name?,tool_call_id?,tool_calls?}],"stream"?,"tools"?}`.
+  Non-streaming response is `object:"chat.completion"` with
+  `choices:[{index,message:{role:"assistant",content,tool_calls?},finish_reason}]` and a `usage`
+  object.
+- `POST /v1/completions` — the legacy text-completion surface. The `prompt` maps onto the plain
+  `Job.Prompt` path (no messages), so the foundational dispatch path and the echo stub run unchanged.
+  Response is `object:"text_completion"` with `choices:[{text,index,finish_reason}]` and `usage`.
+- `GET /v1/models` — the OpenAI-canonical catalog (see above), kept working unchanged.
+
+Response `id`s are `chatcmpl-`/`cmpl-` (and an internal `job-` job id) plus `crypto/rand` hex, so they
+are unguessable and globally unique without coordination; `created` is unix seconds.
+
+### Request ↔ job mapping
+
+The HTTP request is translated into a transport-neutral `types.Job` and threaded through the gRPC
+control stream to the worker:
+
+- chat → `Job.Messages` (the full conversation: `role`, `content`, and for tool turns `tool_call_id` /
+  `name` / replayed `tool_calls`) plus `Job.Tools` (function definitions, `parameters` carried as an
+  opaque JSON-schema string so the schema passes through unchanged). `Job.Prompt` is left empty.
+- completion → `Job.Prompt`; `Messages`/`Tools` empty.
+
+The worker's `OllamaExecutor` runs a chat job against Ollama `/api/chat` (which supports tools) with
+the full message array, and a prompt-only job by wrapping the prompt as a single user turn. The proto
+`Job`/`JobResult`/`JobChunk` were extended **additively** (new field numbers) with `messages`,
+`tools`, `tool_calls`, `finish_reason`, and the `prompt_tokens`/`completion_tokens` split, so existing
+prompt-only callers and the echo path are unaffected.
+
+The response is built from the job result: assistant `content` from the accumulated output, assistant
+`tool_calls` from the model's emitted calls (a missing id is filled with a generated `call_` id so
+clients can correlate the subsequent tool-result message), and `finish_reason` from the worker's
+mapped reason (`stop` / `length` / `tool_calls`; empty normalizes to `stop`). `usage` comes from
+Ollama's `prompt_eval_count` / `eval_count`; when only a total is reported (e.g. the echo stub) it
+lands in `completion_tokens` and `total_tokens` with `prompt_tokens` zero.
+
+### SSE streaming
+
+With `stream:true`, the handler calls `SubmitAuthorizedJobStream` — which authorizes and reserves
+quota **before** any worker is touched — then subscribes to the job's live `JobChunk` stream and
+emits Server-Sent Events. Headers (`Content-Type: text/event-stream`, `Cache-Control: no-cache`,
+`Connection: keep-alive`) are written before the first frame, each frame is an
+`data: <json>\n\n` line flushed via `http.Flusher` **as each chunk arrives** (no full-response
+buffering), and the stream terminates with the literal `data: [DONE]\n\n` sentinel.
+
+For chat the first frame carries `delta:{role:"assistant"}`, subsequent frames carry
+`delta:{content:"…"}` (and/or `tool_calls`), the terminal chunk sets `finish_reason`, and every frame
+is `object:"chat.completion.chunk"`. Completion frames are `object:"text_completion"` with the delta
+in `choices[].text`. Cancelling the request context (client disconnect) propagates to
+`SubmitAuthorizedJobStream`, which detaches the observer and aborts the upstream dispatch so the
+worker can stop.
+
+### Error → status mapping
+
+Submit-path errors map to HTTP status with a stable machine `code` and a generic message (no internal
+detail leaks):
+
+| Error | Status | Code |
+| --- | --- | --- |
+| `auth.ErrUnauthenticated` (middleware) | 401 | `unauthorized` |
+| `authz.ErrForbidden` | 403 | `forbidden` |
+| `quota.ErrQuotaExceeded` | 429 | `rate_limit_exceeded` |
+| `queue.ErrQueueFull` / `server.ErrShuttingDown` | 503 | `unavailable` |
+| `types.ErrInvalidJob` / malformed body | 400 | `invalid_request_error` |
+| anything else | 500 | `internal_error` |
+
+For a streaming request the mapping applies only **before the first byte**: if gating fails the client
+gets the JSON error + status as normal. Once SSE headers are sent, a mid-stream upstream failure is
+surfaced as a terminal chunk with `finish_reason:"error"` followed by `[DONE]`, so the client's stream
+parser ends cleanly rather than hanging.
+
+### Out of scope / seams
+
+The formal OpenAPI 3.1 spec (#14), admin endpoints (#4), and dedicated HTTP rate-limit middleware (#6)
+are out of scope here; the typed `code`s, the `usage` object, and the unplumbed inference parameters
+are the seams those land on. Quota is already enforced (and `429`-mapped) because
+`SubmitAuthorizedJob*` reserves against it.
+
 ## Capacity-aware scheduling
 
 The scheduler (`internal/scheduler`) is the placement core: a **pure, deterministic** function that,

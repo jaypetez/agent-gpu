@@ -52,9 +52,11 @@ func (e EchoExecutor) Execute(_ context.Context, job types.Job, emit func(types.
 		emit(types.JobChunk{JobID: job.ID, Delta: output})
 	}
 	return types.JobResult{
-		JobID:  job.ID,
-		Output: output,
-		Tokens: tokens,
+		JobID:            job.ID,
+		Output:           output,
+		Tokens:           tokens,
+		CompletionTokens: tokens,
+		FinishReason:     "stop",
 	}
 }
 
@@ -79,22 +81,62 @@ func NewOllamaExecutor(client *ollama.Client) *OllamaExecutor {
 }
 
 // Execute streams chat inference for the job against Ollama, emitting a delta
-// chunk per produced token. It returns the accumulated output plus the token
-// count Ollama reports (eval_count + prompt_eval_count). On failure it returns a
-// JobResult carrying the mapped *types.JobError; the worker turns that into a
-// terminal error chunk so the waiter never hangs.
+// chunk per produced token (and per tool-call delta). A chat job (job.Messages
+// non-empty) threads the full conversation plus tools to Ollama /api/chat; a
+// prompt-only job (the /v1/completions and #11 path) wraps job.Prompt as a
+// single user message. It returns the accumulated output, the token split, any
+// tool calls the model emitted, and an OpenAI finish_reason derived from
+// Ollama's done_reason. On failure it returns a JobResult carrying the mapped
+// *types.JobError; the worker turns that into a terminal error chunk so the
+// waiter never hangs.
 func (e *OllamaExecutor) Execute(ctx context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
+	messages := job.Messages
+	if len(messages) == 0 {
+		// Prompt-only job: present it to Ollama as a single user turn.
+		messages = []types.Message{{Role: "user", Content: job.Prompt}}
+	}
+
 	var sb strings.Builder
-	tokens, err := e.client.Chat(ctx, job.Model, job.Prompt, func(delta string) {
+	res, err := e.client.ChatStream(ctx, ollama.ChatRequest{
+		Model:    job.Model,
+		Messages: messages,
+		Tools:    job.Tools,
+	}, func(delta string, calls []types.ToolCall) {
 		sb.WriteString(delta)
-		if emit != nil {
-			emit(types.JobChunk{JobID: job.ID, Delta: delta})
+		if emit != nil && (delta != "" || len(calls) > 0) {
+			emit(types.JobChunk{JobID: job.ID, Delta: delta, ToolCalls: calls})
 		}
 	})
 	if err != nil {
-		return types.JobResult{JobID: job.ID, Output: sb.String(), Err: jobError(err), Tokens: tokens}
+		return types.JobResult{JobID: job.ID, Output: sb.String(), Err: jobError(err), Tokens: res.Tokens}
 	}
-	return types.JobResult{JobID: job.ID, Output: sb.String(), Tokens: tokens}
+	return types.JobResult{
+		JobID:            job.ID,
+		Output:           sb.String(),
+		Tokens:           res.Tokens,
+		PromptTokens:     res.PromptTokens,
+		CompletionTokens: res.CompletionTokens,
+		ToolCalls:        res.ToolCalls,
+		FinishReason:     finishReason(res),
+	}
+}
+
+// finishReason derives the OpenAI finish_reason from a chat result. A tool call
+// always takes precedence (OpenAI reports "tool_calls" even when Ollama's
+// done_reason is "stop"); otherwise Ollama's done_reason maps through, with
+// "length" preserved and an empty/"stop" reason normalized to "stop".
+func finishReason(res ollama.ChatResult) string {
+	if len(res.ToolCalls) > 0 {
+		return "tool_calls"
+	}
+	switch res.DoneReason {
+	case "length":
+		return "length"
+	case "", "stop":
+		return "stop"
+	default:
+		return res.DoneReason
+	}
 }
 
 // Version reports the running Ollama version. It satisfies the worker's

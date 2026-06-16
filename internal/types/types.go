@@ -19,11 +19,54 @@ type Model struct {
 	Digest string
 }
 
-// Job is a single unit of inference work.
+// Message is one entry in an OpenAI-style chat conversation. It is transport-
+// neutral: the public API maps OpenAI request messages onto it, the worker
+// threads it to Ollama /api/chat, and Ollama tool calls map back onto a
+// response Message's ToolCalls.
+type Message struct {
+	Role       string
+	Content    string
+	ToolCallID string
+	Name       string
+	ToolCalls  []ToolCall
+}
+
+// Tool is a function the model may call (OpenAI function-calling). Only function
+// tools exist today.
+type Tool struct {
+	Type     string // "function"
+	Function ToolFunction
+}
+
+// ToolFunction is a JSON-schema function definition. Parameters is the raw
+// JSON-schema parameter object encoded as a JSON string so the schema passes
+// through unchanged end-to-end.
+type ToolFunction struct {
+	Name        string
+	Description string
+	Parameters  string // JSON-encoded JSON-schema object
+}
+
+// ToolCall is a function invocation the model emitted, or a prior assistant
+// tool call replayed back to the model. Arguments is the raw JSON arguments
+// string.
+type ToolCall struct {
+	ID           string
+	Type         string // "function"
+	FunctionName string
+	Arguments    string // JSON-encoded arguments
+}
+
+// Job is a single unit of inference work. Prompt backs /v1/completions and the
+// foundational stub; Messages+Tools back /v1/chat/completions. A chat job
+// carries Messages (Prompt empty); a completion job carries Prompt (Messages
+// empty). The two are additive — existing prompt-only callers are unaffected.
 type Job struct {
-	ID     string
-	Model  string
-	Prompt string
+	ID       string
+	Model    string
+	Prompt   string
+	Messages []Message
+	Tools    []Tool
 }
 
 // JobError is a structured, transport-neutral job failure. It implements the
@@ -54,6 +97,17 @@ type JobResult struct {
 	// whitespace token count; real counts arrive with Ollama (#11). Zero means
 	// "no tokens reported".
 	Tokens uint64
+	// ToolCalls are the function calls the model emitted (OpenAI function-
+	// calling); empty for an ordinary text completion.
+	ToolCalls []ToolCall
+	// FinishReason is the OpenAI finish_reason ("stop", "length", "tool_calls").
+	// Empty when the worker reports none.
+	FinishReason string
+	// PromptTokens/CompletionTokens are the prompt/completion token split for
+	// OpenAI usage accounting; Tokens above remains the total used for quota.
+	// Zero when unknown.
+	PromptTokens     uint64
+	CompletionTokens uint64
 }
 
 // JobChunk is an incremental piece of a streaming job's output, sent
@@ -67,6 +121,14 @@ type JobChunk struct {
 	Done   bool
 	Err    *JobError
 	Tokens uint64
+	// ToolCalls/FinishReason are carried on the terminal chunk so a streaming
+	// function call surfaces as delta tool_calls plus finish_reason "tool_calls".
+	ToolCalls    []ToolCall
+	FinishReason string
+	// PromptTokens/CompletionTokens are the terminal-chunk token split for OpenAI
+	// usage accounting.
+	PromptTokens     uint64
+	CompletionTokens uint64
 }
 
 // Heartbeat is a worker's periodic liveness-and-capacity report. It mirrors the
@@ -177,9 +239,161 @@ func ModelsToProto(ms []Model) []*agentgpuv1.Model {
 	return out
 }
 
+// ---- chat message / tool conversions ----
+
+// Proto converts a ToolCall to its protobuf representation.
+func (t ToolCall) Proto() *agentgpuv1.ToolCall {
+	return &agentgpuv1.ToolCall{
+		Id:            t.ID,
+		Type:          t.Type,
+		FunctionName:  t.FunctionName,
+		ArgumentsJson: t.Arguments,
+	}
+}
+
+// ToolCallFromProto converts a protobuf ToolCall to the domain type.
+func ToolCallFromProto(p *agentgpuv1.ToolCall) ToolCall {
+	if p == nil {
+		return ToolCall{}
+	}
+	return ToolCall{
+		ID:           p.GetId(),
+		Type:         p.GetType(),
+		FunctionName: p.GetFunctionName(),
+		Arguments:    p.GetArgumentsJson(),
+	}
+}
+
+// ToolCallsToProto converts a slice of domain ToolCalls to protobuf.
+func ToolCallsToProto(ts []ToolCall) []*agentgpuv1.ToolCall {
+	if len(ts) == 0 {
+		return nil
+	}
+	out := make([]*agentgpuv1.ToolCall, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.Proto())
+	}
+	return out
+}
+
+// ToolCallsFromProto converts a slice of protobuf ToolCalls to domain.
+func ToolCallsFromProto(ps []*agentgpuv1.ToolCall) []ToolCall {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, ToolCallFromProto(p))
+	}
+	return out
+}
+
+// Proto converts a Message to its protobuf representation.
+func (m Message) Proto() *agentgpuv1.ChatMessage {
+	return &agentgpuv1.ChatMessage{
+		Role:       m.Role,
+		Content:    m.Content,
+		ToolCallId: m.ToolCallID,
+		Name:       m.Name,
+		ToolCalls:  ToolCallsToProto(m.ToolCalls),
+	}
+}
+
+// MessageFromProto converts a protobuf ChatMessage to the domain type.
+func MessageFromProto(p *agentgpuv1.ChatMessage) Message {
+	if p == nil {
+		return Message{}
+	}
+	return Message{
+		Role:       p.GetRole(),
+		Content:    p.GetContent(),
+		ToolCallID: p.GetToolCallId(),
+		Name:       p.GetName(),
+		ToolCalls:  ToolCallsFromProto(p.GetToolCalls()),
+	}
+}
+
+func messagesToProto(ms []Message) []*agentgpuv1.ChatMessage {
+	if len(ms) == 0 {
+		return nil
+	}
+	out := make([]*agentgpuv1.ChatMessage, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.Proto())
+	}
+	return out
+}
+
+func messagesFromProto(ps []*agentgpuv1.ChatMessage) []Message {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]Message, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, MessageFromProto(p))
+	}
+	return out
+}
+
+// Proto converts a Tool to its protobuf representation.
+func (t Tool) Proto() *agentgpuv1.Tool {
+	return &agentgpuv1.Tool{
+		Type: t.Type,
+		Function: &agentgpuv1.ToolFunction{
+			Name:           t.Function.Name,
+			Description:    t.Function.Description,
+			ParametersJson: t.Function.Parameters,
+		},
+	}
+}
+
+// ToolFromProto converts a protobuf Tool to the domain type.
+func ToolFromProto(p *agentgpuv1.Tool) Tool {
+	if p == nil {
+		return Tool{}
+	}
+	fn := p.GetFunction()
+	return Tool{
+		Type: p.GetType(),
+		Function: ToolFunction{
+			Name:        fn.GetName(),
+			Description: fn.GetDescription(),
+			Parameters:  fn.GetParametersJson(),
+		},
+	}
+}
+
+func toolsToProto(ts []Tool) []*agentgpuv1.Tool {
+	if len(ts) == 0 {
+		return nil
+	}
+	out := make([]*agentgpuv1.Tool, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.Proto())
+	}
+	return out
+}
+
+func toolsFromProto(ps []*agentgpuv1.Tool) []Tool {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]Tool, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, ToolFromProto(p))
+	}
+	return out
+}
+
 // Proto converts a Job to its protobuf representation.
 func (j Job) Proto() *agentgpuv1.Job {
-	return &agentgpuv1.Job{Id: j.ID, Model: j.Model, Prompt: j.Prompt}
+	return &agentgpuv1.Job{
+		Id:       j.ID,
+		Model:    j.Model,
+		Prompt:   j.Prompt,
+		Messages: messagesToProto(j.Messages),
+		Tools:    toolsToProto(j.Tools),
+	}
 }
 
 // JobFromProto converts a protobuf Job to the domain type.
@@ -187,7 +401,13 @@ func JobFromProto(p *agentgpuv1.Job) Job {
 	if p == nil {
 		return Job{}
 	}
-	return Job{ID: p.GetId(), Model: p.GetModel(), Prompt: p.GetPrompt()}
+	return Job{
+		ID:       p.GetId(),
+		Model:    p.GetModel(),
+		Prompt:   p.GetPrompt(),
+		Messages: messagesFromProto(p.GetMessages()),
+		Tools:    toolsFromProto(p.GetTools()),
+	}
 }
 
 // Proto converts a JobError to its protobuf representation. nil maps to nil.
@@ -209,21 +429,29 @@ func JobErrorFromProto(p *agentgpuv1.Error) *JobError {
 // Proto converts a JobResult to its protobuf representation.
 func (r JobResult) Proto() *agentgpuv1.JobResult {
 	return &agentgpuv1.JobResult{
-		JobId:  r.JobID,
-		Output: r.Output,
-		Error:  r.Err.Proto(),
-		Tokens: r.Tokens,
+		JobId:            r.JobID,
+		Output:           r.Output,
+		Error:            r.Err.Proto(),
+		Tokens:           r.Tokens,
+		ToolCalls:        ToolCallsToProto(r.ToolCalls),
+		FinishReason:     r.FinishReason,
+		PromptTokens:     r.PromptTokens,
+		CompletionTokens: r.CompletionTokens,
 	}
 }
 
 // Proto converts a JobChunk to its protobuf representation.
 func (c JobChunk) Proto() *agentgpuv1.JobChunk {
 	return &agentgpuv1.JobChunk{
-		JobId:  c.JobID,
-		Delta:  c.Delta,
-		Done:   c.Done,
-		Error:  c.Err.Proto(),
-		Tokens: c.Tokens,
+		JobId:            c.JobID,
+		Delta:            c.Delta,
+		Done:             c.Done,
+		Error:            c.Err.Proto(),
+		Tokens:           c.Tokens,
+		ToolCalls:        ToolCallsToProto(c.ToolCalls),
+		FinishReason:     c.FinishReason,
+		PromptTokens:     c.PromptTokens,
+		CompletionTokens: c.CompletionTokens,
 	}
 }
 
@@ -233,11 +461,15 @@ func JobChunkFromProto(p *agentgpuv1.JobChunk) JobChunk {
 		return JobChunk{}
 	}
 	return JobChunk{
-		JobID:  p.GetJobId(),
-		Delta:  p.GetDelta(),
-		Done:   p.GetDone(),
-		Err:    JobErrorFromProto(p.GetError()),
-		Tokens: p.GetTokens(),
+		JobID:            p.GetJobId(),
+		Delta:            p.GetDelta(),
+		Done:             p.GetDone(),
+		Err:              JobErrorFromProto(p.GetError()),
+		Tokens:           p.GetTokens(),
+		ToolCalls:        ToolCallsFromProto(p.GetToolCalls()),
+		FinishReason:     p.GetFinishReason(),
+		PromptTokens:     p.GetPromptTokens(),
+		CompletionTokens: p.GetCompletionTokens(),
 	}
 }
 
@@ -276,9 +508,13 @@ func JobResultFromProto(p *agentgpuv1.JobResult) JobResult {
 		return JobResult{}
 	}
 	return JobResult{
-		JobID:  p.GetJobId(),
-		Output: p.GetOutput(),
-		Err:    JobErrorFromProto(p.GetError()),
-		Tokens: p.GetTokens(),
+		JobID:            p.GetJobId(),
+		Output:           p.GetOutput(),
+		Err:              JobErrorFromProto(p.GetError()),
+		Tokens:           p.GetTokens(),
+		ToolCalls:        ToolCallsFromProto(p.GetToolCalls()),
+		FinishReason:     p.GetFinishReason(),
+		PromptTokens:     p.GetPromptTokens(),
+		CompletionTokens: p.GetCompletionTokens(),
 	}
 }

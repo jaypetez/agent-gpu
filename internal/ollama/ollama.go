@@ -218,62 +218,136 @@ func (c *Client) Pull(ctx context.Context, model string) error {
 	return nil
 }
 
-// chatRequest models POST /api/chat. The schema is intentionally minimal for
-// the foundational stub (#11): one user message and streaming on. Richer chat
-// params arrive with the OpenAI-API epic (#13).
+// chatRequest models POST /api/chat. The OpenAI-API epic (#13) carries the full
+// conversation (messages) plus optional tools so chat semantics and function-
+// calling round-trip end-to-end; the foundational prompt path (#11) wraps a
+// single user message via Chat.
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
+	Tools    []chatTool    `json:"tools,omitempty"`
 	Stream   bool          `json:"stream"`
 }
 
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
+	// ToolName carries the function name for a "tool" result message (Ollama
+	// keys it as "tool_name"); OpenAI uses tool_call_id which Ollama ignores.
+	ToolName string `json:"tool_name,omitempty"`
+}
+
+// chatTool / chatToolFunction model Ollama's tool definition, which mirrors
+// OpenAI: {"type":"function","function":{name,description,parameters}}.
+// Parameters is the raw JSON-schema object, passed through unchanged.
+type chatTool struct {
+	Type     string           `json:"type"`
+	Function chatToolFunction `json:"function"`
+}
+
+type chatToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+// chatToolCall models a tool call in Ollama's /api/chat message. Arguments is a
+// JSON object (not a string, unlike OpenAI's wire form); it is re-encoded to a
+// JSON string for the agent-gpu/OpenAI contract.
+type chatToolCall struct {
+	Function chatToolCallFunc `json:"function"`
+}
+
+type chatToolCallFunc struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 // chatResponse models one NDJSON object of the /api/chat stream. Per-token
-// objects carry Message.Content with Done false; the final object carries Done
-// true plus the eval counts. An "error" field signals an in-stream failure.
+// objects carry Message.Content (and possibly Message.ToolCalls) with Done
+// false; the final object carries Done true plus the eval counts and an
+// optional done_reason. An "error" field signals an in-stream failure.
 type chatResponse struct {
 	Message         chatMessage `json:"message"`
 	Done            bool        `json:"done"`
+	DoneReason      string      `json:"done_reason"`
 	EvalCount       uint64      `json:"eval_count"`
 	PromptEvalCount uint64      `json:"prompt_eval_count"`
 	Error           string      `json:"error"`
 }
 
-// Chat runs streaming chat inference for prompt against model. It calls emit
-// once per produced token delta as the NDJSON stream arrives, and returns the
-// total token count (eval_count + prompt_eval_count) reported on the terminal
-// object. The caller's context bounds the call: cancelling it aborts the
-// in-flight HTTP request and stops emitting. A non-nil error is a *types.JobError
-// with a stable code.
+// ChatResult is the structured outcome of a chat stream, surfaced on the
+// terminal object: token split, any tool calls the model emitted, and Ollama's
+// done_reason (mapped to an OpenAI finish_reason by the caller).
+type ChatResult struct {
+	PromptTokens     uint64
+	CompletionTokens uint64
+	Tokens           uint64
+	ToolCalls        []types.ToolCall
+	DoneReason       string
+}
+
+// Chat runs streaming chat inference for a single prompt against model. It is
+// the foundational prompt path (#11): it wraps the prompt as one user message
+// and returns the total token count. Cancelling ctx aborts the request and
+// stops emitting. Richer chat (full message history + tools) goes through
+// ChatStream.
 func (c *Client) Chat(ctx context.Context, model, prompt string, emit func(delta string)) (uint64, error) {
-	reqBody := chatRequest{
+	res, err := c.ChatStream(ctx, ChatRequest{
 		Model:    model,
-		Messages: []chatMessage{{Role: "user", Content: prompt}},
+		Messages: []types.Message{{Role: "user", Content: prompt}},
+	}, func(delta string, _ []types.ToolCall) {
+		if emit != nil && delta != "" {
+			emit(delta)
+		}
+	})
+	if err != nil {
+		return res.Tokens, err
+	}
+	return res.Tokens, nil
+}
+
+// ChatRequest is the input to ChatStream: the model, the full OpenAI-style
+// conversation, and optional tool (function) definitions the model may call.
+type ChatRequest struct {
+	Model    string
+	Messages []types.Message
+	Tools    []types.Tool
+}
+
+// ChatStream runs streaming chat inference for the full conversation against
+// Ollama /api/chat. It calls emit per streamed object with the content delta
+// and any tool-call deltas that object carried. On the terminal object it
+// returns a ChatResult with the token split, accumulated tool calls, and
+// done_reason. Cancelling ctx aborts the in-flight request and stops emitting.
+// A non-nil error is a *types.JobError with a stable code.
+func (c *Client) ChatStream(ctx context.Context, cr ChatRequest, emit func(delta string, toolCalls []types.ToolCall)) (ChatResult, error) {
+	reqBody := chatRequest{
+		Model:    cr.Model,
+		Messages: toOllamaMessages(cr.Messages),
+		Tools:    toOllamaTools(cr.Tools),
 		Stream:   true,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return 0, &types.JobError{Code: CodeInvalidRequest, Message: "marshal chat request: " + err.Error()}
+		return ChatResult{}, &types.JobError{Code: CodeInvalidRequest, Message: "marshal chat request: " + err.Error()}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/chat", bytes.NewReader(body))
 	if err != nil {
-		return 0, c.transportError(err, "build chat request")
+		return ChatResult{}, c.transportError(err, "build chat request")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, c.transportError(err, "contact ollama")
+		return ChatResult{}, c.transportError(err, "contact ollama")
 	}
 	defer drainClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return 0, c.statusError(resp, "chat")
+		return ChatResult{}, c.statusError(resp, "chat")
 	}
 
-	var tokens uint64
+	var result ChatResult
 	scanner := bufio.NewScanner(resp.Body)
 	// Allow long single-line tokens / large objects without erroring on the
 	// default 64KiB limit; partial lines across reads are handled by Scan.
@@ -282,32 +356,120 @@ func (c *Client) Chat(ctx context.Context, model, prompt string, emit func(delta
 		// Honor cancellation between lines so a cancelled job stops emitting
 		// promptly even if the server keeps sending.
 		if ctx.Err() != nil {
-			return tokens, c.transportError(ctx.Err(), "chat cancelled")
+			return result, c.transportError(ctx.Err(), "chat cancelled")
 		}
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
-		var cr chatResponse
-		if err := json.Unmarshal(line, &cr); err != nil {
-			return tokens, &types.JobError{Code: CodeOllamaError, Message: "decode chat chunk: " + err.Error()}
+		var co chatResponse
+		if err := json.Unmarshal(line, &co); err != nil {
+			return result, &types.JobError{Code: CodeOllamaError, Message: "decode chat chunk: " + err.Error()}
 		}
-		if cr.Error != "" {
-			return tokens, c.errorFromMessage(cr.Error)
+		if co.Error != "" {
+			return result, c.errorFromMessage(co.Error)
 		}
-		if cr.Message.Content != "" && emit != nil {
-			emit(cr.Message.Content)
+		calls := fromOllamaToolCalls(co.Message.ToolCalls)
+		if len(calls) > 0 {
+			result.ToolCalls = append(result.ToolCalls, calls...)
 		}
-		if cr.Done {
-			tokens = cr.EvalCount + cr.PromptEvalCount
-			return tokens, nil
+		if (co.Message.Content != "" || len(calls) > 0) && emit != nil {
+			emit(co.Message.Content, calls)
+		}
+		if co.Done {
+			result.PromptTokens = co.PromptEvalCount
+			result.CompletionTokens = co.EvalCount
+			result.Tokens = co.EvalCount + co.PromptEvalCount
+			result.DoneReason = co.DoneReason
+			return result, nil
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return tokens, c.transportError(err, "read chat stream")
+		return result, c.transportError(err, "read chat stream")
 	}
 	// Stream ended without a terminal done object.
-	return tokens, &types.JobError{Code: CodeOllamaError, Message: "chat stream ended without completion"}
+	return result, &types.JobError{Code: CodeOllamaError, Message: "chat stream ended without completion"}
+}
+
+// toOllamaMessages maps domain messages onto the Ollama /api/chat shape. Tool
+// result messages carry the function name (Ollama keys it tool_name); assistant
+// messages replaying prior tool calls carry them through.
+func toOllamaMessages(ms []types.Message) []chatMessage {
+	out := make([]chatMessage, 0, len(ms))
+	for _, m := range ms {
+		cm := chatMessage{Role: m.Role, Content: m.Content, ToolName: m.Name}
+		for _, tc := range m.ToolCalls {
+			cm.ToolCalls = append(cm.ToolCalls, chatToolCall{
+				Function: chatToolCallFunc{
+					Name:      tc.FunctionName,
+					Arguments: rawOrNull(tc.Arguments),
+				},
+			})
+		}
+		out = append(out, cm)
+	}
+	return out
+}
+
+// toOllamaTools maps domain tools onto Ollama's tool definitions, passing the
+// JSON-schema parameter object through unchanged.
+func toOllamaTools(ts []types.Tool) []chatTool {
+	if len(ts) == 0 {
+		return nil
+	}
+	out := make([]chatTool, 0, len(ts))
+	for _, t := range ts {
+		typ := t.Type
+		if typ == "" {
+			typ = "function"
+		}
+		out = append(out, chatTool{
+			Type: typ,
+			Function: chatToolFunction{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				Parameters:  rawOrNil(t.Function.Parameters),
+			},
+		})
+	}
+	return out
+}
+
+// fromOllamaToolCalls maps Ollama's tool calls onto domain ToolCalls,
+// re-encoding the arguments object as a JSON string for the OpenAI contract.
+func fromOllamaToolCalls(calls []chatToolCall) []types.ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]types.ToolCall, 0, len(calls))
+	for _, c := range calls {
+		args := string(c.Function.Arguments)
+		if args == "" {
+			args = "{}"
+		}
+		out = append(out, types.ToolCall{
+			Type:         "function",
+			FunctionName: c.Function.Name,
+			Arguments:    args,
+		})
+	}
+	return out
+}
+
+// rawOrNil returns s as raw JSON, or nil if empty (so the field is omitted).
+func rawOrNil(s string) json.RawMessage {
+	if s == "" {
+		return nil
+	}
+	return json.RawMessage(s)
+}
+
+// rawOrNull returns s as raw JSON, or an empty object if empty.
+func rawOrNull(s string) json.RawMessage {
+	if s == "" {
+		return json.RawMessage("{}")
+	}
+	return json.RawMessage(s)
 }
 
 // transportError maps a transport/context failure to a *types.JobError with a

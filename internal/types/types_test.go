@@ -2,6 +2,7 @@ package types
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
@@ -73,7 +74,7 @@ func TestJobRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := Job{ID: "j1", Model: "llama3", Prompt: "hello"}
 	got := JobFromProto(in.Proto())
-	if got != in {
+	if !reflect.DeepEqual(got, in) {
 		t.Fatalf("round trip mismatch: got %+v want %+v", got, in)
 	}
 }
@@ -108,6 +109,66 @@ func TestModelsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestChatJobRoundTrip proves the OpenAI chat contract (messages + tools and,
+// on the result/chunk, tool_calls + finish_reason + the token split) survives
+// the proto round trip additively, so chat semantics genuinely thread
+// server<->worker.
+func TestChatJobRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	in := Job{
+		ID:    "j1",
+		Model: "llama3",
+		Messages: []Message{
+			{Role: "system", Content: "be terse"},
+			{Role: "user", Content: "weather in paris?"},
+			{Role: "assistant", ToolCalls: []ToolCall{
+				{ID: "call_1", Type: "function", FunctionName: "get_weather", Arguments: `{"city":"paris"}`},
+			}},
+			{Role: "tool", ToolCallID: "call_1", Name: "get_weather", Content: `{"temp":21}`},
+		},
+		Tools: []Tool{
+			{Type: "function", Function: ToolFunction{
+				Name:        "get_weather",
+				Description: "current weather",
+				Parameters:  `{"type":"object","properties":{"city":{"type":"string"}}}`,
+			}},
+		},
+	}
+	if got := JobFromProto(in.Proto()); !reflect.DeepEqual(got, in) {
+		t.Fatalf("chat job round trip mismatch:\n got %+v\nwant %+v", got, in)
+	}
+
+	res := JobResult{
+		JobID:            "j1",
+		FinishReason:     "tool_calls",
+		PromptTokens:     11,
+		CompletionTokens: 3,
+		Tokens:           14,
+		ToolCalls: []ToolCall{
+			{ID: "call_1", Type: "function", FunctionName: "get_weather", Arguments: `{"city":"paris"}`},
+		},
+	}
+	if got := JobResultFromProto(res.Proto()); !reflect.DeepEqual(got, res) {
+		t.Fatalf("chat result round trip mismatch:\n got %+v\nwant %+v", got, res)
+	}
+
+	chunk := JobChunk{
+		JobID:            "j1",
+		Done:             true,
+		FinishReason:     "tool_calls",
+		PromptTokens:     11,
+		CompletionTokens: 3,
+		Tokens:           14,
+		ToolCalls: []ToolCall{
+			{ID: "call_1", Type: "function", FunctionName: "get_weather", Arguments: `{"city":"paris"}`},
+		},
+	}
+	if got := JobChunkFromProto(chunk.Proto()); !reflect.DeepEqual(got, chunk) {
+		t.Fatalf("chat chunk round trip mismatch:\n got %+v\nwant %+v", got, chunk)
+	}
+}
+
 func TestJobResultRoundTrip(t *testing.T) {
 	t.Parallel()
 	t.Run("success", func(t *testing.T) {
@@ -136,7 +197,7 @@ func TestJobResultRoundTrip(t *testing.T) {
 
 func TestNilProtoConversions(t *testing.T) {
 	t.Parallel()
-	if JobFromProto(nil) != (Job{}) {
+	if !reflect.DeepEqual(JobFromProto(nil), Job{}) {
 		t.Fatal("JobFromProto(nil) should be zero value")
 	}
 	if ModelFromProto(nil) != (Model{}) {
@@ -149,7 +210,7 @@ func TestNilProtoConversions(t *testing.T) {
 	if je.Proto() != nil {
 		t.Fatal("(*JobError)(nil).Proto() should be nil")
 	}
-	if JobResultFromProto(nil) != (JobResult{}) {
+	if !reflect.DeepEqual(JobResultFromProto(nil), JobResult{}) {
 		t.Fatal("JobResultFromProto(nil) should be zero value")
 	}
 	// Ensure the generated proto type is actually wired up.

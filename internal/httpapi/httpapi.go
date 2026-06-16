@@ -6,21 +6,28 @@
 //
 // # Scope
 //
-// This package ships model discovery (#12):
+// This package ships the OpenAI-compatible API surface:
 //
-//   - GET /v1/models — the OpenAI-canonical model list.
-//   - GET /models    — a richer internal catalog (digest + per-model worker
-//     availability).
+//   - GET  /v1/models           — the OpenAI-canonical model list (#12).
+//   - GET  /models              — a richer internal catalog (digest + per-model
+//     worker availability) (#12).
+//   - POST /v1/chat/completions — chat completions with messages + function/tool
+//     calling, non-streaming and SSE streaming (#13).
+//   - POST /v1/completions      — legacy text completions, non-streaming and SSE
+//     streaming (#13).
 //
-// Both endpoints require a valid API key (Bearer token) and are
-// permission-filtered per key: a model appears only if the key may run
-// inference against it, using the SAME authorization decision the dispatch path
-// applies (authz.Infer), so a model a key sees in the catalog is exactly a model
-// it may invoke.
+// Every endpoint requires a valid API key (Bearer token). Model discovery is
+// permission-filtered per key — a model appears only if the key may run
+// inference against it (authz.Infer), so a model a key sees in the catalog is
+// exactly a model it may invoke. The inference endpoints gate through the
+// control-plane server's SubmitAuthorizedJob / SubmitAuthorizedJobStream, which
+// enforce the same authorization plus quota before any worker is touched.
 //
-// Chat/completions + SSE streaming (#13), admin endpoints (#4), and HTTP
-// rate-limit enforcement / 429 (#6) are out of scope here; the auth middleware
-// and helpers are designed so those plug in without rework.
+// The formal OpenAPI 3.1 spec (#14), admin endpoints (#4), and dedicated HTTP
+// rate-limit middleware (#6) are out of scope here; quota is already enforced
+// (and 429-mapped) because the submit paths reserve against it. The auth
+// middleware and the JSON/error/SSE helpers are designed so those plug in
+// without rework.
 package httpapi
 
 import (
@@ -32,6 +39,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/server"
+	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 )
 
@@ -43,6 +51,16 @@ type fleetSource interface {
 	Fleet() []types.Worker
 }
 
+// inferenceEngine is the subset of *server.Server the chat/completions handlers
+// need: the gated synchronous and streaming submit paths. Narrowing to an
+// interface keeps the handlers unit-testable with a fake engine and documents
+// exactly what the HTTP layer asks of the control plane. *server.Server
+// satisfies it (SubmitAuthorizedJob and SubmitAuthorizedJobStream).
+type inferenceEngine interface {
+	SubmitAuthorizedJob(ctx context.Context, key store.APIKey, job types.Job) (types.JobResult, error)
+	SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey, job types.Job) (<-chan types.JobChunk, error)
+}
+
 // Server is the agent-gpu HTTP API server. It is constructed with the
 // control-plane server (for the fleet snapshot), the auth service (to
 // authenticate Bearer tokens), and the authorizer (to permission-filter the
@@ -50,6 +68,7 @@ type fleetSource interface {
 // so catalog visibility matches dispatch-time authorization exactly.
 type Server struct {
 	fleet  fleetSource
+	engine inferenceEngine
 	auth   *auth.Service
 	authz  *authz.Authorizer
 	log    *slog.Logger
@@ -74,6 +93,7 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 	}
 	s := &Server{
 		fleet:  grpcSrv,
+		engine: grpcSrv,
 		auth:   authSvc,
 		authz:  az,
 		log:    log,
@@ -97,6 +117,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/models", s.authMiddleware(http.HandlerFunc(s.handleOpenAIModels)))
 	mux.Handle("/models", s.authMiddleware(http.HandlerFunc(s.handleModels)))
+	mux.Handle("/v1/chat/completions", s.authMiddleware(http.HandlerFunc(s.handleChatCompletions)))
+	mux.Handle("/v1/completions", s.authMiddleware(http.HandlerFunc(s.handleCompletions)))
 	return mux
 }
 
