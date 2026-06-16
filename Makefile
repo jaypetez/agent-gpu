@@ -4,9 +4,13 @@
 #   buf                v1.50.0
 #   protoc-gen-go      v1.36.6
 #   protoc-gen-go-grpc v1.5.1
+#   goreleaser         v2.16.0
 BUF_VERSION             := v1.50.0
 PROTOC_GEN_GO_VERSION   := v1.36.6
 PROTOC_GEN_GRPC_VERSION := v1.5.1
+GORELEASER_VERSION      := v2.16.0
+
+GORELEASER ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
 # Redocly CLI (OpenAPI lint + Redoc docs render), pinned by version + digest to
 # match the `openapi` job in .github/workflows/ci.yml.
@@ -58,6 +62,14 @@ vet: ## Run go vet
 .PHONY: tidy
 tidy: ## Tidy go.mod/go.sum
 	$(GO) mod tidy
+
+.PHONY: release-check
+release-check: ## Validate the GoReleaser config (.goreleaser.yaml)
+	$(GORELEASER) check
+
+.PHONY: snapshot
+snapshot: ## Cross-compile all release artifacts locally into dist/ (no publish)
+	$(GORELEASER) build --snapshot --clean
 
 .PHONY: help
 help: ## Show this help

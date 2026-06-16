@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/jaypetez/agent-gpu/internal/version"
 )
 
 func main() {
@@ -29,6 +31,17 @@ func run(args []string) error {
 	if len(args) < 1 {
 		usage()
 		return fmt.Errorf("expected a subcommand")
+	}
+
+	// Handle the informational commands first: they print to stdout and exit
+	// without setting up signal handling, logging, or any subsystem.
+	switch args[0] {
+	case "version", "--version", "-v":
+		fmt.Fprintln(os.Stdout, version.String())
+		return nil
+	case "-h", "--help", "help":
+		usage()
+		return nil
 	}
 
 	// Root context cancelled on SIGINT/SIGTERM for graceful shutdown.
@@ -45,9 +58,6 @@ func run(args []string) error {
 		return runWorkerCmd(ctx, logger, args[1:])
 	case "key":
 		return runKeyCmd(ctx, os.Stdout, args[1:])
-	case "-h", "--help", "help":
-		usage()
-		return nil
 	default:
 		usage()
 		return fmt.Errorf("unknown subcommand %q", args[0])
@@ -67,6 +77,7 @@ Usage:
   agentgpu key perms <id> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--store path]
   agentgpu key quota <id> [--store path] [--quota-path path]
   agentgpu key quota set <id> [--rpm N] [--tpm N] [--daily-tokens N] [--monthly-tokens N] [--store path]
+  agentgpu version
 
 Configuration may also be supplied via environment variables:
   AGENTGPU_SERVER_LISTEN, AGENTGPU_SERVER_ADDR, AGENTGPU_WORKER_ID,
