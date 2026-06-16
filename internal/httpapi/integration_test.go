@@ -53,7 +53,7 @@ func TestEndToEndCatalogReflectsLiveFleet(t *testing.T) {
 	defer gs.Stop()
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, discard, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, discard, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	defer ts.Close()
 
@@ -130,7 +130,7 @@ func TestModelAggregationMultiWorker(t *testing.T) {
 	defer gs.Stop()
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, discard, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, discard, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	defer ts.Close()
 

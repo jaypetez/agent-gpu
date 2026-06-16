@@ -548,12 +548,12 @@ without touching the engine.
 A **session** is a persisted, owner-scoped handle to a model conversation, owned by `internal/session`.
 It is the foundation of the sessions epic. **Session-affinity scheduling is wired** (see
 [Session affinity](#session-affinity-warm-kv-cache) under Capacity-aware scheduling): the `Manager`'s
-`Bind` records a session→worker binding and the scheduler prefers it. `keep_alive` and the HTTP session
-API build on this in later milestones. The session domain model, persistence interfaces +
-in-memory/checkpointing implementations, the lifecycle `Manager`, and the idle-expiry sweeper ship
-here; the cmd/HTTP wiring (constructing the `Manager`, calling `Start`/`Close`, exposing the API, and
-setting `Job.SessionID` on requests) lands with the HTTP session API milestone and is left as a
-documented seam — the server enables affinity via `WithSessionManager` (nil by default = disabled).
+`Bind` records a session→worker binding and the scheduler prefers it. The **HTTP session API is wired**
+too (see [Session API](#session-api-http) below): the cmd layer constructs the `Manager`, runs its
+sweeper (`Start`/`Close`), checkpoints it like the quota counters, and hands the same instance to both
+the control-plane server (`WithSessionManager`, for affinity routing) and the HTTP API (for the
+session CRUD endpoints + stateful chat). `keep_alive` builds on this in a later milestone. The server
+still enables affinity via `WithSessionManager` (nil by default = disabled).
 
 ### Model
 
@@ -618,6 +618,54 @@ the checkpoint cadence: up to one interval of mutations can be lost on an unclea
 sessions already past their TTL are **dropped**, and any history orphaned by a dropped session is
 purged, so a process that was down past a session's idle window does not resurrect it. The store
 interfaces are shaped so a Redis/Postgres backend can slot in later without touching the `Manager`.
+
+### Session API (HTTP)
+
+`internal/httpapi` exposes multi-turn conversations over the public API. Every endpoint is behind the
+same Bearer auth middleware and is **owner-scoped** by the authenticated key id: a session is only ever
+visible to — or mutable by — the key that created it, and a request for a session that is missing,
+owned by another key, or expired returns a uniform `404` (no existence leak). When sessions are
+disabled (`Manager` nil — only in unit tests, never in cmd), the session endpoints return `501` and a
+chat request carrying a session id is rejected `501`.
+
+**Session CRUD:**
+
+- `POST /v1/sessions` — body `{"model":…}` → `201` `{"id":"sess_…","object":"session","model","created"}`.
+- `GET /v1/sessions/{id}` → `200` `{id, object:"session", model, created, last_active, messages:[…]}`,
+  where `messages` is the stored history in the OpenAI message wire shape (so a session can be inspected
+  or replayed verbatim). Missing/not-owned/expired → `404`.
+- `DELETE /v1/sessions/{id}` → `204`, ending the session and **purging its history**. Missing/not-owned
+  → `404`.
+
+**Two conversation modes** on `POST /v1/chat/completions`, distinguished by where the session id rides:
+
+- **Affinity (stateless).** The client keeps the full conversation client-side and sends it in
+  `messages[]` every turn, plus the session id in the **`X-Session-Id` header**. The server stores
+  **nothing**; it only sets `Job.SessionID` so the dispatcher pins the conversation to its warm-cache
+  worker (and rebinds if that worker drains). History reconstruction does not happen — the request's
+  `messages[]` pass through unchanged.
+- **Stateful.** The client sends **only the new turn(s)** plus the session id in the **`session_id`
+  body field**. The server reads the session's stored history, prepends it to the new messages, and
+  dispatches the **full reconstructed context** to the worker (`session_id` itself never crosses the
+  gRPC wire — `Job.Messages` is expanded before dispatch). After a **successful** response
+  (non-streaming) or after the **terminal chunk** (streaming), it persists each new request message
+  **and** the assistant reply (content + any `tool_calls`) so the next turn sees them. A failed
+  inference persists nothing. Persistence (`AppendTurn`) errors are logged and **never fail** the
+  inference response the client already received.
+
+The header and body are **mutually-exclusive intents**; if both are set the **body wins** (stateful),
+and the id still tags `Job.SessionID` so a stateful conversation also routes to its warm worker. With
+neither, behavior is byte-identical to the stateless default. Streaming (SSE) and function/tool calling
+work across turns in both modes — the streaming path accumulates the assistant content + tool-call
+deltas as it emits frames and persists the turn after `[DONE]`.
+
+The cmd wiring mirrors the quota subsystem: `--session-path` / `--session-ttl` flags (resolved via
+`config.ResolveSession`, env `AGENTGPU_SESSION_PATH` / `AGENTGPU_SESSION_TTL`), a checkpoint load at
+boot (dropping expired sessions and purging orphaned history), a periodic 30 s checkpoint goroutine,
+and a checkpoint on graceful shutdown.
+
+> The formal OpenAPI 3.1 spec is a separate milestone (#14); it must include these session endpoints
+> and the two chat modes. This document is the interim contract until that spec lands.
 
 ## State
 
