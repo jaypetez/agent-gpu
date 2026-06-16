@@ -87,9 +87,34 @@ curl http://SERVER_HOST:PORT/v1/chat/completions \
   -d '{"model":"llama3","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
+### Run with Docker
+
+Two minimal, non-root images are built from one multi-stage
+[`Dockerfile`](Dockerfile) and published to GHCR on each release:
+
+```bash
+# Server: the public API + control plane. /data holds key/quota/session state.
+docker run -d -p 8080:8080 -p 50051:50051 -v agentgpu-data:/data \
+  ghcr.io/jaypetez/agent-gpu/server:latest
+
+# Worker: point it at the server (gRPC host:port) and an Ollama that owns the GPU.
+docker run -d \
+  -e AGENTGPU_SERVER_ADDR=server-host:50051 \
+  -e AGENTGPU_OLLAMA_URL=http://host.docker.internal:11434 \
+  ghcr.io/jaypetez/agent-gpu/worker:latest
+```
+
+To build locally instead, select a target: `docker build --target server -t
+agentgpu-server .` (or `--target worker`). Two things to know in containers: the
+server image already binds `0.0.0.0` (the binary defaults to loopback), and the
+worker's `AGENTGPU_OLLAMA_URL` must **not** be `localhost` (that is the worker
+container itself) — use the Ollama service name or `host.docker.internal`. See
+[docs/docker.md](docs/docker.md) for the full guide.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Running with Docker](docs/docker.md)
 - [Releasing](docs/releasing.md)
 - [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Changelog](CHANGELOG.md)
 - Developer Guide — see [#26](https://github.com/jaypetez/agent-gpu/issues/26)

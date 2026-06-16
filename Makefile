@@ -12,8 +12,14 @@ GORELEASER_VERSION      := v2.16.0
 
 GORELEASER ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
-GO  ?= go
-BUF ?= buf
+# Redocly CLI (OpenAPI lint + Redoc docs render), pinned by version + digest to
+# match the `openapi` job in .github/workflows/ci.yml.
+REDOCLY_VERSION := 2.33.2
+REDOCLY_IMAGE   := redocly/cli:$(REDOCLY_VERSION)@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
+
+GO     ?= go
+BUF    ?= buf
+DOCKER ?= docker
 
 .PHONY: all
 all: build test
@@ -32,6 +38,14 @@ proto: ## Regenerate Go stubs from proto/ (commit the result)
 .PHONY: proto-lint
 proto-lint: ## Lint the protobuf definitions
 	$(BUF) lint
+
+.PHONY: openapi-lint
+openapi-lint: ## Validate openapi.yaml (OpenAPI 3.1 + recommended ruleset) via the pinned Redocly image
+	$(DOCKER) run --rm -e REDOCLY_TELEMETRY=off -v "$(CURDIR):/spec" -w /spec $(REDOCLY_IMAGE) lint openapi.yaml
+
+.PHONY: openapi-docs
+openapi-docs: ## Render openapi.yaml to openapi.html (Redoc) via the pinned Redocly image
+	$(DOCKER) run --rm -e REDOCLY_TELEMETRY=off -v "$(CURDIR):/spec" -w /spec $(REDOCLY_IMAGE) build-docs openapi.yaml -o openapi.html
 
 .PHONY: build
 build: ## Build all packages and the agentgpu binary
