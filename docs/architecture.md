@@ -205,10 +205,76 @@ parser ends cleanly rather than hanging.
 
 ### Out of scope / seams
 
-The formal OpenAPI 3.1 spec (#14), admin endpoints (#4), and dedicated HTTP rate-limit middleware (#6)
+The formal OpenAPI 3.1 spec (#14) and dedicated HTTP rate-limit middleware (#6)
 are out of scope here; the typed `code`s, the `usage` object, and the unplumbed inference parameters
 are the seams those land on. Quota is already enforced (and `429`-mapped) because
 `SubmitAuthorizedJob*` reserves against it.
+
+## Admin API
+
+The admin API (`internal/httpapi/admin.go`, #4) is the HTTP control surface for operating the
+gateway: API-key lifecycle (CRUD), per-key quota overrides, roles + per-model allow/deny lists, and
+fleet inspection/drain. It is a thin wrapper over the already-shipped implementations — `auth.Service`
+(keys, permissions, limits), `quota.Engine` (usage snapshot), and `server.Server` (fleet + drain) —
+so #4 adds only the HTTP surface, no new control-plane logic.
+
+### Admin-role gating
+
+Every admin route is mounted behind two middlewares: the shared `authMiddleware` (authenticate the
+Bearer token → `401` on failure) and then `adminMiddleware`, which reads the authenticated key off
+the request context and requires the `admin` role (`authz.RoleAdmin`) → `403` (`forbidden`)
+otherwise. The two responses are cleanly separated: `401` means "who are you", `403` means "you may
+not". An unauthenticated request never reaches the admin gate, and a non-admin key never reaches a
+handler.
+
+### Endpoints
+
+| Method + path | Action |
+| --- | --- |
+| `POST /v1/admin/keys` | Create a key with roles + allow/deny lists → `201` with the one-time token |
+| `GET /v1/admin/keys` | List all keys (metadata only) |
+| `GET /v1/admin/keys/{id}` | Inspect one key |
+| `DELETE /v1/admin/keys/{id}` | Revoke a key → `204` |
+| `POST /v1/admin/keys/{id}/rotate` | Rotate the secret → new one-time token |
+| `PUT /v1/admin/keys/{id}/permissions` | Replace roles + allow/deny lists |
+| `PUT /v1/admin/keys/{id}/quota` | Set/clear the per-key quota override |
+| `GET /v1/admin/keys/{id}/quota` | Usage snapshot vs effective limits + reset windows |
+| `GET /v1/admin/workers` | Fleet snapshot |
+| `POST /v1/admin/workers/{id}/drain` | Drain a worker → `204` |
+
+`PUT .../permissions` is a full replace (not a merge): an omitted/null list clears that dimension.
+`PUT .../quota` is per-dimension: an omitted field defaults to `0` ("unlimited" for that dimension),
+and a body with **every** field omitted clears the per-key override entirely so the key falls back
+to the global defaults.
+
+### Immediate effect
+
+Changes take effect with no restart. Authorization reads the key fresh from the store on every
+dispatch and the quota engine reads its limits fresh on every check, so a deny-model set via
+`PUT .../permissions` denies (`403`) the next inference, a `DELETE` revoke fails (`401`) the next
+authenticated call, and an `RPM` set via `PUT .../quota` trips (`429`) within the same minute window
+— all without bouncing the server.
+
+### Error → status mapping
+
+Admin errors use the same `{"error":{"message","code"}}` envelope as the rest of the API:
+
+| Condition | Status | Code |
+| --- | --- | --- |
+| Non-admin key | 403 | `forbidden` |
+| Unauthenticated (middleware) | 401 | `unauthorized` |
+| `store.ErrNotFound` (unknown key) | 404 | `not_found` |
+| `server.ErrWorkerNotFound` | 404 | `not_found` |
+| Malformed JSON body | 400 | `invalid_request_error` |
+| anything else | 500 | `internal_error` |
+
+### No secret exposure
+
+Responses are explicit request/response structs that project `store.APIKey` into a metadata-only
+view — the stored `SecretHash`/`Salt` are **never** serialized or logged. The plaintext token is
+returned exactly once, only on create and rotate; it cannot be recovered afterward.
+
+The formal OpenAPI 3.1 spec for these endpoints lands in #14.
 
 ## Capacity-aware scheduling
 

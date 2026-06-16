@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/store"
 )
 
@@ -67,6 +68,42 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), apiKeyContextKey, key)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// adminMiddleware gates a route to admin-role keys (#4). It runs INSIDE
+// authMiddleware (wrap as s.authMiddleware(s.adminMiddleware(h))), so the key is
+// already authenticated and stashed on the context: it reads keyFromContext and
+// requires authz.RoleAdmin among the key's roles, otherwise 403. An
+// unauthenticated request never reaches here (authMiddleware already returned
+// 401), so the two responses are cleanly separated: 401 for "who are you" and
+// 403 for "you may not". The 403 message is deliberately generic and never
+// echoes the key's id or roles.
+func (s *Server) adminMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, ok := keyFromContext(r.Context())
+		if !ok {
+			// Defensive: authMiddleware always stashes a key before us. If it is
+			// somehow absent, fail closed as unauthenticated rather than admitting.
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing api key")
+			return
+		}
+		if !hasRole(key.Roles, authz.RoleAdmin) {
+			writeError(w, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// hasRole reports whether role appears in roles. Role lists are tiny, so a
+// linear scan is the right tool.
+func hasRole(roles []string, role string) bool {
+	for _, r := range roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>" header.

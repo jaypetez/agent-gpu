@@ -18,6 +18,8 @@
 //   - POST   /v1/sessions       — create an owner-scoped conversation session (#36).
 //   - GET    /v1/sessions/{id}  — session metadata + stored history (#36).
 //   - DELETE /v1/sessions/{id}  — end a session and purge its history (#36).
+//   - /v1/admin/...             — admin-only key/quota/permission/worker
+//     management, gated to admin-role keys (#4). See admin.go.
 //
 // The chat endpoint also supports two session-aware conversation modes (#36):
 // AFFINITY (X-Session-Id header — stateless, server only routes to the warm
@@ -31,8 +33,8 @@
 // control-plane server's SubmitAuthorizedJob / SubmitAuthorizedJobStream, which
 // enforce the same authorization plus quota before any worker is touched.
 //
-// The formal OpenAPI 3.1 spec (#14), admin endpoints (#4), and dedicated HTTP
-// rate-limit middleware (#6) are out of scope here; quota is already enforced
+// The formal OpenAPI 3.1 spec (#14) and dedicated HTTP rate-limit middleware
+// (#6) are out of scope here; quota is already enforced
 // (and 429-mapped) because the submit paths reserve against it. The auth
 // middleware and the JSON/error/SSE helpers are designed so those plug in
 // without rework.
@@ -46,6 +48,7 @@ import (
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/session"
 	"github.com/jaypetez/agent-gpu/internal/store"
@@ -53,11 +56,13 @@ import (
 )
 
 // fleetSource is the subset of *server.Server the HTTP layer needs: a
-// point-in-time snapshot of the fleet. Narrowing to an interface keeps the
-// handlers testable without standing up a full gRPC server and documents the
-// only coupling between this package and the control plane.
+// point-in-time snapshot of the fleet plus the operator-initiated drain used by
+// the admin API (#4). Narrowing to an interface keeps the handlers testable
+// without standing up a full gRPC server and documents the only coupling
+// between this package and the control plane. *server.Server satisfies it.
 type fleetSource interface {
 	Fleet() []types.Worker
+	DrainWorker(id string) error
 }
 
 // inferenceEngine is the subset of *server.Server the chat/completions handlers
@@ -82,6 +87,14 @@ type Server struct {
 	authz  *authz.Authorizer
 	log    *slog.Logger
 	listen string
+
+	// quota backs the admin per-key usage snapshot (GET /v1/admin/keys/{id}/quota).
+	// It is the same *quota.Engine the control-plane server reserves against, so
+	// the usage the admin API reports is exactly what enforcement sees. It is
+	// sourced from grpcSrv.Quota() in NewServer (may be nil if the server was
+	// built without a quota engine, e.g. in some unit tests); the handler guards
+	// against nil.
+	quota *quota.Engine
 
 	// sessionMgr backs the session CRUD endpoints and stateful chat mode (#36).
 	// When nil, sessions are disabled: the /v1/sessions endpoints return 501 and
@@ -116,6 +129,7 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 		engine:     grpcSrv,
 		auth:       authSvc,
 		authz:      az,
+		quota:      grpcSrv.Quota(),
 		sessionMgr: mgr,
 		log:        log,
 		listen:     listen,
@@ -145,7 +159,32 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/sessions", s.authMiddleware(http.HandlerFunc(s.handleCreateSession)))
 	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
 	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
+	s.registerAdminRoutes(mux)
 	return mux
+}
+
+// admin wraps an admin handler in the auth + admin-role gates. Every admin route
+// is registered through it so the two-stage gating (authenticate then require
+// the admin role) is applied uniformly and cannot be forgotten on a new route.
+func (s *Server) admin(h http.HandlerFunc) http.Handler {
+	return s.authMiddleware(s.adminMiddleware(h))
+}
+
+// registerAdminRoutes mounts the admin API (#4) on mux. Every route is gated by
+// s.admin (authenticate → require admin role). Go 1.22+ method+path patterns let
+// the collection, {id}, and {id}/sub routes coexist without collision and pin
+// each verb. See admin.go for the handlers and the response shapes.
+func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
+	mux.Handle("POST /v1/admin/keys", s.admin(s.handleAdminCreateKey))
+	mux.Handle("GET /v1/admin/keys", s.admin(s.handleAdminListKeys))
+	mux.Handle("GET /v1/admin/keys/{id}", s.admin(s.handleAdminGetKey))
+	mux.Handle("DELETE /v1/admin/keys/{id}", s.admin(s.handleAdminRevokeKey))
+	mux.Handle("POST /v1/admin/keys/{id}/rotate", s.admin(s.handleAdminRotateKey))
+	mux.Handle("PUT /v1/admin/keys/{id}/permissions", s.admin(s.handleAdminSetPermissions))
+	mux.Handle("PUT /v1/admin/keys/{id}/quota", s.admin(s.handleAdminSetQuota))
+	mux.Handle("GET /v1/admin/keys/{id}/quota", s.admin(s.handleAdminGetQuota))
+	mux.Handle("GET /v1/admin/workers", s.admin(s.handleAdminListWorkers))
+	mux.Handle("POST /v1/admin/workers/{id}/drain", s.admin(s.handleAdminDrainWorker))
 }
 
 // ListenAndServe binds s.listen and serves until the listener is closed or
