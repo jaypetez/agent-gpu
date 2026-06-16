@@ -20,6 +20,8 @@ const (
 	EnvHeartbeatInterval = "AGENTGPU_HEARTBEAT_INTERVAL"
 	EnvHeartbeatTimeout  = "AGENTGPU_HEARTBEAT_TIMEOUT"
 	EnvOllamaURL         = "AGENTGPU_OLLAMA_URL"
+	EnvSessionPath       = "AGENTGPU_SESSION_PATH"
+	EnvSessionTTL        = "AGENTGPU_SESSION_TTL"
 )
 
 // Defaults.
@@ -34,6 +36,14 @@ const (
 	DefaultHeartbeatTimeout = 45 * time.Second
 	// DefaultOllamaURL is the address a local Ollama listens on by default.
 	DefaultOllamaURL = "http://localhost:11434"
+	// DefaultSessionTTL is the default per-session idle timeout (#33). A session
+	// untouched for this long is reaped by the sweeper.
+	DefaultSessionTTL = 30 * time.Minute
+	// DefaultSessionMaxTurns is the default per-session conversation turn cap.
+	DefaultSessionMaxTurns = 200
+	// DefaultSessionMaxBytes is the default per-session cumulative-content byte
+	// cap (1 MiB), bounding history memory growth from a long conversation.
+	DefaultSessionMaxBytes = 1 << 20
 )
 
 // ServerConfig configures the server process.
@@ -69,6 +79,23 @@ type QuotaConfig struct {
 	DefaultDailyTokens uint64
 	// DefaultMonthlyTokens is the global default monthly token budget (0 = unlimited).
 	DefaultMonthlyTokens uint64
+}
+
+// SessionConfig configures the conversation-session subsystem (#33): where
+// sessions and history are checkpointed, the per-session idle TTL, and the
+// per-session history caps. It is a plain value struct (no session-package
+// dependency) so the config package stays leaf, mirroring QuotaConfig. The
+// cmd/HTTP wiring that consumes it lands with #36.
+type SessionConfig struct {
+	// Path is the session+history checkpoint file location.
+	Path string
+	// TTL is the per-session idle timeout (0 selects DefaultSessionTTL via
+	// ResolveSession). A session untouched for TTL is reaped by the sweeper.
+	TTL time.Duration
+	// MaxTurns is the per-session conversation turn cap (0 = unbounded).
+	MaxTurns int
+	// MaxBytes is the per-session cumulative-content byte cap (0 = unbounded).
+	MaxBytes int
 }
 
 // EnvLookup is the signature of os.LookupEnv, injectable for tests.
@@ -205,6 +232,61 @@ func ResolveQuotaPath(flagValue string, look EnvLookup, homeDir func() (string, 
 func ResolveQuota(flags QuotaConfig, look EnvLookup, homeDir func() (string, error)) QuotaConfig {
 	out := flags
 	out.Path = ResolveQuotaPath(flags.Path, look, homeDir)
+	return out
+}
+
+// DefaultSessionPath returns the default session-checkpoint location,
+// ~/.agentgpu/sessions.json, falling back to a relative path when the home
+// directory cannot be determined (mirroring DefaultStorePath/DefaultQuotaPath).
+func DefaultSessionPath(homeDir func() (string, error)) string {
+	if homeDir == nil {
+		homeDir = os.UserHomeDir
+	}
+	home, err := homeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".agentgpu", "sessions.json")
+	}
+	return filepath.Join(home, ".agentgpu", "sessions.json")
+}
+
+// ResolveSessionPath resolves the session-checkpoint path with flag > env >
+// default precedence. An empty flag value means "unset".
+func ResolveSessionPath(flagValue string, look EnvLookup, homeDir func() (string, error)) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvSessionPath, DefaultSessionPath(homeDir))
+}
+
+// ResolveSessionTTL resolves the per-session idle TTL with flag > env > default
+// precedence. A non-positive flag value means "unset".
+func ResolveSessionTTL(flagValue time.Duration, look EnvLookup) time.Duration {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return durationEnvOr(look, EnvSessionTTL, DefaultSessionTTL)
+}
+
+// ResolveSession fills a SessionConfig with flag > env > default precedence for
+// the path and TTL, and applies the cap defaults when a cap is left at zero
+// ("unset"). The cap fields have no env override today (they change rarely),
+// matching how QuotaConfig's limits are passed through.
+func ResolveSession(flags SessionConfig, look EnvLookup, homeDir func() (string, error)) SessionConfig {
+	out := flags
+	out.Path = ResolveSessionPath(flags.Path, look, homeDir)
+	out.TTL = ResolveSessionTTL(flags.TTL, look)
+	if out.MaxTurns <= 0 {
+		out.MaxTurns = DefaultSessionMaxTurns
+	}
+	if out.MaxBytes <= 0 {
+		out.MaxBytes = DefaultSessionMaxBytes
+	}
 	return out
 }
 

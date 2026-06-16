@@ -515,6 +515,79 @@ loads the checkpoint on startup — rolling any windows that expired while the p
 interface is shaped so a Redis-backed counter store (atomic `INCR` per window key) can slot in later
 without touching the engine.
 
+## Sessions
+
+A **session** is a persisted, owner-scoped handle to a model conversation, owned by `internal/session`.
+It is the foundation of the sessions epic; affinity routing, `keep_alive`, and the HTTP session API
+build on it in later milestones. This milestone ships the domain model, the persistence interfaces +
+in-memory/checkpointing implementations, the lifecycle `Manager`, and the idle-expiry sweeper only —
+the cmd/HTTP wiring (constructing the `Manager`, calling `Start`/`Close`, exposing the API) lands with
+the HTTP session API milestone and is left as a documented seam.
+
+### Model
+
+```go
+type Session struct {
+    ID            string        // "sess_" + crypto/rand hex — stable, unguessable
+    OwnerKeyID    string        // public API-key id (never a secret/hash)
+    Model         string
+    BoundWorkerID string        // affinity hint, stored only (routing is a later milestone)
+    CreatedAt     time.Time
+    LastActiveAt  time.Time     // touched on create/resume/append
+    TTL           time.Duration // per-session idle timeout (<=0 = never idles out)
+    Status        Status        // active | expired
+}
+```
+
+Every session stores **only public identifiers**: `OwnerKeyID` is the key's public id, never the
+secret or its hash, and nothing in the package logs secrets.
+
+### Lifecycle
+
+The `Manager` is the single entry point and runs every operation **owner-scoped** by the
+authenticated `store.APIKey.ID` threaded down from the request path:
+
+- `Create(ctx, ownerKeyID, model)` mints a stable, unguessable `sess_` id and stamps
+  `CreatedAt`/`LastActiveAt = now`, `Status = active`.
+- `Resume(ctx, id, ownerKeyID)` returns the owner's session and **touches `LastActiveAt`**, keeping it
+  alive for another idle window.
+- `Get` / `Delete` are owner-checked; `AppendTurn` / `History` are owner-scoped and cap-enforced, and
+  `AppendTurn` also touches `LastActiveAt` (a turn is activity).
+
+A request for a session that is **missing, not owned by the caller, or already past its TTL** returns
+the same `ErrSessionNotFound` — the cases are deliberately indistinct so the API never leaks the
+existence of another owner's session.
+
+### Idle-expiry sweeper
+
+A background sweeper (`Start`/`Close`, `sync.Once`, wall-clock ticker) reaps sessions where
+`now - LastActiveAt > TTL`, **deleting the session and its history together** (history first, so a
+crash mid-delete leaves no session pointing at vanished history). The expiry decision uses an
+injectable clock, so tests fast-forward the clock instead of sleeping. `Close` stops and waits for the
+loop and is idempotent (safe without `Start`, and on repeat calls). A session with a non-positive TTL
+never idles out.
+
+### History caps
+
+Conversation turns reuse the shared `types.Message` chat type. The `HistoryStore` enforces two
+per-session caps — a **turn count** and a **cumulative content-byte** budget — with a **trim-oldest**
+policy: appending a turn that would exceed either cap drops the oldest turns until both hold, so the
+most recent context is always retained rather than the write being rejected. A single turn larger than
+the byte cap on its own is still stored (the alternative would make the session permanently
+unwritable). Defaults are 200 turns / 1 MiB.
+
+### Persistence / durability
+
+Both stores are in-memory and concurrency-safe (RWMutex), and hand callers **deep copies** so a
+returned session or turn slice cannot mutate stored state. They survive restarts the same way the
+quota counters do: the process **checkpoints** sessions and history to JSON
+(`AGENTGPU_SESSION_PATH`, default `~/.agentgpu/sessions.json`) periodically and on graceful shutdown,
+and loads on startup — per-operation mutations never touch disk. The durability window is therefore
+the checkpoint cadence: up to one interval of mutations can be lost on an unclean crash. On load,
+sessions already past their TTL are **dropped**, and any history orphaned by a dropped session is
+purged, so a process that was down past a session's idle window does not resurrect it. The store
+interfaces are shaped so a Redis/Postgres backend can slot in later without touching the `Manager`.
+
 ## State
 
 Authentication, permission rules, and quota counters are persisted so they survive restarts.
