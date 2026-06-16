@@ -29,6 +29,10 @@ coverage.txt
 # Docker assets themselves (no need to send them into the build context)
 Dockerfile
 .dockerignore
+compose.yaml
+compose.yml
+docker-compose.yml
+docker-compose.yaml
 
 # Docs (the build needs none of them)
 *.md

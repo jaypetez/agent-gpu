@@ -17,9 +17,14 @@ GORELEASER ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 REDOCLY_VERSION := 2.33.2
 REDOCLY_IMAGE   := redocly/cli:$(REDOCLY_VERSION)@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
 
-GO     ?= go
-BUF    ?= buf
-DOCKER ?= docker
+GO      ?= go
+BUF     ?= buf
+DOCKER  ?= docker
+COMPOSE ?= docker compose
+
+# Model the Compose E2E pulls and exercises end to end. Keep tiny so the smoke
+# test is fast; override on the command line (make compose-e2e MODEL=llama3.2:1b).
+MODEL ?= qwen2:0.5b
 
 .PHONY: all
 all: build test
@@ -70,6 +75,26 @@ release-check: ## Validate the GoReleaser config (.goreleaser.yaml)
 .PHONY: snapshot
 snapshot: ## Cross-compile all release artifacts locally into dist/ (no publish)
 	$(GORELEASER) build --snapshot --clean
+
+.PHONY: compose-config
+compose-config: ## Validate compose.yaml
+	$(COMPOSE) config -q
+
+.PHONY: compose-up
+compose-up: ## Build and start the local dev stack in the background
+	$(COMPOSE) up -d --build
+
+.PHONY: compose-down
+compose-down: ## Stop the stack, KEEPING volumes (state persists)
+	$(COMPOSE) down
+
+.PHONY: compose-clean
+compose-clean: ## Stop the stack and REMOVE volumes (clean teardown)
+	$(COMPOSE) down -v
+
+.PHONY: compose-e2e
+compose-e2e: ## Bring the stack up and run a full bootstrap + inference smoke test
+	AGENTGPU_MODEL=$(MODEL) COMPOSE="$(COMPOSE)" ./scripts/compose-e2e.sh
 
 .PHONY: help
 help: ## Show this help

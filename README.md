@@ -89,8 +89,22 @@ curl http://SERVER_HOST:PORT/v1/chat/completions \
 
 ### Run with Docker
 
-Two minimal, non-root images are built from one multi-stage
-[`Dockerfile`](Dockerfile) and published to GHCR on each release:
+The fastest way to a working stack is Docker Compose — server, a worker, a local
+Ollama (with a tiny model pulled automatically), and the backing services, in one
+command:
+
+```bash
+docker compose up -d --build
+# Bootstrap a key, then call http://localhost:8080 — see docs/docker.md.
+docker compose down -v   # clean teardown
+```
+
+Scale workers with `docker compose up -d --scale worker=3`. The full guide
+(key bootstrap, sample inference request, persistence demo, GPU access) is in
+[docs/docker.md](docs/docker.md).
+
+Or run the two minimal, non-root images directly. They are built from one
+multi-stage [`Dockerfile`](Dockerfile) and published to GHCR on each release:
 
 ```bash
 # Server: the public API + control plane. /data holds key/quota/session state.

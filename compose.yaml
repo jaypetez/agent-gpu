@@ -1,0 +1,170 @@
+# agent-gpu local development stack (Compose Spec — no obsolete `version:` key).
+#
+# One command brings up a working server with at least one registered worker, a
+# local Ollama that owns inference, and the backing services state will migrate
+# to. With a model pulled, a request flows end to end:
+#
+#   docker compose up -d --build
+#
+# Then bootstrap a key and call the API — see docs/docker.md for the full guide,
+# including the persistence-across-restart demo and clean teardown:
+#
+#   docker compose down -v
+#
+# Scale workers horizontally; each gets a unique id from its container hostname
+# (the worker does NOT pin --id), so the fleet shows N online workers:
+#
+#   docker compose up -d --scale worker=3
+#
+# Configuration knobs live in .env (copy .env.example). Values below fall back to
+# sensible defaults via ${VAR:-default} so the stack runs with no .env at all.
+
+services:
+  # ---- server: public OpenAI-compatible API + gRPC control plane -------------
+  # The image already binds 0.0.0.0 and points all state at the /data volume, so
+  # almost nothing needs to be set here. It is distroless (no shell/curl), so it
+  # carries NO in-container healthcheck — readiness is checked from outside (an
+  # unauthenticated GET /v1/models returns 401 once it is up), and the worker's
+  # reconnect backoff tolerates the server not being ready the instant it starts.
+  server:
+    build:
+      context: .
+      target: server
+    image: agentgpu-server:dev
+    ports:
+      # 8080 = public OpenAI-compatible HTTP API. The gRPC control plane (50051)
+      # is reachable to the worker over the Compose network and needs no host map.
+      - "${AGENTGPU_HTTP_PORT:-8080}:8080"
+    environment:
+      # Per-key quota defaults applied to every key without an explicit override
+      # (0 = unlimited). Tune for local load testing; harmless at the defaults.
+      AGENTGPU_DEFAULT_RPM: "${AGENTGPU_DEFAULT_RPM:-0}"
+      AGENTGPU_DEFAULT_TPM: "${AGENTGPU_DEFAULT_TPM:-0}"
+    volumes:
+      # The AC's "persists across restarts": keys/quota/sessions are JSON files
+      # under /data (atomic writes), so a named volume on /data is real, verifiable
+      # persistence. `docker compose restart server` keeps every key; only
+      # `down -v` removes the volume. See docs/docker.md for the demo.
+      - agentgpu-data:/data
+    restart: unless-stopped
+
+  # ---- worker: drives the local Ollama, executes dispatched jobs -------------
+  # Stateless, opens no inbound port. It reconnects to the server with exponential
+  # backoff (so server start order does not matter) and degrades gracefully if
+  # Ollama is briefly unreachable. It refreshes its advertised models from Ollama
+  # /api/tags every heartbeat, so a model pulled into Ollama becomes routable
+  # within one heartbeat interval (shortened below for snappy dev propagation).
+  #
+  # --id is intentionally NOT set: it defaults to the container hostname, which is
+  # unique per replica, so `docker compose up --scale worker=N` yields N distinct
+  # workers in the fleet automatically.
+  worker:
+    build:
+      context: .
+      target: worker
+    image: agentgpu-worker:dev
+    environment:
+      AGENTGPU_SERVER_ADDR: "server:50051"
+      AGENTGPU_OLLAMA_URL: "http://ollama:11434"
+      # Short heartbeat so a freshly pulled model is advertised quickly in dev
+      # (production leaves this at the 15s default).
+      AGENTGPU_HEARTBEAT_INTERVAL: "${AGENTGPU_HEARTBEAT_INTERVAL:-5s}"
+    depends_on:
+      server:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- ollama: owns the accelerator / runs the models ------------------------
+  # Pinned by tag + digest (OpenSSF Scorecard Pinned-Dependencies). Unlike the
+  # distroless agent-gpu images this one HAS a shell, so it carries a real
+  # healthcheck the worker/init services gate on. To use a host GPU, see the GPU
+  # note in docs/docker.md (uncomment the `deploy.resources.reservations.devices`
+  # block); the default is CPU so the stack runs anywhere.
+  ollama:
+    image: ollama/ollama:0.12.3@sha256:c622a7adec67cf5bd7fe1802b7e26aa583a955a54e91d132889301f50c3e0bd0
+    volumes:
+      # Persist pulled models so a restart does not re-download them.
+      - ollama-models:/root/.ollama
+    healthcheck:
+      # `ollama list` succeeds only once the server is serving on :11434.
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    # GPU access (NVIDIA Container Toolkit). Uncomment to give Ollama the host GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ---- ollama-init: one-shot model pull so the worker has something to serve --
+  # Pulls ${AGENTGPU_MODEL} into the shared ollama-models volume, then exits. The
+  # worker then advertises the model on its next heartbeat and it becomes routable
+  # (a submit for a model no worker serves queues and blocks, so the model must be
+  # present before inference). Re-running `up` is cheap: an already-present model
+  # is a no-op pull.
+  ollama-init:
+    image: ollama/ollama:0.12.3@sha256:c622a7adec67cf5bd7fe1802b7e26aa583a955a54e91d132889301f50c3e0bd0
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    # Override the image entrypoint (which would start a server) and just pull.
+    entrypoint: ["ollama"]
+    command: ["pull", "${AGENTGPU_MODEL:-qwen2:0.5b}"]
+    restart: "no"
+
+  # ---- redis / postgres: provisioned backing services ------------------------
+  # IMPORTANT (honest status): the server currently persists ALL state (keys,
+  # quotas, sessions) to JSON files on the agentgpu-data volume above. NOTHING in
+  # the code connects to Redis or Postgres yet. They are provisioned here because
+  # the architecture (docs/architecture.md) backs durable state with them and the
+  # store interfaces are shaped for that backend swap — but they are not wired.
+  # Treat them as scaffolding for the forthcoming backend integration, not as the
+  # live state store. Until then, "persists across restarts" is the agentgpu-data
+  # volume, demonstrated in docs/docker.md.
+  redis:
+    image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine@sha256:979c4379dd698aba0b890599a6104e082035f98ef31d9b9291ec22f2b13059ca
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-agentgpu}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-agentgpu}"
+      POSTGRES_DB: "${POSTGRES_DB:-agentgpu}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready against the configured role/db so the check matches the env.
+      test: ["CMD-SHELL", "pg_isready -U \"${POSTGRES_USER:-agentgpu}\" -d \"${POSTGRES_DB:-agentgpu}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  # The AC's durable state today (keys/quotas/sessions, file store).
+  agentgpu-data:
+  # Pulled Ollama models, so a restart does not re-download.
+  ollama-models:
+  # Provisioned for the forthcoming Redis/Postgres backend (not yet wired).
+  redis-data:
+  postgres-data:

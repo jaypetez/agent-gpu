@@ -179,6 +179,41 @@ jobs:
             exit 1
           fi
 
+  compose:
+    name: compose
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Validate compose.yaml
+        run: docker compose config -q
+
+      - name: End-to-end stack (up, register, persist, infer)
+        shell: bash
+        # The script brings the stack up, asserts a worker registers, proves a key
+        # survives a server restart, pulls the tiny model, and runs a real chat
+        # completion — then tears everything down. It is the same script behind
+        # `make compose-e2e`, so CI and local runs exercise identical steps. Set
+        # SKIP_INFERENCE=1 here if the model pull ever proves too slow/flaky for CI;
+        # the up + registration + persistence assertions still run.
+        run: AGENTGPU_MODEL=qwen2:0.5b ./scripts/compose-e2e.sh
+
+      - name: Teardown
+        if: always()
+        shell: bash
+        # The script tears down on its own EXIT trap; this is a belt-and-suspenders
+        # cleanup so a crash before the trap installs never leaks the stack.
+        run: docker compose down -v --remove-orphans || true
+
   release-dryrun:
     name: release-dryrun
     runs-on: ubuntu-latest
