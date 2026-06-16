@@ -157,10 +157,27 @@ func TestModelAggregationMultiWorker(t *testing.T) {
 		go func() { _ = w.Run(wctx) }()
 	}
 
-	// Wait until all three workers are Online and both models are visible.
-	waitFor(t, 2*time.Second, "both models to appear once all workers register", func() bool {
+	// Wait until the whole fleet has converged: the shared model (llama3) must be
+	// served by BOTH expected workers and the distinct model (mistral) by its one
+	// worker. Polling only on len(models) == 2 would proceed as soon as a single
+	// llama3 worker plus mistral are Online — before worker-b has necessarily
+	// registered — leaving the worker_count assertion to win a registration race.
+	// Waiting on the full expected state removes that timing dependence entirely.
+	waitFor(t, 2*time.Second, "fleet to converge: llama3 on worker-a+worker-b, mistral on worker-c", func() bool {
 		models := fetchModels(t, ts.URL, token)
-		return len(models) == 2
+		byName := make(map[string]modelEntry, len(models))
+		for _, m := range models {
+			byName[m.Name] = m
+		}
+		llama, ok := byName["llama3"]
+		if !ok || llama.WorkerCount != 2 || !equalStrings(llama.Workers, []string{"worker-a", "worker-b"}) {
+			return false
+		}
+		mistral, ok := byName["mistral"]
+		if !ok || mistral.WorkerCount != 1 || !equalStrings(mistral.Workers, []string{"worker-c"}) {
+			return false
+		}
+		return true
 	})
 
 	models := fetchModels(t, ts.URL, token)
