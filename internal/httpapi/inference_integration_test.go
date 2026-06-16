@@ -105,6 +105,9 @@ type inferenceHarness struct {
 	// authSvc lets a test mint additional keys or set per-key quota limits
 	// after the harness is up (e.g. the 429 quota test).
 	authSvc *auth.Service
+	// httpSrv is the HTTP API server, exposed so rate-limit tests can read the
+	// throttle metrics (RateLimitStats) the requests increment.
+	httpSrv *httpapi.Server
 }
 
 func newInferenceHarness(t *testing.T, exec *scriptedExecutor, model string) inferenceHarness {
@@ -170,7 +173,7 @@ func newInferenceHarnessWith(t *testing.T, exec *scriptedExecutor, model string,
 	})
 	go func() { _ = w.Run(wctx) }()
 
-	h := inferenceHarness{url: ts.URL, token: token, authSvc: authSvc}
+	h := inferenceHarness{url: ts.URL, token: token, authSvc: authSvc, httpSrv: httpSrv}
 	// Wait until the model is visible so a dispatch will find a worker.
 	waitFor(t, 2*time.Second, "model in catalog", func() bool {
 		return len(fetchModels(t, h.url, h.token)) == 1

@@ -33,10 +33,16 @@
 // control-plane server's SubmitAuthorizedJob / SubmitAuthorizedJobStream, which
 // enforce the same authorization plus quota before any worker is touched.
 //
-// The formal OpenAPI 3.1 spec (#14) and dedicated HTTP rate-limit middleware
-// (#6) are out of scope here; quota is already enforced
-// (and 429-mapped) because the submit paths reserve against it. The auth
-// middleware and the JSON/error/SSE helpers are designed so those plug in
+// The inference routes are additionally fronted by a server-wide (global) rate
+// limiter (rateLimitMiddleware, #6): it reserves against the quota engine's
+// global counter before dispatch and returns 429 with a Retry-After header when
+// the fleet-wide limit is exceeded, independent of per-key quota. Per-key quota
+// 429s (from the submit path) also carry a Retry-After, and both scopes feed the
+// throttle metrics exposed by RateLimitStats. See ratelimit.go.
+//
+// The formal OpenAPI 3.1 spec (#14) is out of scope here; per-key quota is
+// enforced (and 429-mapped) because the submit paths reserve against it. The
+// auth middleware and the JSON/error/SSE helpers are designed so those plug in
 // without rework.
 package httpapi
 
@@ -44,6 +50,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
@@ -106,6 +113,16 @@ type Server struct {
 	// to one source of truth.
 	sessionMgr *session.Manager
 
+	// rlMu guards the rate-limit throttle counters below. A small dedicated mutex
+	// (rather than reusing a broader lock) keeps the throttle accounting cheap and
+	// off the request hot path's critical sections, mirroring server.affinityMu.
+	rlMu sync.Mutex
+	// globalThrottled counts requests rejected by the global rate limiter
+	// (rateLimitMiddleware); keyThrottled counts per-key quota 429s observed at
+	// writeSubmitError. They are the throttle-metrics seam for #24 (Prometheus).
+	globalThrottled uint64
+	keyThrottled    uint64
+
 	// httpSrv is constructed in NewServer (not in ListenAndServe) so the pointer
 	// is non-nil and stable before any goroutine starts or any Shutdown call
 	// races startup. This gives a happens-before edge between construction and
@@ -152,8 +169,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/models", s.authMiddleware(http.HandlerFunc(s.handleOpenAIModels)))
 	mux.Handle("/models", s.authMiddleware(http.HandlerFunc(s.handleModels)))
-	mux.Handle("/v1/chat/completions", s.authMiddleware(http.HandlerFunc(s.handleChatCompletions)))
-	mux.Handle("/v1/completions", s.authMiddleware(http.HandlerFunc(s.handleCompletions)))
+	// The inference surface is the only one fronted by the global rate limiter:
+	// rateLimitMiddleware runs INSIDE authMiddleware (so the authenticated key is
+	// on the context for the throttle log) but BEFORE the handler, so a global
+	// 429 short-circuits before any dispatch. Discovery, session, and admin routes
+	// are intentionally NOT rate-limited (they do not consume inference capacity).
+	mux.Handle("/v1/chat/completions", s.authMiddleware(s.rateLimitMiddleware(http.HandlerFunc(s.handleChatCompletions))))
+	mux.Handle("/v1/completions", s.authMiddleware(s.rateLimitMiddleware(http.HandlerFunc(s.handleCompletions))))
 	// Session CRUD (#36). Go 1.22+ method+path patterns let the same path host
 	// distinct verbs and capture the id segment via r.PathValue("id").
 	mux.Handle("POST /v1/sessions", s.authMiddleware(http.HandlerFunc(s.handleCreateSession)))

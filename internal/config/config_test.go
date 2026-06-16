@@ -143,6 +143,38 @@ func TestResolveQuota(t *testing.T) {
 	if got.DefaultRPM != 60 || got.DefaultTPM != 1000 {
 		t.Fatalf("limit defaults not preserved: %+v", got)
 	}
+	// Global limits default to 0 (unlimited) with no flag or env.
+	if got.GlobalRPM != 0 || got.GlobalTPM != 0 {
+		t.Fatalf("global limits default not unlimited: %+v", got)
+	}
+}
+
+func TestResolveQuota_GlobalLimits(t *testing.T) {
+	t.Parallel()
+	home := func() (string, error) { return "/home/u", nil }
+
+	// Flag value wins over env.
+	got := ResolveQuota(QuotaConfig{GlobalRPM: 500},
+		env(map[string]string{EnvGlobalRPM: "999", EnvGlobalTPM: "8000"}), home)
+	if got.GlobalRPM != 500 {
+		t.Errorf("GlobalRPM = %d, want 500 (flag wins)", got.GlobalRPM)
+	}
+	// Zero flag ("unset") falls back to env.
+	if got.GlobalTPM != 8000 {
+		t.Errorf("GlobalTPM = %d, want 8000 (env fallback)", got.GlobalTPM)
+	}
+
+	// Env-only resolution when no flag is set.
+	got = ResolveQuota(QuotaConfig{}, env(map[string]string{EnvGlobalRPM: "120"}), home)
+	if got.GlobalRPM != 120 || got.GlobalTPM != 0 {
+		t.Errorf("env resolution = (%d,%d), want (120,0)", got.GlobalRPM, got.GlobalTPM)
+	}
+
+	// An unparseable env value falls back to 0 rather than wedging startup.
+	got = ResolveQuota(QuotaConfig{}, env(map[string]string{EnvGlobalRPM: "not-a-number"}), home)
+	if got.GlobalRPM != 0 {
+		t.Errorf("unparseable env GlobalRPM = %d, want 0", got.GlobalRPM)
+	}
 }
 
 func TestResolveWorker(t *testing.T) {
