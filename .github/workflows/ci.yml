@@ -74,3 +74,83 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build server image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: server
+          push: false
+          load: true
+          tags: agentgpu-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+
+      - name: Build worker image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: worker
+          push: false
+          load: true
+          tags: agentgpu-worker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+
+      - name: Smoke-test images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::server --help"
+          docker run --rm agentgpu-server:ci --help
+          echo "::endgroup::"
+
+          echo "::group::worker --help"
+          docker run --rm agentgpu-worker:ci --help
+          echo "::endgroup::"
+
+          echo "::group::server serves on 0.0.0.0 (expect 401 on /v1/models)"
+          cid="$(docker run -d -p 8080:8080 agentgpu-server:ci)"
+          code=""
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/v1/models || true)"
+            if [ "$code" = "401" ]; then break; fi
+            if [ -z "$(docker ps -q --no-trunc --filter id="$cid")" ]; then
+              echo "server container exited early; logs:"
+              docker logs "$cid" || true
+              docker rm -f "$cid" >/dev/null 2>&1 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "GET /v1/models -> HTTP $code"
+          docker logs "$cid"
+          docker rm -f "$cid" >/dev/null
+          echo "::endgroup::"
+
+          if [ "$code" != "401" ]; then
+            echo "expected HTTP 401 from a running, unauthenticated server, got '$code'" >&2
+            exit 1
+          fi

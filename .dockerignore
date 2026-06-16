@@ -1,0 +1,42 @@
+# Keep the build context lean: the image build only needs the Go sources plus
+# go.mod/go.sum. Everything excluded here is either VCS metadata, build output,
+# tooling, or docs the build does not read. Patterns mirror .gitignore where it
+# overlaps so the context never carries local cruft.
+
+# VCS metadata
+.git
+.gitignore
+.gitattributes
+
+# Build output / GoReleaser artifacts
+/dist
+/agentgpu
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Tooling, CI, and editor config the build does not need
+.claude
+.github
+.editorconfig
+.markdownlint.jsonc
+.yamllint.yml
+.lycheeignore
+.vscode
+.idea
+
+# Docker assets themselves (no need to send them into the build context)
+Dockerfile
+.dockerignore
+
+# Docs (the build needs none of them)
+*.md
+docs
+
+# Local env / logs
+.env
+.env.*
+*.log
+tmp
+.cache
