@@ -1,0 +1,80 @@
+# GoReleaser configuration for agent-gpu.
+# Builds the single `agentgpu` binary for all six supported OS/arch targets,
+# archives them, emits a SHA-256 checksums file, and publishes a GitHub release
+# for the pushed tag. Validate changes with `goreleaser check` (see Makefile:
+# `make release-check`).
+#
+# Docs: https://goreleaser.com
+version: 2
+
+project_name: agentgpu
+
+before:
+  hooks:
+    # Keep the module graph tidy and verified before a release build.
+    - go mod tidy
+    - go mod verify
+
+builds:
+  - id: agentgpu
+    main: ./cmd/agentgpu
+    binary: agentgpu
+    # Static, dependency-free binaries — the project deliberately avoids cgo so
+    # GOOS/GOARCH cross-compilation stays a one-liner (docs/architecture.md).
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    # 3 OS x 2 arch = exactly six artifacts.
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/jaypetez/agent-gpu/internal/version.Version={{ .Version }}
+      - -X github.com/jaypetez/agent-gpu/internal/version.Commit={{ .Commit }}
+      - -X github.com/jaypetez/agent-gpu/internal/version.Date={{ .Date }}
+    # Pin file mtimes to the commit time for reproducible builds.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: agentgpu
+    ids:
+      - agentgpu
+    # tar.gz everywhere except Windows, which gets a zip (see overrides).
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  # Single SHA-256 manifest published next to the artifacts.
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  # Used by `goreleaser build --snapshot` (local + CI dry-run); never published.
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  # Defer to GitHub's native release-notes generator, which honors the
+  # repository's .github/release.yml categories. Avoids a second, competing
+  # changelog source.
+  use: github-native
+
+release:
+  # Default behavior: create the GitHub release for the pushed tag. Mark
+  # pre-1.0 / pre-release tags (e.g. v0.1.0-rc1) as prereleases automatically.
+  prerelease: auto

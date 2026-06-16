@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/jaypetez/agent-gpu/internal/gpu"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
 )
@@ -74,13 +75,22 @@ type Config struct {
 	Models []types.Model
 	// HeartbeatInterval between heartbeats. Defaults to 15s.
 	HeartbeatInterval time.Duration
-	// Capacity stub fields reported in heartbeats. Real GPU detection (#16)
-	// replaces these; until then they are configured/zero. TotalVRAM/FreeVRAM are
+	// Capacity fields reported in heartbeats. When Detector is set these are
+	// overwritten by live GPU detection (static identity once at startup, dynamic
+	// free VRAM + load each heartbeat); when Detector is nil they are used as-is
+	// as manual overrides (or zero, the CPU profile). TotalVRAM/FreeVRAM are
 	// bytes, GPUType is a human-readable description, Load is 0-100.
 	TotalVRAM uint64
 	FreeVRAM  uint64
 	GPUType   string
 	Load      uint32
+	// Detector, if set, supplies real GPU capacity (#16): NVIDIA/AMD/Apple via
+	// their vendor CLIs, with a clean CPU fallback when no GPU is present. It is
+	// optional and nil-safe — a nil Detector leaves the static TotalVRAM/GPUType
+	// (etc.) fields above as the reported capacity, so existing callers and tests
+	// that set those directly keep working unchanged. The real CLI wiring in
+	// cmd/agentgpu constructs a gpu.Detector and passes it here.
+	Detector CapacityDetector
 	// Backoff policy for reconnects.
 	Backoff Backoff
 	// Executor runs jobs. Defaults to EchoExecutor.
@@ -89,6 +99,14 @@ type Config struct {
 	Logger *slog.Logger
 	// DialOptions are extra gRPC dial options (tests inject in-process dialers).
 	DialOptions []grpc.DialOption
+}
+
+// CapacityDetector probes the host's GPU(s) and returns an aggregated capacity
+// snapshot. *gpu.Detector satisfies it; tests inject a fake. It must never error
+// or panic — it returns a usable Capacity (the CPU fallback) on any trouble — so
+// detection can run inline on the heartbeat path without endangering liveness.
+type CapacityDetector interface {
+	Detect(ctx context.Context) gpu.Capacity
 }
 
 func (c *Config) withDefaults() {
@@ -124,6 +142,17 @@ type Worker struct {
 	// refresh.
 	modelsMu sync.Mutex
 	models   []types.Model
+
+	// capMu guards capacity, the most recent GPU-detection result reported in
+	// heartbeats. When a Detector is configured, the static identity (type +
+	// total VRAM) is captured once at startup and the dynamic signals (free VRAM
+	// + load) are refreshed before each heartbeat; a refresh failure keeps the
+	// last-known value rather than flapping. When no Detector is configured it is
+	// seeded once from the static cfg fields (manual override / CPU zero) and left
+	// untouched. Guarded like the model cache because the heartbeat reader and the
+	// detection refresh touch it from different goroutines.
+	capMu    sync.Mutex
+	capacity gpu.Capacity
 }
 
 // New constructs a Worker from config.
@@ -133,6 +162,15 @@ func New(cfg Config) *Worker {
 		cfg:    cfg,
 		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
 		models: cfg.Models,
+		// Seed capacity from the static cfg fields so the worker reports something
+		// sensible before its first detection (and forever, when no Detector is
+		// set): a manual override, or the all-zero CPU profile.
+		capacity: gpu.Capacity{
+			Type:      cfg.GPUType,
+			TotalVRAM: cfg.TotalVRAM,
+			FreeVRAM:  cfg.FreeVRAM,
+			Load:      cfg.Load,
+		},
 	}
 }
 
@@ -158,6 +196,46 @@ func (w *Worker) refreshModels(ctx context.Context) {
 	w.modelsMu.Unlock()
 }
 
+// currentCapacity returns the most recently cached GPU capacity snapshot.
+func (w *Worker) currentCapacity() gpu.Capacity {
+	w.capMu.Lock()
+	defer w.capMu.Unlock()
+	return w.capacity
+}
+
+// detectCapacity runs the configured Detector and caches the result. full
+// controls how much of the snapshot is adopted:
+//
+//   - full=true (startup): adopt the entire snapshot, including the static
+//     identity (Type + TotalVRAM) which is immutable hardware identity.
+//   - full=false (per-heartbeat): refresh only the dynamic signals the scheduler
+//     reads (FreeVRAM + Load), preserving the startup Type/TotalVRAM so a
+//     momentary probe hiccup cannot blank out the hardware identity.
+//
+// It is a no-op when no Detector is configured (the seeded static capacity
+// stands). Detection is bounded by a short timeout and never propagates an
+// error: gpu.Detector.Detect already degrades to the CPU fallback on any
+// trouble, so the worst case here is reporting the CPU profile, never a failed
+// heartbeat or wedged startup.
+func (w *Worker) detectCapacity(ctx context.Context, full bool) {
+	if w.cfg.Detector == nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cap := w.cfg.Detector.Detect(probeCtx)
+
+	w.capMu.Lock()
+	defer w.capMu.Unlock()
+	if full {
+		w.capacity = cap
+		return
+	}
+	// Dynamic-only refresh: keep the startup-detected identity.
+	w.capacity.FreeVRAM = cap.FreeVRAM
+	w.capacity.Load = cap.Load
+}
+
 // OnConnect registers a callback invoked after each successful registration
 // ack with the assigned session ID. Primarily for tests observing
 // (re)connection events.
@@ -173,6 +251,13 @@ func (w *Worker) Run(ctx context.Context) error {
 	// whatever models it last knew, possibly none) so the fleet sees it. This is
 	// best-effort and bounded so a slow/hung backend cannot wedge startup.
 	w.detectBackend(ctx)
+
+	// Detect local GPU capacity once at startup to capture the hardware identity
+	// (type + total VRAM, which are immutable). Free VRAM and load are refreshed
+	// per heartbeat below. Like the backend probe this is best-effort, bounded,
+	// and degrades to the CPU fallback rather than failing startup. A nil Detector
+	// makes this a no-op and the static cfg fields stand.
+	w.detectCapacity(ctx, true)
 
 	attempt := 0
 	for {
@@ -420,6 +505,11 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 		// (sourced from Ollama for the real worker); a refresh failure keeps the
 		// last-known set.
 		w.refreshModels(connCtx)
+		// Refresh the dynamic GPU signals (free VRAM + load) so each heartbeat
+		// carries fresh scheduler-relevant capacity; the immutable identity from
+		// startup is preserved. A detection failure degrades to CPU/last-known
+		// inside detectCapacity and never blocks the heartbeat.
+		w.detectCapacity(connCtx, false)
 		return stream.Send(&agentgpuv1.WorkerMessage{
 			Payload: &agentgpuv1.WorkerMessage_Heartbeat{
 				Heartbeat: w.heartbeat(uint32(atomic.LoadInt32(&activeJobs))),
@@ -499,16 +589,20 @@ func (w *Worker) deregister(stream agentgpuv1.ControlPlane_ConnectClient, recvEr
 	}
 }
 
-// heartbeat builds the worker's periodic liveness/capacity report. Capacity
-// fields are stub/configured values until real GPU detection (#16) lands.
+// heartbeat builds the worker's periodic liveness/capacity report. The capacity
+// fields come from the cached GPU-detection snapshot (#16): real
+// NVIDIA/AMD/Apple capacity when a Detector is configured (free VRAM + load
+// refreshed each heartbeat, type + total VRAM captured once at startup), or the
+// static cfg fields / CPU profile when no Detector is set.
 func (w *Worker) heartbeat(activeJobs uint32) *agentgpuv1.Heartbeat {
+	cap := w.currentCapacity()
 	return types.Heartbeat{
 		WorkerID:        w.cfg.WorkerID,
 		ActiveJobs:      activeJobs,
-		TotalVRAM:       w.cfg.TotalVRAM,
-		FreeVRAM:        w.cfg.FreeVRAM,
-		Load:            w.cfg.Load,
-		GPUType:         w.cfg.GPUType,
+		TotalVRAM:       cap.TotalVRAM,
+		FreeVRAM:        cap.FreeVRAM,
+		Load:            cap.Load,
+		GPUType:         cap.Type,
 		AvailableModels: w.currentModels(),
 	}.Proto()
 }

@@ -48,6 +48,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  openapi:
+    name: openapi
+    runs-on: ubuntu-latest
+    env:
+      REDOCLY_TELEMETRY: "off"
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Lint OpenAPI spec (validate 3.1 + recommended ruleset)
+        uses: docker://redocly/cli:2.33.2@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
+        with:
+          args: lint openapi.yaml
+
+      - name: Render OpenAPI docs (Redoc)
+        uses: docker://redocly/cli:2.33.2@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
+        with:
+          args: build-docs openapi.yaml -o openapi.html
+
   go:
     name: go
     runs-on: ubuntu-latest
@@ -74,3 +98,149 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build server image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: server
+          push: false
+          load: true
+          tags: agentgpu-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+
+      - name: Build worker image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: worker
+          push: false
+          load: true
+          tags: agentgpu-worker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=ci
+            COMMIT=${{ github.sha }}
+
+      - name: Smoke-test images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "::group::server --help"
+          docker run --rm agentgpu-server:ci --help
+          echo "::endgroup::"
+
+          echo "::group::worker --help"
+          docker run --rm agentgpu-worker:ci --help
+          echo "::endgroup::"
+
+          echo "::group::server serves on 0.0.0.0 (expect 401 on /v1/models)"
+          cid="$(docker run -d -p 8080:8080 agentgpu-server:ci)"
+          code=""
+          for _ in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/v1/models || true)"
+            if [ "$code" = "401" ]; then break; fi
+            if [ -z "$(docker ps -q --no-trunc --filter id="$cid")" ]; then
+              echo "server container exited early; logs:"
+              docker logs "$cid" || true
+              docker rm -f "$cid" >/dev/null 2>&1 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "GET /v1/models -> HTTP $code"
+          docker logs "$cid"
+          docker rm -f "$cid" >/dev/null
+          echo "::endgroup::"
+
+          if [ "$code" != "401" ]; then
+            echo "expected HTTP 401 from a running, unauthenticated server, got '$code'" >&2
+            exit 1
+          fi
+
+  release-dryrun:
+    name: release-dryrun
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # GoReleaser needs full history/tags even for a snapshot build.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Validate GoReleaser config
+        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        with:
+          version: "~> v2"
+          args: check
+
+      - name: Cross-compile all targets (no publish)
+        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        with:
+          version: "~> v2"
+          args: build --snapshot --clean
+
+  version-smoke:
+    name: version-smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build binary
+        run: go build -o agentgpu ./cmd/agentgpu
+
+      - name: Run --version
+        # bash is available on all three runners; keep the step portable.
+        shell: bash
+        run: |
+          out="$(./agentgpu --version)"
+          echo "$out"
+          echo "$out" | grep -q "agentgpu" || { echo "missing program name"; exit 1; }
