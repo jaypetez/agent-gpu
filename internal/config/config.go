@@ -12,6 +12,7 @@ import (
 // Environment variable names.
 const (
 	EnvServerListen      = "AGENTGPU_SERVER_LISTEN"
+	EnvHTTPListen        = "AGENTGPU_HTTP_LISTEN"
 	EnvWorkerServer      = "AGENTGPU_SERVER_ADDR"
 	EnvWorkerID          = "AGENTGPU_WORKER_ID"
 	EnvStorePath         = "AGENTGPU_STORE_PATH"
@@ -24,6 +25,8 @@ const (
 // Defaults.
 const (
 	DefaultServerListen = "127.0.0.1:50051"
+	// DefaultHTTPListen is the address the public HTTP API binds by default.
+	DefaultHTTPListen = "127.0.0.1:8080"
 	// DefaultHeartbeatInterval is the worker's heartbeat cadence.
 	DefaultHeartbeatInterval = 15 * time.Second
 	// DefaultHeartbeatTimeout is the server's stale-eviction window (3x the
@@ -37,6 +40,9 @@ const (
 type ServerConfig struct {
 	// Listen is the gRPC listen address (host:port).
 	Listen string
+	// HTTPListen is the public HTTP API listen address (host:port). It fronts the
+	// OpenAI-compatible API (model discovery #12, chat/completions #13).
+	HTTPListen string
 }
 
 // WorkerConfig configures the worker process.
@@ -98,6 +104,9 @@ func ResolveServer(flags ServerConfig, look EnvLookup) ServerConfig {
 	out := flags
 	if out.Listen == "" {
 		out.Listen = envOr(look, EnvServerListen, DefaultServerListen)
+	}
+	if out.HTTPListen == "" {
+		out.HTTPListen = envOr(look, EnvHTTPListen, DefaultHTTPListen)
 	}
 	return out
 }

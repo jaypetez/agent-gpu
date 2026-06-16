@@ -73,6 +73,52 @@ sequenceDiagram
   end
 ```
 
+## HTTP API / model discovery
+
+The public, client-facing surface is an HTTP server (`internal/httpapi`) — the first HTTP server in
+the project; server↔worker traffic stays on gRPC. It is built on the standard library
+(`net/http` + `http.ServeMux`, no framework) and is constructed with the control-plane server (for
+the fleet snapshot), the `auth.Service` (to authenticate keys), and the **same** `authz.Authorizer`
+the gRPC server uses to gate dispatch. Sharing the authorizer guarantees catalog visibility matches
+dispatch-time authorization exactly: a model a key can see is a model it can invoke.
+
+Listen address resolves flag > env > default: `--http-listen` / `AGENTGPU_HTTP_LISTEN` /
+`127.0.0.1:8080`. The HTTP server starts alongside the gRPC server and, on shutdown, is drained
+first (bounded `Shutdown` timeout) before the gRPC server stops.
+
+### Bearer authentication
+
+Every route is wrapped in a reusable auth middleware that extracts
+`Authorization: Bearer <token>`, calls `auth.Service.Authenticate`, and stashes the resolved
+`store.APIKey` on the request context for handlers. Failures map deterministically:
+
+- missing / malformed header, or `auth.ErrUnauthenticated` → **401** (no detail leaked, no catalog
+  exposed);
+- any other authentication error → **500**.
+
+The same middleware and the shared JSON/error helpers (`{"error":{"message","code"}}`) are the seam
+the chat/completions path (#13) reuses, so authentication behaves identically across the API.
+
+### Permission-filtered catalog
+
+The catalog aggregates `Server.Fleet()`: it keeps only **Online** workers, deduplicates models by
+name, and records per-model availability (worker count + ids). A model is included only if the
+request's key passes `authz.Authorize(…, authz.Infer)` — the deny-wins precedence used at dispatch —
+so a drained/stale/evicted worker's models disappear, a model on several workers collapses to one
+entry, and models a key cannot use are hidden. Output is sorted by name for determinism.
+
+### Endpoints
+
+- `GET /v1/models` — OpenAI-canonical:
+  `{"object":"list","data":[{"id":<name>,"object":"model","created":0,"owned_by":"agent-gpu"}]}`.
+  `created` is a stable sentinel (`0`) because the domain model carries no creation time; keeping it
+  fixed makes responses deterministic and cacheable.
+- `GET /models` — richer internal shape:
+  `{"models":[{"name":…,"digest":…,"worker_count":N,"workers":[ids]}]}`.
+
+Both require a valid key and are permission-filtered per key. Responses never include secrets,
+tokens, or hashes.
+
 ## Capacity-aware scheduling
 
 The scheduler (`internal/scheduler`) is the placement core: a **pure, deterministic** function that,
