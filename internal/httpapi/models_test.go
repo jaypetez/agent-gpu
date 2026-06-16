@@ -18,10 +18,23 @@ import (
 // fakeFleet is a deterministic stand-in for *server.Server's Fleet snapshot,
 // letting the handler tests assert aggregation/dedup/filtering without standing
 // up a gRPC control plane. snapshot is swapped between sub-tests to model worker
-// drain/eviction.
-type fakeFleet struct{ snapshot []types.Worker }
+// drain/eviction. drainErr / drained let the admin drain tests assert the
+// control-plane call without a live server.
+type fakeFleet struct {
+	snapshot []types.Worker
+	// drainErr is returned by DrainWorker (nil = success). The admin drain test
+	// sets server.ErrWorkerNotFound to exercise the 404 mapping.
+	drainErr error
+	// drained records the id DrainWorker was last called with.
+	drained string
+}
 
 func (f *fakeFleet) Fleet() []types.Worker { return f.snapshot }
+
+func (f *fakeFleet) DrainWorker(id string) error {
+	f.drained = id
+	return f.drainErr
+}
 
 // testServer builds an httpapi.Server wired to the fake fleet and a real auth
 // service + authorizer over an in-memory store, plus a discarding logger.

@@ -135,6 +135,13 @@ func (s *Service) List(ctx context.Context) ([]store.APIKey, error) {
 	return s.store.ListAPIKeys(ctx)
 }
 
+// Get returns the key with the given id, or store.ErrNotFound. It is the
+// single-key inspection seam for the admin API (#4); like List it returns only
+// metadata (the plaintext secret is never stored and so can never be returned).
+func (s *Service) Get(ctx context.Context, id string) (store.APIKey, error) {
+	return s.store.GetAPIKey(ctx, id)
+}
+
 // Revoke marks the key revoked. Revoked keys never authenticate. Revoking an
 // unknown key returns store.ErrNotFound. Revoking an already-revoked key is a
 // no-op success.
