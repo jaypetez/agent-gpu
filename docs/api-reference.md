@@ -82,6 +82,11 @@ The relevant `server start` flags (each with an `AGENTGPU_*` env equivalent):
 count is a whitespace-token estimate (there is no model tokenizer), consistent
 with the rest of the project's token accounting.
 
+For a task-oriented walkthrough of both conversation modes — with working,
+copy-pasteable `curl` examples for creating a session, multi-turn chat,
+streaming, and deletion, plus the model-warmth (`keep_alive`) behavior and the
+limits above — see the [Multi-Turn Sessions guide](sessions.md).
+
 ### Streaming
 
 The two inference endpoints (`/v1/chat/completions`, `/v1/completions`) return
