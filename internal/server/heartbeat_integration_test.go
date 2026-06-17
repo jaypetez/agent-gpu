@@ -153,6 +153,12 @@ func TestFleetReflectsRegistrationAndHeartbeat(t *testing.T) {
 	if w.Status != types.WorkerOnline {
 		t.Fatalf("status = %v, want online", w.Status)
 	}
+	// RegisteredAt is stamped with the server clock at registration (the
+	// worker-uptime metric base, #24). The injected clock is fixed, so it equals
+	// the clock's now.
+	if !w.RegisteredAt.Equal(clk.now()) {
+		t.Fatalf("RegisteredAt = %v, want registration clock %v", w.RegisteredAt, clk.now())
+	}
 
 	// AC2: a heartbeat updates capacity fields visibly.
 	rc.heartbeat(t, types.Heartbeat{

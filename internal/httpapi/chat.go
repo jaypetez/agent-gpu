@@ -222,6 +222,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Content:   res.Output,
 		ToolCalls: fromDomainToolCalls(res.ToolCalls),
 	}
+	// Meter the tokens this completion accounted, by model (#24). Recorded on the
+	// terminal (success) path so a failed/aborted inference is not counted.
+	s.recordTokens(req.Model, res.PromptTokens, res.CompletionTokens, res.Tokens)
 	// Persist the turn AFTER a successful response so a failed inference never
 	// pollutes stored history. Affinity mode stores nothing (the client owns it).
 	if mode == modeStateful {
@@ -297,6 +300,10 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 	// when mode == modeStateful.
 	var content strings.Builder
 	var toolCalls []types.ToolCall
+	// Token counts from the terminal chunk, metered once the stream ends cleanly
+	// (#24): the terminal JobChunk carries the prompt/completion split, mirroring
+	// the non-streaming result.
+	var promptTokens, completionTokens, totalTokens uint64
 	failed := false
 	// sawDone tracks whether a genuine terminal chunk (Done == true) was observed.
 	// A mid-stream client disconnect closes the chunk channel WITHOUT an error
@@ -330,6 +337,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 		choice.Delta.ToolCalls = fromDomainToolCalls(chunk.ToolCalls)
 		if chunk.Done {
 			sawDone = true
+			promptTokens, completionTokens, totalTokens = chunk.PromptTokens, chunk.CompletionTokens, chunk.Tokens
 			fr := finishReasonOrStop(chunk.FinishReason)
 			choice.FinishReason = &fr
 		}
@@ -344,6 +352,14 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 	}
 
 	writeSSEDone(w, flusher)
+
+	// Meter tokens only for a stream that terminated cleanly (a genuine terminal
+	// chunk, no mid-stream error), so an aborted/failed stream is not counted —
+	// the same gate the persistence below uses, minus the disconnect check (the
+	// inference's tokens were produced regardless of whether the client stayed).
+	if sawDone && !failed {
+		s.recordTokens(model, promptTokens, completionTokens, totalTokens)
+	}
 
 	// Persist the turn atomically (the new user/tool message(s) AND the assistant
 	// reply together) only after the stream terminated cleanly: a genuine terminal

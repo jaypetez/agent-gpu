@@ -61,6 +61,7 @@ func TestWorkerSnapshotAndStatus(t *testing.T) {
 	w := &worker{
 		id:            "w",
 		models:        []types.Model{{Name: "llama3"}},
+		registeredAt:  base,
 		lastHeartbeat: base,
 		pending:       map[string]chan types.JobResult{},
 	}
@@ -81,6 +82,11 @@ func TestWorkerSnapshotAndStatus(t *testing.T) {
 	}
 	if snap.ActiveJobs != 4 || snap.Load != 33 || snap.GPUType != "gpu" {
 		t.Fatalf("snapshot capacity not applied: %+v", snap)
+	}
+	// RegisteredAt is surfaced from the worker (the worker-uptime metric base,
+	// #24) and is independent of the heartbeat that re-stamped LastSeen.
+	if !snap.RegisteredAt.Equal(base) {
+		t.Fatalf("snapshot RegisteredAt = %v, want %v", snap.RegisteredAt, base)
 	}
 	if len(snap.Models) != 1 || snap.Models[0].Name != "mistral" {
 		t.Fatalf("snapshot should reflect available_models: %+v", snap.Models)

@@ -89,6 +89,8 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		s.writeSubmitError(w, r, err)
 		return
 	}
+	// Meter tokens by model on the success path (#24).
+	s.recordTokens(req.Model, res.PromptTokens, res.CompletionTokens, res.Tokens)
 	writeJSON(w, http.StatusOK, completionResponse{
 		ID:      newID("cmpl-"),
 		Object:  "text_completion",
@@ -123,6 +125,12 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, key st
 	id := newID("cmpl-")
 	created := time.Now().Unix()
 
+	// Token counts from the terminal chunk, metered once the stream ends cleanly
+	// (#24), mirroring the chat streaming path.
+	var promptTokens, completionTokens, totalTokens uint64
+	failed := false
+	sawDone := false
+
 	for chunk := range chunks {
 		if chunk.Err != nil {
 			s.reqLog(r.Context()).Warn("completion stream failed mid-stream", "code", chunk.Err.Code, "err", chunk.Err.Message)
@@ -134,11 +142,14 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, key st
 				Model:   model,
 				Choices: []completionChunkChoice{{Index: 0, FinishReason: &fr}},
 			})
+			failed = true
 			break
 		}
 
 		choice := completionChunkChoice{Text: chunk.Delta, Index: 0}
 		if chunk.Done {
+			sawDone = true
+			promptTokens, completionTokens, totalTokens = chunk.PromptTokens, chunk.CompletionTokens, chunk.Tokens
 			fr := finishReasonOrStop(chunk.FinishReason)
 			choice.FinishReason = &fr
 		}
@@ -152,4 +163,10 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, key st
 	}
 
 	writeSSEDone(w, flusher)
+
+	// Meter tokens only for a cleanly-terminated stream (terminal chunk seen, no
+	// mid-stream error), so a failed/aborted stream is not counted.
+	if sawDone && !failed {
+		s.recordTokens(model, promptTokens, completionTokens, totalTokens)
+	}
 }

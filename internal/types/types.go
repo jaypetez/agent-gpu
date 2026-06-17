@@ -190,6 +190,12 @@ type Worker struct {
 	Load       uint32
 	GPUType    string
 	Status     WorkerStatus
+	// RegisteredAt is when the worker registered with the server (the server
+	// clock at registration). It backs the worker uptime metric (#24), which
+	// dashboards derive as time() - start_time. It is the zero time for a snapshot
+	// taken before a registration timestamp was recorded; uptime resets on
+	// reconnect because a re-registering worker gets a fresh server-side struct.
+	RegisteredAt time.Time
 }
 
 // ErrInvalidJob is returned when a Job fails validation.

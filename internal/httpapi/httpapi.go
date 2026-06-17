@@ -55,6 +55,7 @@ import (
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
+	"github.com/jaypetez/agent-gpu/internal/metrics"
 	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
@@ -118,6 +119,15 @@ type Server struct {
 	// to one source of truth.
 	sessionMgr *session.Manager
 
+	// metrics is the Prometheus instrument the request-path middleware/handlers
+	// update (request count + latency, tokens generated, throttles) (#24). It is
+	// nil-safe: a nil *metrics.Metrics disables all recording, so callers and
+	// tests that do not wire metrics in behave exactly as before. The exposition
+	// /metrics endpoint and the live server collector live on a separate listener
+	// owned by cmd, not on this API mux (so scraping needs no API auth and the
+	// OpenAPI route set is unaffected).
+	metrics *metrics.Metrics
+
 	// rlMu guards the rate-limit throttle counters below. A small dedicated mutex
 	// (rather than reusing a broader lock) keeps the throttle accounting cheap and
 	// off the request hot path's critical sections, mirroring server.affinityMu.
@@ -139,10 +149,11 @@ type Server struct {
 
 // NewServer constructs an HTTP API Server. grpcSrv supplies the fleet snapshot,
 // authSvc authenticates Bearer tokens, az permission-filters the catalog, mgr
-// backs the session API + stateful chat (nil disables sessions), log receives
-// structured logs (defaulting to slog.Default() when nil), and listen is the
-// host:port to bind.
-func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authorizer, mgr *session.Manager, log *slog.Logger, listen string) *Server {
+// backs the session API + stateful chat (nil disables sessions), m is the
+// Prometheus instrument the request path updates (nil disables metrics, #24),
+// log receives structured logs (defaulting to slog.Default() when nil), and
+// listen is the host:port to bind.
+func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authorizer, mgr *session.Manager, m *metrics.Metrics, log *slog.Logger, listen string) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -153,6 +164,7 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 		authz:      az,
 		quota:      grpcSrv.Quota(),
 		sessionMgr: mgr,
+		metrics:    m,
 		log:        log,
 		listen:     listen,
 	}
@@ -190,10 +202,12 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
 	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
 	s.registerAdminRoutes(mux)
-	// Correlation id is established outermost so every response — including
+	// Correlation id is established before auth so every response — including
 	// unauthenticated 401s short-circuited by authMiddleware — gets a request_id
-	// and X-Request-Id header.
-	return s.requestIDMiddleware(mux)
+	// and X-Request-Id header. The metrics middleware wraps it OUTERMOST so it
+	// times the whole handler chain and records the final status of even a
+	// short-circuited response (#24); it is a no-op when metrics are disabled.
+	return s.metricsMiddleware(s.requestIDMiddleware(mux))
 }
 
 // admin wraps an admin handler in the auth + admin-role gates. Every admin route

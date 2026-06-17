@@ -150,7 +150,7 @@ func StartInProc(ctx context.Context, cfg InProcConfig) (*InProcStack, error) {
 	go func() { _ = gs.Serve(lis) }()
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(srv, authSvc, az, nil, logger, "")
+	httpSrv := httpapi.NewServer(srv, authSvc, az, nil, nil, logger, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 
 	// Mint a user key (permitted for the model) for the load, and an admin key for

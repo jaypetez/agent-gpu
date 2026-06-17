@@ -80,6 +80,13 @@ type worker struct {
 	// waiter is independent and unaffected. Guarded by mu.
 	observers map[string]chan types.JobChunk
 
+	// registeredAt is the server clock at registration, set once when the worker
+	// connects and never mutated thereafter, so it needs no lock for reads. It
+	// backs the worker-uptime metric (#24): the collector emits it as
+	// worker_start_time_seconds and dashboards derive uptime as time() - it.
+	// Uptime resets on reconnect because a re-registering worker is a fresh struct.
+	registeredAt time.Time
+
 	// Capacity/liveness fields reported via heartbeats, guarded by mu. models is
 	// seeded from the registration advertisement and refreshed from each
 	// heartbeat's available_models.
@@ -134,15 +141,16 @@ func (w *worker) snapshot(now time.Time, timeout time.Duration) types.Worker {
 		status = types.WorkerStale
 	}
 	return types.Worker{
-		ID:         w.id,
-		Models:     append([]types.Model(nil), models...),
-		LastSeen:   w.lastHeartbeat,
-		ActiveJobs: w.activeJobs,
-		TotalVRAM:  w.totalVRAM,
-		FreeVRAM:   w.freeVRAM,
-		Load:       w.load,
-		GPUType:    w.gpuType,
-		Status:     status,
+		ID:           w.id,
+		Models:       append([]types.Model(nil), models...),
+		LastSeen:     w.lastHeartbeat,
+		ActiveJobs:   w.activeJobs,
+		TotalVRAM:    w.totalVRAM,
+		FreeVRAM:     w.freeVRAM,
+		Load:         w.load,
+		GPUType:      w.gpuType,
+		Status:       status,
+		RegisteredAt: w.registeredAt,
 	}
 }
 
@@ -799,6 +807,9 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 	// connect before an explicit Start (e.g. in tests) still get evicted.
 	s.Start()
 
+	// One clock read seeds both the registration timestamp (worker uptime, #24)
+	// and the first heartbeat grace, so the two are consistent for this worker.
+	registeredAt := s.now()
 	w := &worker{
 		id:        reg.GetWorkerId(),
 		models:    types.ModelsFromProto(reg.GetModels()),
@@ -806,10 +817,13 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		pending:   make(map[string]chan types.JobResult),
 		streams:   make(map[string]*strings.Builder),
 		observers: make(map[string]chan types.JobChunk),
+		// registeredAt backs the worker_start_time_seconds metric; set once here
+		// and never mutated.
+		registeredAt: registeredAt,
 		// Seed lastHeartbeat at registration so a worker that registers but has
 		// not yet sent its first heartbeat is graced for one full timeout window
 		// rather than being treated as never-seen.
-		lastHeartbeat: s.now(),
+		lastHeartbeat: registeredAt,
 	}
 
 	ses := s.addWorker(w)

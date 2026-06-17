@@ -12,8 +12,13 @@ import (
 
 // Environment variable names.
 const (
-	EnvServerListen      = "AGENTGPU_SERVER_LISTEN"
-	EnvHTTPListen        = "AGENTGPU_HTTP_LISTEN"
+	EnvServerListen = "AGENTGPU_SERVER_LISTEN"
+	EnvHTTPListen   = "AGENTGPU_HTTP_LISTEN"
+	// EnvMetricsListen is the bind address of the dedicated Prometheus metrics
+	// listener (#24), which serves only /metrics and is intentionally separate
+	// from the public API port (so scraping needs no API auth). Set it empty to
+	// disable the metrics listener entirely.
+	EnvMetricsListen     = "AGENTGPU_METRICS_LISTEN"
 	EnvWorkerServer      = "AGENTGPU_SERVER_ADDR"
 	EnvWorkerID          = "AGENTGPU_WORKER_ID"
 	EnvStorePath         = "AGENTGPU_STORE_PATH"
@@ -61,6 +66,11 @@ const (
 	DefaultServerListen = "127.0.0.1:50051"
 	// DefaultHTTPListen is the address the public HTTP API binds by default.
 	DefaultHTTPListen = "127.0.0.1:8080"
+	// DefaultMetricsListen is the address the Prometheus metrics listener binds by
+	// default (#24): loopback only, so /metrics is reachable for local scraping
+	// but not exposed off-box without an explicit override. Set the flag/env to
+	// empty to disable the listener.
+	DefaultMetricsListen = "127.0.0.1:9090"
 	// DefaultHeartbeatInterval is the worker's heartbeat cadence.
 	DefaultHeartbeatInterval = 15 * time.Second
 	// DefaultHeartbeatTimeout is the server's stale-eviction window (3x the
@@ -104,6 +114,11 @@ type ServerConfig struct {
 	// HTTPListen is the public HTTP API listen address (host:port). It fronts the
 	// OpenAI-compatible API (model discovery #12, chat/completions #13).
 	HTTPListen string
+	// MetricsListen is the Prometheus metrics listener address (host:port), a
+	// dedicated port serving only /metrics, separate from the API (#24). An empty
+	// resolved value disables the metrics listener; see ResolveServer for how an
+	// explicitly-set-empty flag/env disables it vs. an unset one defaulting on.
+	MetricsListen string
 }
 
 // WorkerConfig configures the worker process.
@@ -225,9 +240,24 @@ func boolEnvOr(look EnvLookup, key string, fallback bool) bool {
 	return fallback
 }
 
+// MetricsListenDisabled is the sentinel a caller stores in
+// ServerConfig.MetricsListen to disable the metrics listener explicitly, so an
+// intentional "off" survives ResolveServer rather than being refilled from the
+// environment/default. The CLI maps an explicitly-passed empty --metrics-listen
+// (or empty AGENTGPU_METRICS_LISTEN) to this so "off" is sticky; the resolved
+// value is then mapped back to "" (disabled) for the lifecycle layer.
+const MetricsListenDisabled = "-"
+
 // ResolveServer applies env-then-default resolution to a ServerConfig whose
 // fields hold flag values (empty meaning "unset"). The CLI layer passes flag
 // values in; this fills the gaps from the environment and defaults.
+//
+// MetricsListen (#24) mirrors HTTPListen's flag > env > default precedence with
+// one addition: the MetricsListenDisabled sentinel ("-") is preserved verbatim so
+// an operator can turn the metrics listener off and have that decision stick
+// (the cmd layer translates an explicit empty flag/env into the sentinel, then
+// maps the resolved sentinel back to "" = disabled). An unset MetricsListen
+// resolves to DefaultMetricsListen (the listener is on by default).
 func ResolveServer(flags ServerConfig, look EnvLookup) ServerConfig {
 	if look == nil {
 		look = os.LookupEnv
@@ -239,7 +269,21 @@ func ResolveServer(flags ServerConfig, look EnvLookup) ServerConfig {
 	if out.HTTPListen == "" {
 		out.HTTPListen = envOr(look, EnvHTTPListen, DefaultHTTPListen)
 	}
+	if out.MetricsListen == "" {
+		out.MetricsListen = envOr(look, EnvMetricsListen, DefaultMetricsListen)
+	}
 	return out
+}
+
+// MetricsListenAddr maps a resolved ServerConfig.MetricsListen to the effective
+// bind address for the lifecycle layer: the MetricsListenDisabled sentinel ("-")
+// becomes "" (the listener is disabled), and any other value is returned as-is.
+// Centralizing the mapping keeps the cmd wiring a single readable check.
+func MetricsListenAddr(resolved string) string {
+	if resolved == MetricsListenDisabled {
+		return ""
+	}
+	return resolved
 }
 
 // ResolveHeartbeatInterval resolves the worker heartbeat cadence with flag >

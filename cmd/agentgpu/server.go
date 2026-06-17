@@ -19,6 +19,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/config"
 	"github.com/jaypetez/agent-gpu/internal/httpapi"
+	"github.com/jaypetez/agent-gpu/internal/metrics"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/session"
@@ -46,6 +47,7 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	fs := flag.NewFlagSet("server start", flag.ContinueOnError)
 	listen := fs.String("listen", "", "gRPC listen address (host:port)")
 	httpListen := fs.String("http-listen", "", "public HTTP API listen address (host:port) (default 127.0.0.1:8080 or $AGENTGPU_HTTP_LISTEN)")
+	metricsListen := fs.String("metrics-listen", "", "Prometheus /metrics listen address (host:port); empty disables it (default 127.0.0.1:9090 or $AGENTGPU_METRICS_LISTEN)")
 	storeFlag := fs.String("store", "", "path to the keys file (default $AGENTGPU_STORE_PATH or ~/.agentgpu/keys.json)")
 	quotaPath := fs.String("quota-path", "", "path to the quota counter checkpoint (default $AGENTGPU_QUOTA_PATH or ~/.agentgpu/quota.json)")
 	rpm := fs.Uint64("default-rpm", 0, "global default requests per minute (0 = unlimited)")
@@ -64,7 +66,17 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		return err
 	}
 
-	cfg := config.ResolveServer(config.ServerConfig{Listen: *listen, HTTPListen: *httpListen}, nil)
+	// Translate an explicit "off" for the metrics listener (an empty
+	// --metrics-listen passed on the command line, or AGENTGPU_METRICS_LISTEN set
+	// to empty) into the disable sentinel so the decision survives env/default
+	// resolution; an unset flag/env defaults the listener on. flagPassed reports
+	// whether --metrics-listen appeared on the command line so an explicit empty
+	// flag is distinguishable from the (empty) zero value of an unset flag.
+	metricsFlag := *metricsListen
+	if metricsListenOff(fs, metricsFlag) {
+		metricsFlag = config.MetricsListenDisabled
+	}
+	cfg := config.ResolveServer(config.ServerConfig{Listen: *listen, HTTPListen: *httpListen, MetricsListen: metricsFlag}, nil)
 	heartbeatTimeout := config.ResolveHeartbeatTimeout(*hbTimeout, nil)
 	qcfg := config.ResolveQuota(config.QuotaConfig{
 		Path:                 *quotaPath,
@@ -80,6 +92,30 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		TTL:  *sessionTTL,
 	}, nil, nil)
 	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout)
+}
+
+// metricsListenOff reports whether the operator explicitly turned the metrics
+// listener off: either --metrics-listen was passed with an empty value, or
+// AGENTGPU_METRICS_LISTEN is set to empty. An unset flag (empty zero value, not
+// visited) and an unset env both return false so the listener defaults on. It is
+// the only place that needs to distinguish "set to empty" from "unset", which a
+// plain string flag cannot, so it consults fs.Visit and os.LookupEnv directly.
+func metricsListenOff(fs *flag.FlagSet, flagValue string) bool {
+	passed := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "metrics-listen" {
+			passed = true
+		}
+	})
+	if passed && flagValue == "" {
+		return true
+	}
+	if !passed {
+		if v, ok := os.LookupEnv(config.EnvMetricsListen); ok && v == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // serveControlPlane starts the gRPC control-plane server and blocks until ctx
@@ -169,16 +205,48 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 	srv.Start()
 	defer func() { _ = srv.Close() }()
 
+	// Prometheus instrument (#24): one registry shared by the request-path
+	// collectors (updated inline by the HTTP layer) and the live server collector
+	// (read at scrape time). Building it here, before the HTTP server, lets the
+	// request path record into it; the server collector is registered just below
+	// once srv exists. metricsAddr is the resolved metrics listener address; the
+	// MetricsListenDisabled sentinel maps to "" which disables the listener.
+	metricsAddr := config.MetricsListenAddr(cfg.MetricsListen)
+	m := metrics.New()
+	// The live collector reads queue depth, the fleet, the time-in-queue
+	// distribution, and affinity counters from the control-plane server at every
+	// scrape. A registration failure (a descriptor clash) is a programming error,
+	// so surface it as a startup error rather than silently dropping the metrics.
+	if err := m.RegisterServerCollector(srv); err != nil {
+		return fmt.Errorf("register metrics collector: %w", err)
+	}
+
 	// Public HTTP API: authenticates Bearer tokens via the same key store and
-	// permission-filters the catalog with the shared authorizer above.
+	// permission-filters the catalog with the shared authorizer above. The same
+	// Prometheus instrument is threaded in so the request path is metered.
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, logger, cfg.HTTPListen)
+	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen)
+
+	// Metrics listener (#24): a second HTTP server serving only /metrics on a
+	// dedicated port, unauthenticated (it is an operational port, not the public
+	// API), kept off the API mux so scraping needs no API auth and the OpenAPI
+	// route set is unaffected. An empty address disables it.
+	var metricsSrv *http.Server
+	if metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", m.Handler())
+		metricsSrv = &http.Server{
+			Addr:              metricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+	}
 
 	logger.Info("control-plane server listening",
 		"addr", lis.Addr().String(), "http_addr", cfg.HTTPListen, "quota_path", qcfg.Path,
 		"global_rpm", qcfg.GlobalRPM, "global_tpm", qcfg.GlobalTPM,
 		"session_path", sessPath, "session_ttl", scfg.TTL.String(),
-		"heartbeat_timeout", heartbeatTimeout.String())
+		"metrics_addr", metricsAddr, "heartbeat_timeout", heartbeatTimeout.String())
 
 	// Periodic checkpoint so a crash loses at most quotaCheckpointInterval of usage.
 	ticker := time.NewTicker(quotaCheckpointInterval)
@@ -211,7 +279,7 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		}
 	}()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() { errCh <- gs.Serve(lis) }()
 	go func() {
 		// ListenAndServe returns http.ErrServerClosed on graceful Shutdown; treat
@@ -220,6 +288,15 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 			errCh <- fmt.Errorf("http api: %w", err)
 		}
 	}()
+	if metricsSrv != nil {
+		go func() {
+			// Same clean-stop contract as the API server: ErrServerClosed on a
+			// graceful Shutdown is not an error.
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("metrics listener: %w", err)
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -229,6 +306,13 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		defer cancel()
 		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 			logger.Warn("http api shutdown failed", "err", err)
+		}
+		// Stop the metrics listener too (best-effort; a scrape in flight is
+		// short-lived and losing it on shutdown is harmless).
+		if metricsSrv != nil {
+			if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("metrics listener shutdown failed", "err", err)
+			}
 		}
 		gs.GracefulStop()
 		if err := cs.Checkpoint(qcfg.Path, time.Now()); err != nil {

@@ -86,7 +86,7 @@ func newCorrelationHarness(t *testing.T, exec *scriptedExecutor, model string) c
 	t.Cleanup(gs.Stop)
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, srvLogger, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, nil, srvLogger, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	t.Cleanup(ts.Close)
 
