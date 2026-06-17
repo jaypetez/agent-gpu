@@ -417,6 +417,7 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 	recvErr := make(chan error, 1)
 	jobs := make(chan types.Job, 8)
 	pulls := make(chan string, 8)
+	unloads := make(chan string, 8)
 
 	// activeJobs counts jobs currently executing, reported in heartbeats. It is
 	// touched by the job-worker goroutine and read by this loop, so it must be
@@ -437,6 +438,10 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 			case *agentgpuv1.ServerMessage_PullModel:
 				if pm := p.PullModel; pm != nil {
 					pulls <- pm.GetModel()
+				}
+			case *agentgpuv1.ServerMessage_UnloadModel:
+				if um := p.UnloadModel; um != nil {
+					unloads <- um.GetModel()
 				}
 			}
 		}
@@ -507,6 +512,26 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 				}
 				w.cfg.Logger.Info("model pulled", "worker", w.cfg.WorkerID, "model", model)
 				w.refreshModels(connCtx)
+			}
+		}
+	}()
+
+	// Unload worker: handle UnloadModel control messages off the receive path so a
+	// model eviction does not block job dispatch (#35). It is best-effort model
+	// lifecycle: a failure is logged and dropped (the idle keep_alive timer is the
+	// backstop release path), and a missing model is treated as success by the
+	// executor, so an unload racing the idle timer is harmless.
+	go func() {
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case model := <-unloads:
+				if err := w.cfg.Executor.Unload(connCtx, model); err != nil {
+					w.cfg.Logger.Warn("model unload failed", "worker", w.cfg.WorkerID, "model", model, "err", err)
+					continue
+				}
+				w.cfg.Logger.Info("model unloaded", "worker", w.cfg.WorkerID, "model", model)
 			}
 		}
 	}()

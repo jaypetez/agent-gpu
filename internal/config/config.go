@@ -28,6 +28,12 @@ const (
 	EnvOllamaURL         = "AGENTGPU_OLLAMA_URL"
 	EnvSessionPath       = "AGENTGPU_SESSION_PATH"
 	EnvSessionTTL        = "AGENTGPU_SESSION_TTL"
+	// EnvModelWarmMax caps the model-warmth keep_alive window (#35): the longest a
+	// session-bound model is kept resident on its worker after a turn. The server
+	// sends keep_alive = min(session TTL, this cap) so an idle/abandoned session's
+	// model unloads within a bounded window and never pins VRAM indefinitely. A
+	// session with no idle TTL falls back to exactly this cap.
+	EnvModelWarmMax = "AGENTGPU_MODEL_WARM_MAX"
 	// EnvGPUDetect toggles automatic GPU detection on the worker (#16). When
 	// false, detection is skipped and the manual EnvGPUType/EnvTotalVRAM (or their
 	// flags) describe the worker's capacity instead.
@@ -86,6 +92,13 @@ const (
 	// DefaultSessionMaxBytes is the default per-session cumulative-content byte
 	// cap (1 MiB), bounding history memory growth from a long conversation.
 	DefaultSessionMaxBytes = 1 << 20
+	// DefaultModelWarmMax is the default cap on the model-warmth keep_alive window
+	// (#35): a session-bound model is kept resident on its worker for at most this
+	// long after a turn. One hour gives generous headroom over the 30-minute
+	// default session TTL (so the common case is never clipped) while still
+	// bounding how long an idle/abandoned session can pin VRAM. The keep_alive sent
+	// to Ollama is min(session TTL, this cap); a never-idle session uses this cap.
+	DefaultModelWarmMax = time.Hour
 	// DefaultGPUDetect is the default for the worker's automatic GPU detection
 	// (#16): on, so a worker advertises real hardware capacity out of the box.
 	DefaultGPUDetect = true
@@ -171,6 +184,12 @@ type SessionConfig struct {
 	MaxTurns int
 	// MaxBytes is the per-session cumulative-content byte cap (0 = unbounded).
 	MaxBytes int
+	// ModelWarmMax caps the model-warmth keep_alive window (#35): the longest a
+	// session-bound model is kept resident on its worker after a turn. 0 selects
+	// DefaultModelWarmMax via ResolveSession. The server sends keep_alive =
+	// min(session TTL, this cap), so an idle/abandoned session's model unloads
+	// within a bounded window; a never-idle session falls back to this cap.
+	ModelWarmMax time.Duration
 }
 
 // LogConfig configures structured logging (#23) for the server and worker
@@ -503,14 +522,29 @@ func ResolveSessionTTL(flagValue time.Duration, look EnvLookup) time.Duration {
 	return durationEnvOr(look, EnvSessionTTL, DefaultSessionTTL)
 }
 
+// ResolveModelWarmMax resolves the model-warmth keep_alive cap (#35) with flag >
+// env > default precedence. A non-positive flag value means "unset"; the result
+// is always positive (DefaultModelWarmMax when nothing else is configured) so the
+// derived warm window is always bounded.
+func ResolveModelWarmMax(flagValue time.Duration, look EnvLookup) time.Duration {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return durationEnvOr(look, EnvModelWarmMax, DefaultModelWarmMax)
+}
+
 // ResolveSession fills a SessionConfig with flag > env > default precedence for
-// the path and TTL, and applies the cap defaults when a cap is left at zero
-// ("unset"). The cap fields have no env override today (they change rarely),
-// matching how QuotaConfig's limits are passed through.
+// the path, TTL, and model-warmth cap, and applies the cap defaults when a cap is
+// left at zero ("unset"). The history cap fields have no env override today (they
+// change rarely), matching how QuotaConfig's limits are passed through.
 func ResolveSession(flags SessionConfig, look EnvLookup, homeDir func() (string, error)) SessionConfig {
 	out := flags
 	out.Path = ResolveSessionPath(flags.Path, look, homeDir)
 	out.TTL = ResolveSessionTTL(flags.TTL, look)
+	out.ModelWarmMax = ResolveModelWarmMax(flags.ModelWarmMax, look)
 	if out.MaxTurns <= 0 {
 		out.MaxTurns = DefaultSessionMaxTurns
 	}

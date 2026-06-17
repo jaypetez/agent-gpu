@@ -230,3 +230,35 @@ func TestPullModelDenied(t *testing.T) {
 		t.Fatalf("denied pull reached the worker: %v", pulls)
 	}
 }
+
+// TestUnloadSessionModelReachesWorker covers the explicit model-warmth release
+// path end to end (#35): UnloadSessionModel sends an UnloadModel control message
+// that drives the worker's executor to evict the model. It reuses the pull
+// harness's real worker + recording executor.
+func TestUnloadSessionModelReachesWorker(t *testing.T) {
+	p := newPullHarness(t)
+
+	p.h.srv.UnloadSessionModel(context.Background(), "puller", "llama3")
+	waitFor(t, 2*time.Second, "worker to unload the model", func() bool {
+		for _, m := range p.exec.Unloads() {
+			if m == "llama3" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestUnloadSessionModelUnknownWorkerNoExecutorCall asserts an unload aimed at a
+// worker that is not connected never reaches the connected worker's executor (it
+// is a safe no-op on the server, with the keep_alive timer as the backstop).
+func TestUnloadSessionModelUnknownWorkerNoExecutorCall(t *testing.T) {
+	p := newPullHarness(t)
+
+	p.h.srv.UnloadSessionModel(context.Background(), "ghost", "llama3")
+	// Allow any (erroneous) message time to propagate, then assert nothing unloaded.
+	time.Sleep(100 * time.Millisecond)
+	if unloads := p.exec.Unloads(); len(unloads) != 0 {
+		t.Fatalf("unload for an unknown worker reached the connected worker: %v", unloads)
+	}
+}

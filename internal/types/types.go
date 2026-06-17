@@ -73,6 +73,17 @@ type Job struct {
 	// the wire — Proto/JobFromProto deliberately omit it — so the worker contract
 	// is unchanged. Empty for jobs with no session (the default, affinity-free).
 	SessionID string
+	// KeepAliveSeconds is the model-warmth hint (#35) threaded server→worker so the
+	// worker asks Ollama to keep the model resident after the job. Unlike SessionID
+	// it DOES cross the wire (proto Job.keep_alive_seconds). The server derives it
+	// from a session's idle window for session-bound turns; it is 0 for session-less
+	// jobs. Semantics mirror Ollama's keep_alive in seconds: 0 means "unset" (the
+	// worker omits keep_alive and Ollama's default applies), a positive value keeps
+	// the model loaded that many seconds (re-sent each turn so Ollama's unload timer
+	// resets), and a negative value keeps it loaded indefinitely. The 0 default
+	// reproduces pre-#35 behavior exactly, so existing prompt/echo paths are
+	// unaffected.
+	KeepAliveSeconds int64
 }
 
 // JobError is a structured, transport-neutral job failure. It implements the
@@ -397,28 +408,33 @@ func toolsFromProto(ps []*agentgpuv1.Tool) []Tool {
 	return out
 }
 
-// Proto converts a Job to its protobuf representation.
+// Proto converts a Job to its protobuf representation. SessionID is deliberately
+// NOT carried (it is a server-side-only affinity hint, #34); KeepAliveSeconds IS
+// carried (#35) so the worker can thread model warmth to Ollama.
 func (j Job) Proto() *agentgpuv1.Job {
 	return &agentgpuv1.Job{
-		Id:       j.ID,
-		Model:    j.Model,
-		Prompt:   j.Prompt,
-		Messages: messagesToProto(j.Messages),
-		Tools:    toolsToProto(j.Tools),
+		Id:               j.ID,
+		Model:            j.Model,
+		Prompt:           j.Prompt,
+		Messages:         messagesToProto(j.Messages),
+		Tools:            toolsToProto(j.Tools),
+		KeepAliveSeconds: j.KeepAliveSeconds,
 	}
 }
 
-// JobFromProto converts a protobuf Job to the domain type.
+// JobFromProto converts a protobuf Job to the domain type. SessionID stays unset
+// (it never crosses the wire); KeepAliveSeconds round-trips (#35).
 func JobFromProto(p *agentgpuv1.Job) Job {
 	if p == nil {
 		return Job{}
 	}
 	return Job{
-		ID:       p.GetId(),
-		Model:    p.GetModel(),
-		Prompt:   p.GetPrompt(),
-		Messages: messagesFromProto(p.GetMessages()),
-		Tools:    toolsFromProto(p.GetTools()),
+		ID:               p.GetId(),
+		Model:            p.GetModel(),
+		Prompt:           p.GetPrompt(),
+		Messages:         messagesFromProto(p.GetMessages()),
+		Tools:            toolsFromProto(p.GetTools()),
+		KeepAliveSeconds: p.GetKeepAliveSeconds(),
 	}
 }
 

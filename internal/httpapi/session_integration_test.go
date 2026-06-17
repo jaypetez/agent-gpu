@@ -45,6 +45,7 @@ type recordingExecutor struct {
 	count   atomic.Int64
 	mu      sync.Mutex
 	lastJob *types.Job
+	unloads []string
 }
 
 func (e *recordingExecutor) Execute(_ context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
@@ -84,12 +85,27 @@ func (e *recordingExecutor) Execute(_ context.Context, job types.Job, emit func(
 func (e *recordingExecutor) ListModels(context.Context) ([]types.Model, error) { return e.models, nil }
 func (e *recordingExecutor) Pull(context.Context, string) error                { return nil }
 
+// Unload records the model so the session-delete → unload path (#35) is
+// observable end to end through the HTTP layer.
+func (e *recordingExecutor) Unload(_ context.Context, model string) error {
+	e.mu.Lock()
+	e.unloads = append(e.unloads, model)
+	e.mu.Unlock()
+	return nil
+}
+
 func (e *recordingExecutor) handled() int64 { return e.count.Load() }
 
 func (e *recordingExecutor) job() *types.Job {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.lastJob
+}
+
+func (e *recordingExecutor) unloadedModels() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.unloads...)
 }
 
 // sessionHarness wires a real control-plane gRPC server (with a session.Manager
@@ -467,6 +483,84 @@ func TestSessionStatefulMode(t *testing.T) {
 		t.Fatalf("get after delete status = %d, want 404", gresp.StatusCode)
 	}
 	_ = gresp.Body.Close()
+}
+
+// TestSessionDeleteUnloadsModel proves the explicit model-warmth release path
+// (#35) end to end through HTTP: a turn binds the session to its worker, then
+// DELETE /v1/sessions/{id} drives that bound worker to unload the conversation's
+// model (freeing VRAM promptly rather than waiting out the keep_alive window).
+func TestSessionDeleteUnloadsModel(t *testing.T) {
+	exec := &recordingExecutor{workerID: "worker-1", reply: "hi"}
+	h := newSessionHarness(t, "llama3", exec)
+
+	sid := h.createSession(t, "llama3")
+
+	// One stateful turn binds the session to worker-1 (so the delete knows where to
+	// send the unload).
+	resp := h.post(t, "/v1/chat/completions",
+		`{"model":"llama3","session_id":"`+sid+`","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		t.Fatalf("turn status = %d, want 200", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	// Sanity: the session is now bound to worker-1.
+	waitFor(t, 2*time.Second, "session bound to worker-1", func() bool {
+		s, err := h.mgr.Get(context.Background(), sid, adminKeyID(t, h))
+		return err == nil && s.BoundWorkerID == "worker-1"
+	})
+
+	dresp := h.delete(t, h.token, "/v1/sessions/"+sid)
+	if dresp.StatusCode != http.StatusNoContent {
+		_ = dresp.Body.Close()
+		t.Fatalf("delete status = %d, want 204", dresp.StatusCode)
+	}
+	_ = dresp.Body.Close()
+
+	// The bound worker's executor is asked to unload the session's model.
+	waitFor(t, 2*time.Second, "bound worker unloads the model", func() bool {
+		for _, m := range exec.unloadedModels() {
+			if m == "llama3" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestSessionDeleteUnboundNoUnload asserts a session that was never bound to a
+// worker (no turn taken) produces no unload on DELETE: there is nothing resident
+// to release. It guards the no-op branch of the delete→unload wiring.
+func TestSessionDeleteUnboundNoUnload(t *testing.T) {
+	exec := &recordingExecutor{workerID: "worker-1", reply: "hi"}
+	h := newSessionHarness(t, "llama3", exec)
+
+	sid := h.createSession(t, "llama3") // created but never used → unbound
+
+	dresp := h.delete(t, h.token, "/v1/sessions/"+sid)
+	if dresp.StatusCode != http.StatusNoContent {
+		_ = dresp.Body.Close()
+		t.Fatalf("delete status = %d, want 204", dresp.StatusCode)
+	}
+	_ = dresp.Body.Close()
+
+	// Give any (erroneous) unload time to propagate, then assert none happened.
+	time.Sleep(100 * time.Millisecond)
+	if got := exec.unloadedModels(); len(got) != 0 {
+		t.Fatalf("unbound session delete unloaded models: %v", got)
+	}
+}
+
+// adminKeyID returns the public key id for the harness's admin token, so a test
+// can look a session up owner-scoped via the manager.
+func adminKeyID(t *testing.T, h sessionHarness) string {
+	t.Helper()
+	key, err := h.authSvc.Authenticate(context.Background(), h.token)
+	if err != nil {
+		t.Fatalf("authenticate admin token: %v", err)
+	}
+	return key.ID
 }
 
 // TestSessionStatefulStreaming proves AC4 (streaming): a stateful streaming turn

@@ -227,6 +227,14 @@ type chatRequest struct {
 	Messages []chatMessage `json:"messages"`
 	Tools    []chatTool    `json:"tools,omitempty"`
 	Stream   bool          `json:"stream"`
+	// KeepAlive controls how long Ollama keeps the model resident after this
+	// request (model warmth, #35). Ollama accepts a number of seconds here; we
+	// send seconds as a JSON number. It is a pointer so a nil value omits the
+	// field entirely — Ollama then applies its own default (5m) — while a non-nil
+	// value is sent verbatim: 0 unloads the model immediately and a negative value
+	// keeps it loaded indefinitely. Re-sending a positive value each turn resets
+	// Ollama's unload timer, which is what keeps a model warm across a session.
+	KeepAlive *int64 `json:"keep_alive,omitempty"`
 }
 
 type chatMessage struct {
@@ -314,6 +322,12 @@ type ChatRequest struct {
 	Model    string
 	Messages []types.Message
 	Tools    []types.Tool
+	// KeepAlive is the optional model-warmth control (#35) passed straight through
+	// to Ollama's keep_alive as a number of seconds. nil omits it so Ollama's
+	// default unload window applies; a non-nil value is sent as-is (0 unloads now,
+	// negative keeps the model loaded indefinitely). The worker derives it from the
+	// job's KeepAliveSeconds, which the server sets for session-bound turns.
+	KeepAlive *int64
 }
 
 // ChatStream runs streaming chat inference for the full conversation against
@@ -324,10 +338,11 @@ type ChatRequest struct {
 // A non-nil error is a *types.JobError with a stable code.
 func (c *Client) ChatStream(ctx context.Context, cr ChatRequest, emit func(delta string, toolCalls []types.ToolCall)) (ChatResult, error) {
 	reqBody := chatRequest{
-		Model:    cr.Model,
-		Messages: toOllamaMessages(cr.Messages),
-		Tools:    toOllamaTools(cr.Tools),
-		Stream:   true,
+		Model:     cr.Model,
+		Messages:  toOllamaMessages(cr.Messages),
+		Tools:     toOllamaTools(cr.Tools),
+		Stream:    true,
+		KeepAlive: cr.KeepAlive,
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -389,6 +404,52 @@ func (c *Client) ChatStream(ctx context.Context, cr ChatRequest, emit func(delta
 	}
 	// Stream ended without a terminal done object.
 	return result, &types.JobError{Code: CodeOllamaError, Message: "chat stream ended without completion"}
+}
+
+// unloadRequest models the POST /api/generate call used to evict a model.
+// Ollama unloads a loaded model when it receives a request for that model with
+// keep_alive set to 0 and no prompt; /api/generate is the lightest endpoint for
+// it (no messages array required). stream is false so the single completion
+// object is returned and drained.
+type unloadRequest struct {
+	Model     string `json:"model"`
+	KeepAlive int64  `json:"keep_alive"`
+	Stream    bool   `json:"stream"`
+}
+
+// Unload asks Ollama to evict model from memory now, freeing its VRAM, by
+// issuing a keep_alive=0 generate with no prompt (Ollama's documented unload
+// path; the response carries done_reason "unload"). It is best-effort model
+// lifecycle management for the session-warmth feature (#35): the server calls it
+// when a session is explicitly ended so the conversation's model does not linger
+// for the remainder of its keep_alive window. A missing model is treated as
+// success — there is nothing to unload — so an unload race with the idle timer is
+// not an error. Other failures map to the same stable *types.JobError codes as
+// the rest of the client.
+func (c *Client) Unload(ctx context.Context, model string) error {
+	body, err := json.Marshal(unloadRequest{Model: model, KeepAlive: 0, Stream: false})
+	if err != nil {
+		return &types.JobError{Code: CodeInvalidRequest, Message: "marshal unload request: " + err.Error()}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/generate", bytes.NewReader(body))
+	if err != nil {
+		return c.transportError(err, "build unload request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return c.transportError(err, "contact ollama")
+	}
+	defer drainClose(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		je := c.statusError(resp, "unload")
+		if je.Code == CodeModelNotFound {
+			// Nothing loaded to evict: the desired end state already holds.
+			return nil
+		}
+		return je
+	}
+	return nil
 }
 
 // toOllamaMessages maps domain messages onto the Ollama /api/chat shape. Tool
