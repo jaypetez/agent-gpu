@@ -54,7 +54,7 @@ surface is specified formally in the [API reference](api-reference.md).
 
 ### Prerequisites
 
-- **Go 1.23+** — the module targets Go 1.23 (see [`go.mod`](../go.mod)). The
+- **Go 1.25+** — the module targets Go 1.25 (see [`go.mod`](../go.mod)). The
   toolchain alone is enough to build, run, and test the project.
 - **Docker** *(optional)* — needed only for the container images, the Compose
   dev stack, and the OpenAPI lint/docs targets (which use a pinned Redocly
