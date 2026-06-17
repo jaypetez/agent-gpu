@@ -54,6 +54,7 @@ type serverCollector struct {
 	workerActiveJobs  *prometheus.Desc
 	workerStartTime   *prometheus.Desc
 	affinityTotal     *prometheus.Desc
+	sessionRebinds    *prometheus.Desc
 	fleetWorkersTotal *prometheus.Desc
 }
 
@@ -103,6 +104,11 @@ func newServerCollector(src StatsSource) *serverCollector {
 			"Session-affinity routing outcomes since startup, by result (hit|miss).",
 			[]string{"result"}, nil,
 		),
+		sessionRebinds: prometheus.NewDesc(
+			fq("session_rebinds_total"),
+			"Total session affinity rebindings since startup: a turn whose session moved to a different worker because the bound one was gone/draining/stale/unfit. Equals affinity_total{result=\"miss\"}.",
+			nil, nil,
+		),
 		fleetWorkersTotal: prometheus.NewDesc(
 			fq("fleet_workers"),
 			"Number of workers currently connected to the fleet, by status (online|draining|stale).",
@@ -123,6 +129,7 @@ func (c *serverCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerActiveJobs
 	ch <- c.workerStartTime
 	ch <- c.affinityTotal
+	ch <- c.sessionRebinds
 	ch <- c.fleetWorkersTotal
 }
 
@@ -217,13 +224,17 @@ func (c *serverCollector) collectFleet(ch chan<- prometheus.Metric) {
 	}
 }
 
-// collectAffinity emits the affinity hit/miss counters. They are monotonic
-// since startup, so they are exported as counter values keyed by result; a
-// dashboard computes the hit ratio with rate() over both series.
+// collectAffinity emits the affinity hit/miss counters and the explicit rebind
+// counter. All are monotonic since startup, so they are exported as counter
+// values; a dashboard computes the hit ratio with rate() over both result series,
+// and the rebind rate with rate() over session_rebinds_total. session_rebinds_total
+// equals affinity_total{result="miss"} (every miss is a rebind) but is surfaced
+// as its own clearly-named series for rebind dashboards/alerts (#38).
 func (c *serverCollector) collectAffinity(ch chan<- prometheus.Metric) {
 	a := c.src.AffinityStats()
 	ch <- prometheus.MustNewConstMetric(c.affinityTotal, prometheus.CounterValue, float64(a.Hits), "hit")
 	ch <- prometheus.MustNewConstMetric(c.affinityTotal, prometheus.CounterValue, float64(a.Misses), "miss")
+	ch <- prometheus.MustNewConstMetric(c.sessionRebinds, prometheus.CounterValue, float64(a.Rebinds))
 }
 
 // msToSeconds converts a millisecond count to seconds for the Prometheus-native

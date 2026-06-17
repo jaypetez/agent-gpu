@@ -190,14 +190,39 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 	if err := histStore.LoadCheckpoint(histPath, keep); err != nil {
 		return fmt.Errorf("load history checkpoint: %w", err)
 	}
+
+	// Prometheus instrument (#24): one registry shared by the request-path
+	// collectors (updated inline by the HTTP layer), the live server collector
+	// (read at scrape time), and the session observability added in #38 — the live
+	// active-sessions gauge (a collector over the Manager) and the session-lifetime
+	// histograms (pushed on session end via the Manager's observer hook). It is
+	// built here, before the Manager, so the Manager's end-observer can feed the
+	// histograms; the collectors over the server/Manager are registered once those
+	// exist, just below.
+	m := metrics.New()
+
 	mgr := session.NewManager(sessStore, histStore,
 		session.WithLogger(logger),
 		session.WithTTL(scfg.TTL),
 		// Concurrent-session cap per owner key (#37): 0 = unlimited.
 		session.WithMaxSessionsPerKey(scfg.MaxSessionsPerKey),
+		// Session observability (#38): record each session's turn count and lifetime
+		// in the Prometheus histograms when it ends (delete or idle expiry). nil-safe
+		// and bounded-cardinality (no session/key id is observed, only the aggregates).
+		session.WithSessionObserver(func(end session.SessionEndStats) {
+			m.ObserveSessionEnd(end.Turns, end.Duration)
+		}),
 	)
 	mgr.Start()
 	defer func() { _ = mgr.Close() }()
+
+	// The live session collector reads the Manager's active-session count at every
+	// scrape, so agentgpu_active_sessions always reflects current state. A
+	// registration failure (a descriptor clash) is a programming error, surfaced as
+	// a startup error rather than silently dropped.
+	if err := m.RegisterSessionCollector(mgr); err != nil {
+		return fmt.Errorf("register session metrics collector: %w", err)
+	}
 
 	gs := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -229,18 +254,15 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 	srv.Start()
 	defer func() { _ = srv.Close() }()
 
-	// Prometheus instrument (#24): one registry shared by the request-path
-	// collectors (updated inline by the HTTP layer) and the live server collector
-	// (read at scrape time). Building it here, before the HTTP server, lets the
-	// request path record into it; the server collector is registered just below
-	// once srv exists. metricsAddr is the resolved metrics listener address; the
-	// MetricsListenDisabled sentinel maps to "" which disables the listener.
+	// metricsAddr is the resolved metrics listener address; the
+	// MetricsListenDisabled sentinel maps to "" which disables the listener. The
+	// instrument itself (m) was built above, before the Manager, so the request
+	// path and the session end-observer can both feed it.
 	metricsAddr := config.MetricsListenAddr(cfg.MetricsListen)
-	m := metrics.New()
-	// The live collector reads queue depth, the fleet, the time-in-queue
-	// distribution, and affinity counters from the control-plane server at every
-	// scrape. A registration failure (a descriptor clash) is a programming error,
-	// so surface it as a startup error rather than silently dropping the metrics.
+	// The live server collector reads queue depth, the fleet, the time-in-queue
+	// distribution, and the affinity/rebind counters from the control-plane server
+	// at every scrape. A registration failure (a descriptor clash) is a programming
+	// error, so surface it as a startup error rather than silently dropping the metrics.
 	if err := m.RegisterServerCollector(srv); err != nil {
 		return fmt.Errorf("register metrics collector: %w", err)
 	}

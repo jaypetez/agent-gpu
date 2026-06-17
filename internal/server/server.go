@@ -359,13 +359,22 @@ type Server struct {
 	// warmed (KeepAliveSeconds stays 0 → Ollama's own default applies).
 	modelWarmMax time.Duration
 
-	// affinityMu guards the affinity hit/miss counters below. A hit is counted
-	// when a turn routes to the worker its session was already bound to; a miss
-	// when the session had a binding but a different worker was chosen (a rebind).
-	// No counting happens when there is no session or no prior binding.
-	affinityMu     sync.Mutex
-	affinityHits   uint64
-	affinityMisses uint64
+	// affinityMu guards the affinity hit/miss/rebind counters below. A hit is
+	// counted when a turn routes to the worker its session was already bound to; a
+	// miss when the session had a binding but a different worker was chosen (a
+	// rebind). No counting happens when there is no session or no prior binding.
+	//
+	// affinityRebinds counts the same events as affinityMisses today — a turn whose
+	// session re-bound to a different worker because the bound one was
+	// gone/draining/stale/unfit — and is surfaced as the dedicated
+	// agentgpu_session_rebinds_total metric (#38). It is tracked as its own counter
+	// (rather than reusing misses) so "a session moved workers" stays a distinct,
+	// clearly-named signal even if the miss accounting later grows cases that are
+	// not rebinds.
+	affinityMu      sync.Mutex
+	affinityHits    uint64
+	affinityMisses  uint64
+	affinityRebinds uint64
 
 	// waitMu guards the time-in-queue distribution below: the count of placed-
 	// from-queue jobs, the running sum and max of their queue wait (ms), and the
@@ -1101,8 +1110,12 @@ func (s *Server) recordAffinity(ctx context.Context, job types.Job, keyID, chose
 		s.affinityMu.Unlock()
 	default:
 		// Bound worker was not chosen (rebind): affinity miss, update the binding.
+		// A miss here is exactly a rebind (the session moves to a different worker),
+		// so bump both counters under the one lock; rebinds surfaces as the dedicated
+		// agentgpu_session_rebinds_total metric (#38).
 		s.affinityMu.Lock()
 		s.affinityMisses++
+		s.affinityRebinds++
 		s.affinityMu.Unlock()
 		s.log.Debug("affinity: rebinding session",
 			"session", job.SessionID, "key_id", keyID, "old_worker", preferred, "new_worker", chosen)
@@ -1260,17 +1273,23 @@ func (s *Server) QueueStats() queue.Stats { return s.queue.Stats() }
 // bound to (warm KV cache reused); Misses counts turns that rebound to a
 // different worker because the bound one was gone/draining/stale/unfit. Neither
 // counts a session's first turn (no prior binding) nor any non-session job.
+//
+// Rebinds (#38) counts the session→worker rebindings — a turn whose session moved
+// to a different worker. It equals Misses today (every miss is a rebind) but is
+// reported separately so the rebind signal stays distinct and clearly named; the
+// metrics layer exports it as agentgpu_session_rebinds_total.
 type AffinityStats struct {
-	Hits   uint64
-	Misses uint64
+	Hits    uint64
+	Misses  uint64
+	Rebinds uint64
 }
 
-// AffinityStats returns a point-in-time snapshot of the affinity hit/miss
-// counters. It mirrors QueueStats as the metrics seam for #24 (Prometheus).
+// AffinityStats returns a point-in-time snapshot of the affinity hit/miss/rebind
+// counters. It mirrors QueueStats as the metrics seam for #24/#38 (Prometheus).
 func (s *Server) AffinityStats() AffinityStats {
 	s.affinityMu.Lock()
 	defer s.affinityMu.Unlock()
-	return AffinityStats{Hits: s.affinityHits, Misses: s.affinityMisses}
+	return AffinityStats{Hits: s.affinityHits, Misses: s.affinityMisses, Rebinds: s.affinityRebinds}
 }
 
 // WaitBucket is one cumulative bucket of the time-in-queue histogram: Count is
