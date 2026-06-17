@@ -262,6 +262,7 @@ container itself) — use the Ollama service name or `host.docker.internal`. See
 
 - [Architecture](docs/architecture.md) — the implemented design, request flow, and scheduler.
 - [API Reference](docs/api-reference.md) — the HTTP surface, generated from [`openapi.yaml`](openapi.yaml).
+- [Multi-Turn Sessions](docs/sessions.md) — the two session modes, model warmth, and limits, with `curl` examples.
 - [Developer Guide](docs/developer-guide.md) — build, run, and contribute to the code.
 - [Running with Docker](docs/docker.md) — the container images and the Compose dev stack.
 - [Metrics (Prometheus)](docs/metrics.md) — the `/metrics` endpoint and its reference.

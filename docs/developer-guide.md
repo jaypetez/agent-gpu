@@ -261,6 +261,8 @@ documented in [docs/releasing.md](releasing.md).
 - [README](../README.md) — project overview, install, and end-user quickstart.
 - [Architecture](architecture.md) — the deep dive on the implemented design.
 - [API Reference](api-reference.md) — the OpenAPI 3.1 contract for the HTTP API.
+- [Multi-Turn Sessions](sessions.md) — the two session modes (affinity vs.
+  stateful), model warmth (`keep_alive`), and limits, with `curl` examples.
 - [Testing](testing.md) · [Load testing](load-testing.md) — the test suite and
   the performance harness.
 - [Running with Docker](docker.md) — images and the Compose dev stack.
