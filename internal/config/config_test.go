@@ -62,6 +62,53 @@ func TestResolveServer(t *testing.T) {
 	})
 }
 
+func TestResolveHTTPAddr(t *testing.T) {
+	t.Parallel()
+	t.Run("default", func(t *testing.T) {
+		t.Parallel()
+		if got := ResolveHTTPAddr("", env(nil)); got != DefaultHTTPAddr {
+			t.Fatalf("got %q, want default %q", got, DefaultHTTPAddr)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveHTTPAddr("", env(map[string]string{EnvHTTPAddr: "http://api:9000"}))
+		if got != "http://api:9000" {
+			t.Fatalf("got %q, want env value", got)
+		}
+	})
+	t.Run("flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveHTTPAddr("http://flag:1", env(map[string]string{EnvHTTPAddr: "http://api:9000"}))
+		if got != "http://flag:1" {
+			t.Fatalf("got %q, want flag value", got)
+		}
+	})
+}
+
+func TestResolveToken(t *testing.T) {
+	t.Parallel()
+	t.Run("default is empty", func(t *testing.T) {
+		t.Parallel()
+		if got := ResolveToken("", env(nil)); got != "" {
+			t.Fatalf("got %q, want empty default", got)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Parallel()
+		if got := ResolveToken("", env(map[string]string{EnvToken: "agpu_a_b"})); got != "agpu_a_b" {
+			t.Fatalf("got %q, want env value", got)
+		}
+	})
+	t.Run("flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveToken("agpu_flag_x", env(map[string]string{EnvToken: "agpu_a_b"}))
+		if got != "agpu_flag_x" {
+			t.Fatalf("got %q, want flag value", got)
+		}
+	})
+}
+
 func TestResolveStorePath(t *testing.T) {
 	t.Parallel()
 	home := func() (string, error) { return "/home/u", nil }

@@ -19,7 +19,9 @@ func TestKeyCLIFlow(t *testing.T) {
 	run := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		full := append(args, "--store", path)
+		// --local exercises the on-disk store (offline bootstrap) path; the default
+		// mode targets a running server over HTTP (covered in http_test.go).
+		full := append(args, "--local", "--store", path)
 		if err := runKeyCmd(ctx, &out, full); err != nil {
 			t.Fatalf("runKeyCmd %v: %v", args, err)
 		}
@@ -67,9 +69,12 @@ func TestKeyCLIFlow(t *testing.T) {
 func TestKeyCreateRequiresName(t *testing.T) {
 	t.Parallel()
 	var out bytes.Buffer
-	err := runKeyCmd(context.Background(), &out, []string{"create", "--store", filepath.Join(t.TempDir(), "k.json")})
+	err := runKeyCmd(context.Background(), &out, []string{"create", "--local", "--store", filepath.Join(t.TempDir(), "k.json")})
 	if err == nil {
 		t.Fatal("expected error when --name omitted")
+	}
+	if exitCode(err) != exitUsage {
+		t.Fatalf("missing --name should be a usage error, got exit %d", exitCode(err))
 	}
 }
 

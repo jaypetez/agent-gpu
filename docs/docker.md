@@ -62,14 +62,19 @@ The server is up once an unauthenticated request to `/v1/models` returns `401`
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/v1/models   # -> 401
 ```
 
-Manage API keys with the same binary inside the container:
+Bootstrap the first admin key with the same binary inside the container. Use
+`--local` so it writes the on-disk store on the `/data` volume (there is no admin
+token yet to authenticate against the running server):
 
 ```bash
-docker exec agentgpu-server /agentgpu key create --name my-agent
+docker exec agentgpu-server /agentgpu key create --name admin --role admin --local
 ```
 
-> The `key` commands write to the same `/data` volume, so run them against the
-> server container (or any container with that volume mounted).
+> `--local` writes to the same `/data` volume, so run it against the server
+> container (or any container with that volume mounted). The server reads the
+> store at boot, so restart the server after a `--local` change for it to take
+> effect (see [Bootstrapping keys](#bootstrapping-keys) for managing a running
+> server over the HTTP admin API with the resulting admin token).
 
 ## Running a worker
 
@@ -185,32 +190,41 @@ docker compose up -d --scale worker=3
 
 ### Bootstrapping keys
 
-There is no auto-seeded admin key. Mint keys with the same binary inside the
-running `server` container; they are written to the `/data` volume. The plaintext
-token is printed **once** — save it.
+There is no auto-seeded admin key. The first admin key is a chicken-and-egg: there
+is no token yet to authenticate with, so mint it directly into the on-disk store
+with `--local` (written to the `/data` volume) and restart the server **once** so
+it loads at boot. The plaintext token is printed **once** — save it.
 
 ```bash
-# An admin key (sees every model; can list the fleet and run inference).
-docker compose exec server /agentgpu key create --name admin --role admin
-
-# A user key scoped to a single model (deny-by-default otherwise).
-docker compose exec server /agentgpu key create --name app --role user --allow-model qwen2:0.5b
+# 1. Bootstrap the first admin key offline, then restart so the server loads it.
+docker compose exec server /agentgpu key create --name admin --role admin --local
+docker compose restart server
 ```
 
-> **Restart the server after creating keys.** The file-backed key store is loaded
-> into memory **once at server start** and is not hot-reloaded, so a key created
-> while the server is already running is on the `/data` volume but the running
-> server does not see it yet — it returns `401 invalid api key` until it reloads.
-> Create the keys you need, then:
->
-> ```bash
-> docker compose restart server
-> ```
->
-> After the restart the new keys authenticate. (The richer admin/key HTTP
-> endpoints under `/v1/admin/keys` _do_ take effect immediately, because they
-> mutate the running server's own store — but they require an existing admin key,
-> which is exactly the bootstrap chicken-and-egg the restart solves.)
+After that, manage everything over the running server's HTTP admin API with the
+admin token — these changes take effect **immediately** (no restart):
+
+```bash
+# 2. Point the CLI at the running server with the admin token from step 1.
+export ADMIN_TOKEN=<the admin token>
+alias agentgpu='docker compose exec -e AGENTGPU_TOKEN=$ADMIN_TOKEN -e AGENTGPU_HTTP_ADDR=http://localhost:8080 server /agentgpu'
+
+# A user key scoped to a single model (deny-by-default otherwise).
+agentgpu key create --name app --role user --allow-model qwen2:0.5b   # save the token
+
+# Manage live: revoke, rotate, quotas, permissions, catalog — all immediate.
+agentgpu key revoke <id>
+agentgpu quota set <id> --rpm 60 --tpm 1000
+agentgpu models list
+```
+
+> **Why `--local` only for the first key.** The file-backed key store is loaded
+> into memory **once at server start** and is not hot-reloaded, so a `--local` key
+> created while the server is already running is on the `/data` volume but the
+> running server does not see it until it reloads — hence the one restart in step
+> 1. The CLI's default (HTTP) mode and the admin endpoints under `/v1/admin/keys`
+> mutate the running server's own store, so they take effect immediately — they
+> just need the admin token that step 1 bootstraps.
 
 Verify the worker registered (admin key required, after the restart above):
 
@@ -250,7 +264,7 @@ loads that store at start, the restart that activates a CLI-created key is the
 same step that proves persistence:
 
 ```bash
-docker compose exec server /agentgpu key create --name persists --role admin   # save the token
+docker compose exec server /agentgpu key create --name persists --role admin --local  # save the token
 docker compose restart server
 # The same token now authenticates — the key came back from the volume on reload:
 curl -s -o /dev/null -w '%{http_code}\n' \

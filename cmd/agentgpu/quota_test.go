@@ -20,7 +20,10 @@ func TestKeyQuotaCLIFlow(t *testing.T) {
 	run := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		if err := runKeyCmd(ctx, &out, args); err != nil {
+		// --local exercises the on-disk store path; the HTTP (running-server) path
+		// is covered in http_test.go.
+		full := append(args, "--local")
+		if err := runKeyCmd(ctx, &out, full); err != nil {
 			t.Fatalf("runKeyCmd %v: %v", args, err)
 		}
 		return out.String()
@@ -71,7 +74,8 @@ func TestKeyQuotaClear(t *testing.T) {
 	run := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		if err := runKeyCmd(ctx, &out, args); err != nil {
+		full := append(args, "--local")
+		if err := runKeyCmd(ctx, &out, full); err != nil {
 			t.Fatalf("runKeyCmd %v: %v", args, err)
 		}
 		return out.String()

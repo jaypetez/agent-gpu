@@ -35,6 +35,16 @@ const (
 	// enforced at the HTTP request boundary (#6), independent of per-key quota.
 	EnvGlobalRPM = "AGENTGPU_GLOBAL_RPM"
 	EnvGlobalTPM = "AGENTGPU_GLOBAL_TPM"
+	// EnvHTTPAddr is the base URL of the public HTTP API the `agentgpu` CLI
+	// targets when managing a RUNNING server (key/quota/models commands), e.g.
+	// http://127.0.0.1:8080. It is the client-side counterpart of EnvHTTPListen
+	// (the server's bind address): a full URL with scheme, not a bare host:port,
+	// and deliberately distinct from EnvWorkerServer (the worker→server gRPC addr)
+	// so the HTTP client never targets the gRPC control plane.
+	EnvHTTPAddr = "AGENTGPU_HTTP_ADDR"
+	// EnvToken is the admin Bearer token the CLI authenticates with against the
+	// running server's admin API (agpu_<id>_<secret>).
+	EnvToken = "AGENTGPU_TOKEN"
 )
 
 // Defaults.
@@ -60,6 +70,10 @@ const (
 	// DefaultGPUDetect is the default for the worker's automatic GPU detection
 	// (#16): on, so a worker advertises real hardware capacity out of the box.
 	DefaultGPUDetect = true
+	// DefaultHTTPAddr is the base URL the `agentgpu` CLI targets when no
+	// --server/--url flag or AGENTGPU_HTTP_ADDR is set: the loopback HTTP API on
+	// the default port (the http:// counterpart of DefaultHTTPListen).
+	DefaultHTTPAddr = "http://127.0.0.1:8080"
 )
 
 // ServerConfig configures the server process.
@@ -221,6 +235,35 @@ func ResolveOllamaURL(flagValue string, look EnvLookup) string {
 		return flagValue
 	}
 	return envOr(look, EnvOllamaURL, DefaultOllamaURL)
+}
+
+// ResolveHTTPAddr resolves the base URL the CLI targets for the public HTTP API
+// (the admin + catalog endpoints) with flag > env > default precedence. An empty
+// flag value means "unset". The result is a full URL (scheme + host:port), e.g.
+// http://127.0.0.1:8080 — it is consumed by internal/apiclient, never used as a
+// gRPC dial target, so it must not be confused with EnvWorkerServer.
+func ResolveHTTPAddr(flagValue string, look EnvLookup) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvHTTPAddr, DefaultHTTPAddr)
+}
+
+// ResolveToken resolves the admin Bearer token the CLI authenticates with, using
+// flag > env > default("") precedence. An empty flag value means "unset"; an
+// empty result means "no token configured" (the CLI then errors with guidance to
+// either provide --token or use --local for offline store management).
+func ResolveToken(flagValue string, look EnvLookup) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvToken, "")
 }
 
 // ResolveGPUDetect resolves the worker's automatic-GPU-detection toggle (#16)

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
 	"strings"
 
@@ -31,7 +30,7 @@ func parseModels(s string) []types.Model {
 
 func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error {
 	if len(args) < 1 || args[0] != "start" {
-		return fmt.Errorf("usage: agentgpu worker start --server host:port [--id worker-id] [--models name,name]")
+		return usagef("usage: agentgpu worker start --server host:port [--id worker-id] [--models name,name]")
 	}
 
 	fs := flag.NewFlagSet("worker start", flag.ContinueOnError)
@@ -43,13 +42,14 @@ func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	gpuDetect := fs.Bool("gpu-detect", config.DefaultGPUDetect, "auto-detect local GPU capacity for heartbeats (default true or $AGENTGPU_GPU_DETECT)")
 	gpuType := fs.String("gpu-type", "", "manual GPU type override when detection is off/unavailable (or $AGENTGPU_GPU_TYPE)")
 	totalVRAM := fs.Uint64("total-vram", 0, "manual total VRAM in bytes when detection is off/unavailable (or $AGENTGPU_TOTAL_VRAM)")
-	if err := fs.Parse(args[1:]); err != nil {
+	setUsage(fs, "Usage: agentgpu worker start --server host:port [--id worker-id] [--models name,name] [flags]")
+	if err := parseFlags(fs, args[1:]); err != nil {
 		return err
 	}
 
 	cfg := config.ResolveWorker(config.WorkerConfig{ServerAddr: *srvAddr, WorkerID: *id}, nil, nil)
 	if cfg.ServerAddr == "" {
-		return fmt.Errorf("--server is required (or set %s)", config.EnvWorkerServer)
+		return usagef("--server is required (or set %s)", config.EnvWorkerServer)
 	}
 	heartbeatInterval := config.ResolveHeartbeatInterval(*hbInterval, nil)
 	models := parseModels(*modelsFlag)

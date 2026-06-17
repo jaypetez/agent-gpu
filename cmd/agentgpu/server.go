@@ -39,7 +39,7 @@ const httpShutdownTimeout = 10 * time.Second
 
 func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error {
 	if len(args) < 1 || args[0] != "start" {
-		return fmt.Errorf("usage: agentgpu server start [--listen host:port]")
+		return usagef("usage: agentgpu server start [--listen host:port]")
 	}
 
 	fs := flag.NewFlagSet("server start", flag.ContinueOnError)
@@ -56,7 +56,8 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	hbTimeout := fs.Duration("heartbeat-timeout", 0, "evict a worker after this long without a heartbeat (default 45s or $AGENTGPU_HEARTBEAT_TIMEOUT)")
 	sessionPath := fs.String("session-path", "", "path to the session+history checkpoint (default $AGENTGPU_SESSION_PATH or ~/.agentgpu/sessions.json)")
 	sessionTTL := fs.Duration("session-ttl", 0, "per-session idle timeout (default 30m or $AGENTGPU_SESSION_TTL)")
-	if err := fs.Parse(args[1:]); err != nil {
+	setUsage(fs, "Usage: agentgpu server start [--listen host:port] [--http-listen host:port] [flags]")
+	if err := parseFlags(fs, args[1:]); err != nil {
 		return err
 	}
 
