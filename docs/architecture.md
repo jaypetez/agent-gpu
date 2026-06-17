@@ -878,6 +878,88 @@ and a checkpoint on graceful shutdown.
 > The formal OpenAPI 3.1 spec ([`openapi.yaml`](../openapi.yaml), #14) documents these session
 > endpoints and the two chat modes. This document remains the prose companion to that spec.
 
+## Observability / structured logging
+
+All processes log through Go's standard `log/slog`. The single root logger is built **once** in
+`cmd/agentgpu` (`newLogger`) and passed into both `server start` and `worker start`, so every
+subsystem (auth, authz, quota, scheduler, session, GPU, worker, HTTP) shares one configured logger
+with no per-subsystem setup. Subsystems accept it via a `WithLogger(...)` option and default to
+`slog.Default()` when unset.
+
+### Configurable level, format, and output
+
+Logging is configured with the standard **flag > env > default** precedence (`config.ResolveLog`),
+so the level — and the encoding and sink — can change **without a code change**:
+
+| Setting | Env var               | Values                              | Default  |
+| ------- | --------------------- | ----------------------------------- | -------- |
+| Level   | `AGENTGPU_LOG_LEVEL`  | `debug` / `info` / `warn` / `error` | `info`   |
+| Format  | `AGENTGPU_LOG_FORMAT` | `json` / `text`                     | `json`   |
+| Output  | `AGENTGPU_LOG_OUTPUT` | `stderr` / `stdout` / a file path   | `stderr` |
+
+- **JSON by default** so logs are structured and parseable for an aggregator out of the box; `text`
+  is selectable for human-friendly local development.
+- An **unrecognized level or format** degrades to the `info`/`json` default rather than erroring, so
+  a typo in an env var cannot wedge startup. A **file output that cannot be opened** is a loud
+  startup error (not a silent drop); the file is closed on shutdown so its buffer is flushed.
+
+### Correlation IDs (end-to-end tracing)
+
+A single id makes one request traceable across the whole system. The outermost HTTP middleware
+(`requestIDMiddleware`, ahead of auth) establishes it before anything else runs:
+
+- it **honors an inbound `X-Request-Id`** when the client (or an upstream proxy) supplies a clean
+  one, otherwise **mints** an unguessable `req-<hex>` id;
+- it stashes the id and a **request-scoped logger** (`s.log.With("request_id", …)`) on the context,
+  so every server-side line a handler logs carries `request_id`;
+- it **echoes the id in the `X-Request-Id` response header** — set before the handler runs, so even
+  an unauthenticated **401** carries one.
+
+The dispatched **`Job.ID` is set to that same id**, so `request_id == job_id`. `Job.ID` already
+crosses the gRPC wire, so the id rides the job to the worker, which logs an `executing job` line
+carrying `job_id`. The server's placement/queue/throttle lines also carry `job_id`. One id therefore
+follows a request **HTTP boundary → server submit/placement → worker job execution**:
+
+```text
+client → server : X-Request-Id (or minted)  → request_id on every server log line
+server → worker : Job.ID == request_id        → worker "executing job" {job_id}
+server → client : X-Request-Id response header (same id, even on 401)
+```
+
+An inbound id is validated against a small allow-list (alphanumerics and `-_.`, bounded length); a
+value with any other character — a stand-in for a log-injection / header-splitting payload — is
+**rejected and replaced** with a freshly minted id, so an attacker-controlled header can never reach
+the logs or the echoed response verbatim. The middleware itself logs nothing and never touches the
+`Authorization` value.
+
+### Secret redaction
+
+No secret material (keys, tokens, hashes, salts) ever reaches the logs, guaranteed two ways:
+
+- **Type-level (`store.APIKey.LogValue`).** `APIKey` implements `slog.LogValuer`, returning a group
+  of only safe fields (`id`, `name`, `roles`, `revoked`) and **omitting `SecretHash`/`Salt`
+  entirely**. Any accidental `slog`-ing of a whole key is auto-redacted at the source.
+- **Handler backstop (`ReplaceAttr`).** The root handler masks the value of any attribute whose key
+  names a secret (case-insensitive: `secret`, `secret_hash`, `salt`, `token`, `authorization`,
+  `password`, `api_key`, `bearer`, …) to `[REDACTED]`, catching stringly-typed leaks at any nesting
+  level — including through a `.With` chain such as the request-scoped logger.
+
+Both are covered by tests that log an `APIKey`, a `token` attribute, and a raw `secret_hash`/`salt`
+and assert **none** of the secret material (in any base64/hex/raw encoding) appears in the output.
+
+### Sampling
+
+Sampling is intentionally **not** implemented: there is no high-volume log path. Logging is
+**per-job** (bounded by job count), and the per-token streaming paths log nothing. Verbose detail is
+gated at `Debug` (filtered out by the default `info` level), so the level knob — not a sampler — is
+the lever if verbose logging is ever added.
+
+### Metrics
+
+Metrics export is **out of scope** here (#24). Queue depth, affinity hit/miss, time-in-queue, and
+throttle counts are exposed today as plain accessor methods (`QueueStats`, `AffinityStats`,
+`WaitTimeStats`, `RateLimitStats`) and structured logs; #24 turns them into Prometheus metrics.
+
 ## State
 
 Authentication, permission rules, and quota counters are persisted so they survive restarts.

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/jaypetez/agent-gpu/internal/config"
 )
 
 // dispatch routes the non-informational subcommands. It is split from run so the
@@ -18,7 +20,17 @@ func dispatch(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Build the single root logger both the server and worker inherit (#23):
+	// level/format/output resolved from env + defaults (flag > env > default), so
+	// the log level is configurable without a code change. The redaction
+	// ReplaceAttr and JSON-by-default encoding live in newLogger so they apply
+	// uniformly to every subsystem that takes this logger. A file sink (if any) is
+	// closed on the way out so its buffer is flushed.
+	logger, closeLog, err := newLogger(config.ResolveLog(config.LogConfig{}, nil))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closeLog() }()
 	slog.SetDefault(logger)
 
 	switch args[0] {

@@ -11,6 +11,7 @@ package store
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -80,6 +81,22 @@ type Limits struct {
 
 // Revoked reports whether the key has been revoked.
 func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
+// LogValue implements slog.LogValuer so that logging an APIKey (or a struct
+// embedding one) can NEVER leak secret material (#23). It returns a group of
+// only the safe, non-sensitive identifying fields — the opaque id, the name,
+// the roles, and whether the key is revoked — and deliberately omits SecretHash
+// and Salt entirely. This is the type-level redaction guarantee: any accidental
+// slog call that passes a whole APIKey is auto-redacted at the source, before
+// the handler's ReplaceAttr backstop ever runs.
+func (k APIKey) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("id", k.ID),
+		slog.String("name", k.Name),
+		slog.Any("roles", k.Roles),
+		slog.Bool("revoked", k.Revoked()),
+	)
+}
 
 // Store is the persistence interface for control-plane state. Implementations
 // must be safe for concurrent use. Real backends (Redis/Postgres) and the

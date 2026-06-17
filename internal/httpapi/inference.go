@@ -61,6 +61,21 @@ func newID(prefix string) string {
 	return prefix + hex.EncodeToString(b[:])
 }
 
+// jobIDFor returns the id to stamp on the dispatched job. It reuses the request
+// correlation id (X-Request-Id, set by requestIDMiddleware) so request_id ==
+// job_id: one id follows the request from the HTTP boundary, through the
+// server's submit/placement logs, across the gRPC wire (Job.ID), to the worker's
+// job-execution log line — making a single request traceable end-to-end (#23).
+// If no correlation id is on the context (a handler exercised outside the
+// middleware chain, e.g. some unit tests), it falls back to a freshly minted
+// "job-" id so the job is still uniquely identified.
+func jobIDFor(r *http.Request) string {
+	if id, ok := requestIDFromContext(r.Context()); ok && id != "" {
+		return id
+	}
+	return newID("job-")
+}
+
 // finishReasonOrStop normalizes a worker-reported finish_reason for the wire:
 // an empty reason becomes "stop" so the OpenAI-required field is always set.
 func finishReasonOrStop(r string) string {
@@ -117,7 +132,9 @@ func statusForError(err error) (status int, code, msg string) {
 func (s *Server) writeSubmitError(w http.ResponseWriter, r *http.Request, err error) {
 	status, code, msg := statusForError(err)
 	if status == http.StatusInternalServerError {
-		s.log.Error("inference submit failed", "err", err)
+		// Use the request-scoped logger so the failure carries request_id (==
+		// job_id), correlating it with the rest of the request's server-side logs.
+		s.reqLog(r.Context()).Error("inference submit failed", "err", err)
 	}
 	if status == http.StatusTooManyRequests && errors.Is(err, quota.ErrQuotaExceeded) {
 		s.annotatePerKey429(w, r)
@@ -145,7 +162,7 @@ func (s *Server) annotatePerKey429(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.log.Warn("request throttled",
+	s.reqLog(r.Context()).Warn("request throttled",
 		"scope", "key",
 		"key_id", keyID,
 		"retry_after", retryAfter,

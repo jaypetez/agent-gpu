@@ -45,6 +45,15 @@ const (
 	// EnvToken is the admin Bearer token the CLI authenticates with against the
 	// running server's admin API (agpu_<id>_<secret>).
 	EnvToken = "AGENTGPU_TOKEN"
+	// EnvLogLevel / EnvLogFormat / EnvLogOutput configure structured logging (#23)
+	// for both the server and worker processes. Level is debug|info|warn|error;
+	// format is json|text (json by default so logs are aggregator-ready, text for
+	// local dev); output is stderr|stdout|<file path>. They are resolved once at
+	// startup (flag > env > default) so the log level is configurable without a
+	// code change.
+	EnvLogLevel  = "AGENTGPU_LOG_LEVEL"
+	EnvLogFormat = "AGENTGPU_LOG_FORMAT"
+	EnvLogOutput = "AGENTGPU_LOG_OUTPUT"
 )
 
 // Defaults.
@@ -74,6 +83,18 @@ const (
 	// --server/--url flag or AGENTGPU_HTTP_ADDR is set: the loopback HTTP API on
 	// the default port (the http:// counterpart of DefaultHTTPListen).
 	DefaultHTTPAddr = "http://127.0.0.1:8080"
+	// DefaultLogLevel is the default structured-logging level (#23): info, so
+	// routine lifecycle/decision lines are emitted while debug-only verbosity is
+	// filtered out by default.
+	DefaultLogLevel = "info"
+	// DefaultLogFormat is the default log encoding (#23): json, so logs are
+	// structured and parseable for aggregators out of the box. "text" is selectable
+	// for human-friendly local development.
+	DefaultLogFormat = "json"
+	// DefaultLogOutput is the default log sink (#23): stderr, so logs do not
+	// intermix with any stdout protocol output and follow the twelve-factor
+	// convention. "stdout" or a file path are selectable alternatives.
+	DefaultLogOutput = "stderr"
 )
 
 // ServerConfig configures the server process.
@@ -135,6 +156,26 @@ type SessionConfig struct {
 	MaxTurns int
 	// MaxBytes is the per-session cumulative-content byte cap (0 = unbounded).
 	MaxBytes int
+}
+
+// LogConfig configures structured logging (#23) for the server and worker
+// processes: the minimum level emitted, the encoding, and the sink. It is a
+// plain value struct (no slog dependency) so the config package stays leaf,
+// mirroring QuotaConfig/SessionConfig; the cmd layer turns it into an
+// *slog.Logger (see cmd/agentgpu/logging.go). The same resolved config seeds the
+// single root logger both subcommands inherit, so logging is configured in one
+// place with no per-subsystem duplication.
+type LogConfig struct {
+	// Level is the minimum level emitted: debug|info|warn|error. An unrecognized
+	// value falls back to DefaultLogLevel when the logger is built.
+	Level string
+	// Format is the encoding: json (structured/aggregator-ready) or text
+	// (human-friendly). An unrecognized value falls back to DefaultLogFormat.
+	Format string
+	// Output is the sink: stderr, stdout, or a writable file path. A file path
+	// that cannot be opened surfaces as a startup error rather than a silent
+	// fallback, so a misconfigured sink is loud.
+	Output string
 }
 
 // EnvLookup is the signature of os.LookupEnv, injectable for tests.
@@ -431,6 +472,30 @@ func ResolveSession(flags SessionConfig, look EnvLookup, homeDir func() (string,
 	}
 	if out.MaxBytes <= 0 {
 		out.MaxBytes = DefaultSessionMaxBytes
+	}
+	return out
+}
+
+// ResolveLog fills a LogConfig with flag > env > default precedence for each of
+// the level, format, and output fields (#23). An empty flag field means "unset"
+// (consult the env, then the default), so a process that passes no logging flags
+// is configured entirely from the environment and defaults — the log level is
+// thus changeable without a code change. Validation of the resolved values
+// (level/format spelling, opening a file sink) happens when the logger is built;
+// this only resolves the string precedence, mirroring ResolveServer/ResolveSession.
+func ResolveLog(flags LogConfig, look EnvLookup) LogConfig {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	out := flags
+	if out.Level == "" {
+		out.Level = envOr(look, EnvLogLevel, DefaultLogLevel)
+	}
+	if out.Format == "" {
+		out.Format = envOr(look, EnvLogFormat, DefaultLogFormat)
+	}
+	if out.Output == "" {
+		out.Output = envOr(look, EnvLogOutput, DefaultLogOutput)
 	}
 	return out
 }

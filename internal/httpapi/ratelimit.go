@@ -71,7 +71,7 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 				if key, ok := keyFromContext(r.Context()); ok {
 					keyID = key.ID
 				}
-				s.log.Warn("request throttled",
+				s.reqLog(r.Context()).Warn("request throttled",
 					"scope", "global",
 					"key_id", keyID,
 					"retry_after", retryAfter,
@@ -81,7 +81,7 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 			}
 			// Any other error from the global limiter is a server fault (e.g. a
 			// counter-store failure); fail closed with a 500 rather than admitting.
-			s.log.Error("global rate limit check failed", "err", err)
+			s.reqLog(r.Context()).Error("global rate limit check failed", "err", err)
 			writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
 			return
 		}

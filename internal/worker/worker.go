@@ -463,7 +463,18 @@ func (w *Worker) serve(runCtx, connCtx context.Context, stream agentgpuv1.Contro
 				return
 			case job := <-jobs:
 				atomic.AddInt32(&activeJobs, 1)
+				// Log the job-execution edge carrying job_id (== the server's request_id
+				// for an HTTP-originated job): this is the worker-side anchor that makes a
+				// single request traceable end-to-end (#23), from the HTTP boundary through
+				// the server's placement logs to here. Execute is logged at Info; a failure
+				// is surfaced at Warn with the job error. Both lines carry job_id + model.
+				w.cfg.Logger.Info("executing job", "worker", w.cfg.WorkerID, "job_id", job.ID, "model", job.Model)
 				res := w.cfg.Executor.Execute(connCtx, job, emit)
+				if res.Err != nil {
+					w.cfg.Logger.Warn("job failed", "worker", w.cfg.WorkerID, "job_id", job.ID, "model", job.Model, "err", res.Err)
+				} else {
+					w.cfg.Logger.Debug("job completed", "worker", w.cfg.WorkerID, "job_id", job.ID, "model", job.Model, "tokens", res.Tokens)
+				}
 				// Always send a terminal chunk so the server's accumulator resolves the
 				// waiter exactly once — even on failure, so the waiter never hangs.
 				emit(types.JobChunk{
