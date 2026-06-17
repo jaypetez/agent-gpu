@@ -84,6 +84,13 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Log the create with the new session_id (alongside request_id) so the
+	// conversation is traceable from its first moment, mirroring the session_id
+	// correlation the chat path adds (#38). The owner key id is already implied by
+	// auth and is not a metric label, but logging it here is consistent with the
+	// rest of the session lifecycle lines.
+	s.reqLog(r.Context()).Info("session created", "session_id", sess.ID, "model", sess.Model)
+
 	writeJSON(w, http.StatusCreated, sessionResponse{
 		ID:      sess.ID,
 		Object:  "session",
@@ -106,6 +113,9 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := r.PathValue("id")
+	// Bind session_id onto the request-scoped logger so any line this request logs
+	// (e.g. a lookup error) carries it alongside request_id (#38).
+	r = r.WithContext(s.withSessionLog(r.Context(), id))
 	sess, err := s.sessionMgr.Get(r.Context(), id, key.ID)
 	if err != nil {
 		s.writeSessionLookupError(r, w, err)
@@ -150,6 +160,9 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := r.PathValue("id")
+	// Bind session_id onto the request-scoped logger so the delete (and any lookup
+	// error) is traceable alongside request_id (#38).
+	r = r.WithContext(s.withSessionLog(r.Context(), id))
 	// Capture the bound worker + model before deleting, so we know where to send
 	// the unload. A lookup failure is non-fatal: Delete below produces the
 	// authoritative 404 for a missing/not-owned session.
@@ -161,6 +174,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		s.writeSessionLookupError(r, w, err)
 		return
 	}
+	s.reqLog(r.Context()).Info("session deleted")
 	s.unloadSessionModel(r.Context(), boundWorker, model)
 	w.WriteHeader(http.StatusNoContent)
 }

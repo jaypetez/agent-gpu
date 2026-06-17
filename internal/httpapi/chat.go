@@ -131,6 +131,20 @@ const (
 	modeStateful
 )
 
+// chatModeName renders a chatMode for log attributes (#38), so a session log line
+// states which session mode the turn used. Only the session-aware modes are ever
+// logged (the stateless path emits no session line).
+func chatModeName(m chatMode) string {
+	switch m {
+	case modeAffinity:
+		return "affinity"
+	case modeStateful:
+		return "stateful"
+	default:
+		return "stateless"
+	}
+}
+
 // resolveSession decides the session mode and id for a chat request. The two
 // session inputs express different intents:
 //
@@ -180,6 +194,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// in unit tests, never in cmd). Fail closed rather than silently dropping it.
 		writeError(w, http.StatusNotImplemented, "not_implemented", "sessions are not enabled")
 		return
+	}
+	// For a session-aware turn, bind session_id onto the request-scoped logger so
+	// every line this turn logs carries both request_id (this turn) and session_id
+	// (the conversation), making a multi-turn conversation traceable end-to-end
+	// (#38). A stateless request is left untouched (no empty session_id attribute).
+	if mode != modeStateless {
+		r = r.WithContext(s.withSessionLog(r.Context(), sessionID))
+		s.reqLog(r.Context()).Info("session chat turn", "mode", chatModeName(mode), "model", req.Model)
 	}
 
 	job := types.Job{

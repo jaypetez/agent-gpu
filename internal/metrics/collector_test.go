@@ -211,6 +211,22 @@ agentgpu_affinity_total{result="miss"} 2
 	}
 }
 
+// TestCollectorSessionRebinds asserts the explicit rebind counter surfaces as
+// agentgpu_session_rebinds_total, read from AffinityStats.Rebinds (#38).
+func TestCollectorSessionRebinds(t *testing.T) {
+	src := &fakeStatsSource{affinity: server.AffinityStats{Hits: 7, Misses: 2, Rebinds: 2}}
+	reg := registerCollector(t, src)
+
+	want := `
+# HELP agentgpu_session_rebinds_total Total session affinity rebindings since startup: a turn whose session moved to a different worker because the bound one was gone/draining/stale/unfit. Equals affinity_total{result="miss"}.
+# TYPE agentgpu_session_rebinds_total counter
+agentgpu_session_rebinds_total 2
+`
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "agentgpu_session_rebinds_total"); err != nil {
+		t.Fatalf("session_rebinds_total mismatch:\n%v", err)
+	}
+}
+
 // TestCollectorNilSourceEmitsNothing proves a collector over a nil source
 // contributes no metrics (rather than erroring the whole scrape).
 func TestCollectorNilSourceEmitsNothing(t *testing.T) {

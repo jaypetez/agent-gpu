@@ -52,6 +52,15 @@ type Manager struct {
 	// injectable so a test can force an id-generation failure deterministically.
 	randRead func([]byte) (int, error)
 
+	// obs, when set, is invoked exactly once when a session ENDS — on an explicit
+	// Delete or an idle-expiry sweep — with that session's lifetime stats (turn
+	// count and wall-clock duration). It is the nil-safe observability seam for #38:
+	// the cmd layer wires it to the Prometheus session-turns/duration histograms,
+	// while session.NewManager callers that do not opt in (and every existing test)
+	// see no behavior change. It is called synchronously while the end is processed,
+	// so the callback must be cheap and non-blocking (a histogram Observe is).
+	obs func(SessionEndStats)
+
 	// sweepInterval is the wall-clock cadence at which the sweeper wakes to
 	// re-evaluate expiry against the (possibly injected) clock.
 	sweepInterval time.Duration
@@ -63,8 +72,50 @@ type Manager struct {
 	done      chan struct{}
 }
 
+// SessionEndStats is the lifetime summary of a session reported to a
+// SessionObserver when the session ends (#38). It carries only aggregate,
+// bounded-cardinality numbers — never the session id or owner key — so the
+// metrics layer can observe distributions (turns, duration) without ever
+// labeling by an unbounded identifier.
+type SessionEndStats struct {
+	// Turns is the number of stored conversation turns the session accumulated
+	// over its lifetime (its history length at end). 0 for a session that was
+	// created but never took a turn.
+	Turns int
+	// Duration is how long the session existed: end time minus CreatedAt, measured
+	// on the Manager's (possibly injected) clock. Never negative.
+	Duration time.Duration
+	// Reason is why the session ended: "deleted" (explicit Delete) or "expired"
+	// (idle-expiry sweep). It is a fixed, bounded set so it is safe as a metric
+	// label if the observer chooses to use it.
+	Reason string
+}
+
+// Session-end reasons reported in SessionEndStats.Reason.
+const (
+	// EndReasonDeleted marks a session ended by an explicit Delete.
+	EndReasonDeleted = "deleted"
+	// EndReasonExpired marks a session reaped by the idle-expiry sweeper.
+	EndReasonExpired = "expired"
+)
+
 // Option configures a Manager.
 type Option func(*Manager)
+
+// WithSessionObserver registers a callback invoked exactly once when a session
+// ends (explicit Delete or idle-expiry sweep), with that session's lifetime
+// SessionEndStats (#38). A nil callback is ignored (the default — sessions emit
+// no end events, so existing callers/tests are unaffected). The callback runs
+// synchronously on the end path, so it must be cheap and non-blocking (a
+// Prometheus histogram Observe is); the cmd layer wires it to the session-turns
+// and session-duration histograms.
+func WithSessionObserver(fn func(SessionEndStats)) Option {
+	return func(m *Manager) {
+		if fn != nil {
+			m.obs = fn
+		}
+	}
+}
 
 // WithLogger sets the structured logger. A nil logger is ignored.
 func WithLogger(l *slog.Logger) Option {
@@ -231,6 +282,28 @@ func (m *Manager) activeCount(ownerKeyID string) int {
 	return m.counts[ownerKeyID]
 }
 
+// ActiveSessions returns the total number of live (not-yet-expired-or-deleted)
+// sessions across all owners. It is the live read backing the
+// agentgpu_active_sessions gauge (#38): the metrics collector calls it at scrape
+// time, so the gauge always reflects the Manager's current state with no
+// background poller. It sums the per-owner active-session tally — the same
+// counter the concurrent-session cap maintains — which is O(distinct owners) and
+// holds only countMu briefly, so it is cheap to call on every scrape.
+//
+// The tally counts sessions that have idled out but not yet been swept (the
+// sweeper decrements on delete); this is intentional, mirroring the cap, so a
+// just-expired session is still "active" until reaped. The skew is bounded by
+// the sweep interval.
+func (m *Manager) ActiveSessions() int {
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	total := 0
+	for _, n := range m.counts {
+		total += n
+	}
+	return total
+}
+
 // Create mints a new active session owned by ownerKeyID targeting model. It
 // returns a copy of the created session, including its stable, unguessable id.
 func (m *Manager) Create(_ context.Context, ownerKeyID, model string) (Session, error) {
@@ -325,34 +398,49 @@ func (m *Manager) Delete(_ context.Context, id, ownerKeyID string) error {
 	if s.OwnerKeyID != ownerKeyID {
 		return ErrSessionNotFound
 	}
-	return m.deleteSession(id, s.OwnerKeyID)
+	return m.deleteSession(id, s.OwnerKeyID, EndReasonDeleted)
 }
 
-// deleteSession removes a session and its history and releases the owner's
-// concurrency slot EXACTLY ONCE (#37). History is deleted first so a crash
-// between the two leaves no session pointing at vanished history; an orphaned
-// history with no session is harmless (it is purged on the next load or can be
-// re-deleted).
+// deleteSession removes a session and its history, releases the owner's
+// concurrency slot, and emits the session-end observation (#38) EXACTLY ONCE.
 //
-// The session-row delete and the slot release are performed together under
-// countMu and gated on the session still being present, so a Delete racing the
-// sweeper (both targeting the same id) decrements the owner's tally only once:
-// whichever call observes the row removes it and releases the slot; the other
-// sees it already gone and does nothing. Without this gate the two idempotent
-// store deletes would each release a slot and under-count the owner.
-func (m *Manager) deleteSession(id, ownerKeyID string) error {
-	if err := m.history.DeleteBySession(id); err != nil {
-		return err
-	}
+// The whole removal — the presence re-check, the history delete, the session-row
+// delete, the slot release, and the end-observation — is performed together
+// under countMu and gated on the session still being present. So a Delete racing
+// the sweeper (both targeting the same id) takes effect only once: whichever call
+// observes the row does all the work; the other sees it already gone and does
+// nothing. This gate is what keeps the per-owner tally from being double-
+// decremented AND the end-observation (turns/duration) from being double-counted.
+//
+// Doing the work under the lock (rather than deleting history first, outside it)
+// also means the turn count read for the observation is the session's true final
+// history length: a concurrent remover cannot empty the history between the read
+// and the row delete. The session row is removed before its history within the
+// critical section, so on the off chance of a crash mid-section an orphaned
+// history with no session is the harmless outcome (purged on the next load),
+// never a session pointing at vanished history.
+//
+// reason ("deleted" | "expired") is forwarded to the observer so it can attribute
+// the end; it does not affect the removal itself.
+func (m *Manager) deleteSession(id, ownerKeyID, reason string) error {
 	m.countMu.Lock()
-	defer m.countMu.Unlock()
 	// Re-check presence under the lock; only the call that actually removes the row
-	// releases the slot, so concurrent removals of the same id decrement once.
-	if _, err := m.sessions.Get(id); err != nil {
-		// Already gone (e.g. reaped by a racing sweep): nothing to release here.
+	// does the rest, so concurrent removals of the same id take effect once.
+	s, err := m.sessions.Get(id)
+	if err != nil {
+		// Already gone (e.g. reaped by a racing sweep): nothing to do here.
+		m.countMu.Unlock()
 		return nil
 	}
+	// Capture the lifetime stats BEFORE deleting, while the history is still
+	// present, so the end-observation reports the true final turn count.
+	end, endOK := m.endStats(id, s, reason)
 	if err := m.sessions.Delete(id); err != nil {
+		m.countMu.Unlock()
+		return err
+	}
+	if err := m.history.DeleteBySession(id); err != nil {
+		m.countMu.Unlock()
 		return err
 	}
 	if n := m.counts[ownerKeyID]; n > 1 {
@@ -360,7 +448,36 @@ func (m *Manager) deleteSession(id, ownerKeyID string) error {
 	} else {
 		delete(m.counts, ownerKeyID)
 	}
+	m.countMu.Unlock()
+
+	// Emit the end-observation AFTER releasing the lock so a (cheap, non-blocking)
+	// observer never runs under countMu — and only here, in the single goroutine
+	// that actually removed the row, so it fires exactly once per session end.
+	if endOK && m.obs != nil {
+		m.obs(end)
+	}
 	return nil
+}
+
+// endStats builds the lifetime SessionEndStats for a session that is about to be
+// removed (#38): turns is its current stored history length and duration is
+// now-CreatedAt on the Manager's clock (clamped non-negative against clock skew).
+// It returns ok=false (and no observation is emitted) when no observer is wired,
+// so the history read is skipped entirely on the no-metrics path. Callers hold
+// countMu and call it BEFORE deleting the history so the turn count is final.
+func (m *Manager) endStats(id string, s Session, reason string) (SessionEndStats, bool) {
+	if m.obs == nil {
+		return SessionEndStats{}, false
+	}
+	turns := 0
+	if hist, err := m.history.Get(id); err == nil {
+		turns = len(hist)
+	}
+	dur := m.now().Sub(s.CreatedAt)
+	if dur < 0 {
+		dur = 0
+	}
+	return SessionEndStats{Turns: turns, Duration: dur, Reason: reason}, true
 }
 
 // Bind records the worker a session is affinity-bound to (#34): the worker that
@@ -507,7 +624,7 @@ func (m *Manager) sweepExpired() {
 		if !s.expired(now) {
 			continue
 		}
-		if err := m.deleteSession(s.ID, s.OwnerKeyID); err != nil {
+		if err := m.deleteSession(s.ID, s.OwnerKeyID, EndReasonExpired); err != nil {
 			m.log.Warn("session sweep: delete failed", "session", s.ID, "err", err)
 			continue
 		}
