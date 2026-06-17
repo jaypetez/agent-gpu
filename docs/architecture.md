@@ -527,6 +527,19 @@ Ollama NDJSON     worker emits            server accumulates        SubmitJob ca
 {done,eval=3}  -> JobChunk{done,tok=5} -> resolve(JobResult{...}) -> returns "pong", 5 tokens
 ```
 
+### keep_alive on the chat request
+
+The chat request carries an optional [`keep_alive`](https://github.com/ollama/ollama/blob/main/docs/api.md#parameters)
+window that controls how long Ollama keeps the model resident after the turn. The worker derives it from
+the job's `keep_alive_seconds` (set by the server for **session-bound** turns, see
+[Model warmth](#model-warmth-keep_alive) under Sessions): a non-zero value is sent on `/api/chat` as a
+numeric `keep_alive`, and a zero value (every session-less job) **omits** the field so Ollama's default
+5-minute unload window applies — exact back-compat. Re-sending the window each turn resets Ollama's
+unload timer, keeping a conversation's model warm; once a session goes idle the window elapses and Ollama
+unloads the model on its own. The executor also exposes `Unload(model)` — a `keep_alive=0`
+`/api/generate` with no prompt, Ollama's documented eviction — which backs the explicit-release path when
+a session is ended (a missing model is treated as success, since there is nothing to evict).
+
 ### Permission-gated pull
 
 A model is fetched onto a worker via `Server.PullModel(ctx, key, workerID, model)`. It mirrors the
@@ -535,7 +548,9 @@ first, and a denied key returns `authz.ErrForbidden` with **no** `PullModel` mes
 unauthorized caller never reaches Ollama's `/api/pull`. A permitted pull sends a fire-and-forget
 `PullModel` control message; the worker drives `POST /api/pull` (draining its NDJSON progress stream)
 and advertises the new model on its next heartbeat. Auto-pull on a dispatch miss is intentionally a
-**seam**, not built here.
+**seam**, not built here. The symmetric **`UnloadModel`** control message (model warmth's explicit
+release, #35) follows the same fire-and-forget pattern, off the receive path so a long eviction does not
+block job dispatch.
 
 ### Error contract
 
@@ -765,8 +780,11 @@ It is the foundation of the sessions epic. **Session-affinity scheduling is wire
 too (see [Session API](#session-api-http) below): the cmd layer constructs the `Manager`, runs its
 sweeper (`Start`/`Close`), checkpoints it like the quota counters, and hands the same instance to both
 the control-plane server (`WithSessionManager`, for affinity routing) and the HTTP API (for the
-session CRUD endpoints + stateful chat). `keep_alive` builds on this in a later milestone. The server
-still enables affinity via `WithSessionManager` (nil by default = disabled).
+session CRUD endpoints + stateful chat). **Model warmth (`keep_alive`) is wired** too (see
+[Model warmth](#model-warmth-keep_alive) below): session-bound turns carry a `keep_alive` window so the
+conversation's model stays resident across active turns and is released within a bounded window when the
+session goes idle or is ended. The server still enables affinity via `WithSessionManager` (nil by
+default = disabled).
 
 ### Model
 
@@ -810,6 +828,49 @@ crash mid-delete leaves no session pointing at vanished history). The expiry dec
 injectable clock, so tests fast-forward the clock instead of sleeping. `Close` stops and waits for the
 loop and is idempotent (safe without `Start`, and on repeat calls). A session with a non-positive TTL
 never idles out.
+
+### Model warmth (`keep_alive`)
+
+Ollama keeps a model resident in VRAM for a while after each request and unloads it once an idle timer
+elapses (the default is **5 minutes**); each request may override that window with a
+[`keep_alive`](https://github.com/ollama/ollama/blob/main/docs/api.md#parameters) value. agent-gpu
+coordinates that timer with the session lifecycle so a conversation does not pay a **cold model reload**
+between turns, while an idle or abandoned conversation still frees its VRAM.
+
+- **Warm window tied to the idle TTL.** For a **session-bound** turn the dispatcher sets the job's
+  `keep_alive` to `min(session TTL, model-warm cap)`; a session with no idle TTL (never-idle) falls back
+  to the cap. The value is **always bounded and positive** (≥ 1 s) — the warm path never sends a
+  "forever" `keep_alive`. The cap is configurable (`--model-warm-max` / `AGENTGPU_MODEL_WARM_MAX`,
+  default **1 h**, generous over the 30 m default TTL so the common case is never clipped). A
+  **session-less** request sends no `keep_alive` at all, so Ollama's own default applies and the
+  non-session path is byte-identical to before.
+- **Stays warm across active turns.** Affinity routes every turn of a session to the same bound worker
+  (see [Session affinity](#session-affinity-warm-kv-cache)), and each turn **re-sends** `keep_alive`,
+  which **resets** Ollama's unload timer. So while a conversation is active its model never unloads
+  mid-flight — no cold reload between turns.
+- **Released when idle or abandoned.** Once the last turn's `keep_alive` window elapses with no new
+  turn, Ollama unloads the model on its own — no control message needed. Because the window is bounded
+  (≤ the cap), an **idle or abandoned** session's model is always freed within that window and can never
+  pin VRAM indefinitely. This is the primary release mechanism and it covers session expiry/idle and
+  abandonment.
+- **Released promptly on explicit end.** On `DELETE /v1/sessions/{id}` the server additionally sends the
+  session's **bound worker** a best-effort `UnloadModel` control message, which evicts the model now
+  (Ollama's `keep_alive=0` `/api/generate` eviction) rather than after the warm window. It is
+  fire-and-forget and never blocks or fails the delete: if the worker is gone or the message is dropped,
+  the idle `keep_alive` timer is the backstop. An **unbound** session (no turn taken) sends nothing —
+  there is nothing resident to release.
+- **VRAM pressure / `OLLAMA_NUM_PARALLEL`.** A longer warm window keeps more models resident at once,
+  which interacts with Ollama's concurrent-model capacity (`OLLAMA_NUM_PARALLEL` / `OLLAMA_MAX_LOADED_MODELS`
+  on the worker host): warmth trades VRAM for latency. The cap bounds that trade — lower it on
+  VRAM-constrained workers so idle sessions release sooner; raise it (or the session TTL) where long
+  pauses between turns are common and VRAM is plentiful.
+
+The propagation path is additive end-to-end: the warm window rides the existing `Job` as
+`keep_alive_seconds` (server → worker over gRPC), the worker threads it onto Ollama's `/api/chat`
+`keep_alive` field (seconds as a number; `0`/unset omits it, a negative value would keep the model
+loaded — the warm path never sends one), and the executor exposes an `Unload` that drives Ollama's
+eviction for the explicit-end path. `SessionID` itself still never crosses the wire (it is a server-side
+affinity hint); only the derived `keep_alive_seconds` does.
 
 ### History caps
 

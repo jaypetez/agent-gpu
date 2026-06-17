@@ -62,14 +62,16 @@ type FakeExecutor struct {
 	release chan struct{}
 
 	// pullErr is returned by Pull (nil = success). modelsErr is returned by
-	// ListModels (nil = success).
+	// ListModels (nil = success). unloadErr is returned by Unload (nil = success).
 	pullErr   error
 	modelsErr error
+	unloadErr error
 
 	count   atomic.Int64
 	mu      sync.Mutex
 	lastJob *types.Job
 	pulls   []string
+	unloads []string
 }
 
 // Compile-time assertion that *FakeExecutor satisfies worker.Executor.
@@ -182,6 +184,11 @@ func WithPullErr(err error) ExecutorOption {
 // WithListModelsErr makes ListModels return err.
 func WithListModelsErr(err error) ExecutorOption {
 	return func(e *FakeExecutor) { e.modelsErr = err }
+}
+
+// WithUnloadErr makes Unload return err.
+func WithUnloadErr(err error) ExecutorOption {
+	return func(e *FakeExecutor) { e.unloadErr = err }
 }
 
 // Execute implements worker.Executor.
@@ -300,6 +307,15 @@ func (e *FakeExecutor) Pull(_ context.Context, model string) error {
 	return e.pullErr
 }
 
+// Unload implements worker.Executor: it records the requested model and returns
+// the configured error (nil by default).
+func (e *FakeExecutor) Unload(_ context.Context, model string) error {
+	e.mu.Lock()
+	e.unloads = append(e.unloads, model)
+	e.mu.Unlock()
+	return e.unloadErr
+}
+
 // Handled returns how many jobs Execute has run.
 func (e *FakeExecutor) Handled() int64 { return e.count.Load() }
 
@@ -319,4 +335,11 @@ func (e *FakeExecutor) Pulls() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]string(nil), e.pulls...)
+}
+
+// Unloads returns the models Unload was called with, in order.
+func (e *FakeExecutor) Unloads() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.unloads...)
 }

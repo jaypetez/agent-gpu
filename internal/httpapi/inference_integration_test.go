@@ -87,6 +87,7 @@ func (e *scriptedExecutor) Execute(_ context.Context, job types.Job, emit func(t
 
 func (e *scriptedExecutor) ListModels(context.Context) ([]types.Model, error) { return e.models, nil }
 func (e *scriptedExecutor) Pull(context.Context, string) error                { return nil }
+func (e *scriptedExecutor) Unload(context.Context, string) error              { return nil }
 
 // job returns a copy of the last job the worker executed, for assertions.
 func (e *scriptedExecutor) job() *types.Job {

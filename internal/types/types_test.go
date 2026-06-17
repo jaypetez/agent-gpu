@@ -79,6 +79,43 @@ func TestJobRoundTrip(t *testing.T) {
 	}
 }
 
+// TestJobKeepAliveRoundTrip proves the model-warmth hint (#35) crosses the wire:
+// KeepAliveSeconds survives Proto/JobFromProto for a positive (warm), zero
+// (unset), and negative (keep-forever) value, so the server's warm window reaches
+// the worker.
+func TestJobKeepAliveRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, secs := range []int64{0, 900, -1} {
+		in := Job{ID: "j1", Model: "llama3", Prompt: "hi", KeepAliveSeconds: secs}
+		got := JobFromProto(in.Proto())
+		if got.KeepAliveSeconds != secs {
+			t.Fatalf("KeepAliveSeconds round trip: got %d want %d", got.KeepAliveSeconds, secs)
+		}
+		// The full value still round-trips intact alongside the new field.
+		if !reflect.DeepEqual(got, in) {
+			t.Fatalf("round trip mismatch: got %+v want %+v", got, in)
+		}
+	}
+}
+
+// TestJobSessionIDNotOnWire proves SessionID is a server-side-only routing hint
+// (#34): Proto drops it and JobFromProto never sets it, so the worker contract is
+// unchanged. (Contrast KeepAliveSeconds, which is carried on purpose — #35.)
+func TestJobSessionIDNotOnWire(t *testing.T) {
+	t.Parallel()
+	in := Job{ID: "j1", Model: "llama3", Prompt: "hi", SessionID: "sess_abc", KeepAliveSeconds: 600}
+	got := JobFromProto(in.Proto())
+	if got.SessionID != "" {
+		t.Fatalf("SessionID crossed the wire: got %q, want empty", got.SessionID)
+	}
+	// Everything except SessionID survives; keep_alive in particular is carried.
+	want := in
+	want.SessionID = ""
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip mismatch: got %+v want %+v", got, want)
+	}
+}
+
 func TestModelRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := Model{Name: "llama3", Digest: "sha256:abc"}

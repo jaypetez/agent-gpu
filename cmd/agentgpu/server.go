@@ -59,6 +59,7 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	hbTimeout := fs.Duration("heartbeat-timeout", 0, "evict a worker after this long without a heartbeat (default 45s or $AGENTGPU_HEARTBEAT_TIMEOUT)")
 	sessionPath := fs.String("session-path", "", "path to the session+history checkpoint (default $AGENTGPU_SESSION_PATH or ~/.agentgpu/sessions.json)")
 	sessionTTL := fs.Duration("session-ttl", 0, "per-session idle timeout (default 30m or $AGENTGPU_SESSION_TTL)")
+	modelWarmMax := fs.Duration("model-warm-max", 0, "max model-warmth keep_alive window for session-bound jobs; keep_alive = min(session TTL, this) (default 1h or $AGENTGPU_MODEL_WARM_MAX)")
 	setUsage(fs, "Usage: agentgpu server start [--listen host:port] [--http-listen host:port] [flags]")
 	// The server/worker commands have no caller-injected writer; their help goes to
 	// stdout (a success), matching the informational top-level help.
@@ -88,8 +89,9 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		GlobalTPM:            *globalTPM,
 	}, nil, nil)
 	scfg := config.ResolveSession(config.SessionConfig{
-		Path: *sessionPath,
-		TTL:  *sessionTTL,
+		Path:         *sessionPath,
+		TTL:          *sessionTTL,
+		ModelWarmMax: *modelWarmMax,
 	}, nil, nil)
 	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout)
 }
@@ -199,6 +201,11 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		// The same manager backs affinity routing in the dispatcher and the session
 		// API + stateful history in the HTTP layer — one source of truth.
 		server.WithSessionManager(mgr),
+		// Model warmth (#35): cap the keep_alive window the dispatcher sends for
+		// session-bound jobs at min(session TTL, this), so a conversation's model
+		// stays resident across active turns and unloads within a bounded window
+		// once the session goes idle.
+		server.WithModelWarmMax(scfg.ModelWarmMax),
 	)
 	srv.Register(gs)
 	// Start the stale-worker eviction loop; Close stops it on shutdown.

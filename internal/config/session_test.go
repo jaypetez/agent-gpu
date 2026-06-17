@@ -71,6 +71,37 @@ func TestResolveSessionTTL(t *testing.T) {
 	})
 }
 
+func TestResolveModelWarmMax(t *testing.T) {
+	t.Parallel()
+	t.Run("default", func(t *testing.T) {
+		t.Parallel()
+		if got := ResolveModelWarmMax(0, env(nil)); got != DefaultModelWarmMax {
+			t.Fatalf("got %v, want default %v", got, DefaultModelWarmMax)
+		}
+	})
+	t.Run("env overrides default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveModelWarmMax(0, env(map[string]string{EnvModelWarmMax: "20m"}))
+		if got != 20*time.Minute {
+			t.Fatalf("got %v, want 20m", got)
+		}
+	})
+	t.Run("flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveModelWarmMax(45*time.Minute, env(map[string]string{EnvModelWarmMax: "20m"}))
+		if got != 45*time.Minute {
+			t.Fatalf("got %v, want flag 45m", got)
+		}
+	})
+	t.Run("unparseable env falls back to default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveModelWarmMax(0, env(map[string]string{EnvModelWarmMax: "nonsense"}))
+		if got != DefaultModelWarmMax {
+			t.Fatalf("got %v, want default on bad env", got)
+		}
+	})
+}
+
 func TestResolveSession(t *testing.T) {
 	t.Parallel()
 	home := func() (string, error) { return "/home/u", nil }
@@ -87,12 +118,18 @@ func TestResolveSession(t *testing.T) {
 		if got.MaxTurns != DefaultSessionMaxTurns || got.MaxBytes != DefaultSessionMaxBytes {
 			t.Fatalf("caps = %d/%d, want defaults", got.MaxTurns, got.MaxBytes)
 		}
+		if got.ModelWarmMax != DefaultModelWarmMax {
+			t.Fatalf("model warm max = %v, want default %v", got.ModelWarmMax, DefaultModelWarmMax)
+		}
 	})
 	t.Run("explicit caps preserved", func(t *testing.T) {
 		t.Parallel()
-		got := ResolveSession(SessionConfig{MaxTurns: 10, MaxBytes: 4096, TTL: time.Minute}, env(nil), home)
+		got := ResolveSession(SessionConfig{MaxTurns: 10, MaxBytes: 4096, TTL: time.Minute, ModelWarmMax: 90 * time.Second}, env(nil), home)
 		if got.MaxTurns != 10 || got.MaxBytes != 4096 || got.TTL != time.Minute {
 			t.Fatalf("explicit values not preserved: %+v", got)
+		}
+		if got.ModelWarmMax != 90*time.Second {
+			t.Fatalf("explicit model warm max not preserved: %v", got.ModelWarmMax)
 		}
 	})
 }
