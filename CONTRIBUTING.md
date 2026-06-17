@@ -47,13 +47,18 @@ Every change should ship with tests:
 - **Integration tests** for cross-component flows (registration, routing, quota/permission
   enforcement).
 
-Run the suite locally before opening a PR (`go test -race ./...`, as CI does). Coverage is reported
-in CI.
+Run the suite locally before opening a PR (`go test -race ./...`, as CI does; use `make cover` on a
+box without a C toolchain). **Coverage is measured and reported on every CI run**, and the `go` job
+**fails if total coverage drops below the gate floor** (currently 65%, a ratchet that rises over
+time). Generated protobuf code is excluded from the gate. Run `make cover` to see the total locally.
 
-See [docs/testing.md](docs/testing.md) for the integration-test layout and the rules that keep the
-suite deterministic — poll with `waitFor` instead of `time.Sleep`, inject a clock and fast-forward
-instead of sleeping through real windows, keep real timeouts short, guard cross-goroutine state with
-a mutex, and run `-race`.
+Shared test fixtures live in `internal/testutil` (job/key/worker/heartbeat builders and a
+configurable fake `worker.Executor`); use them in new black-box tests.
+
+See [docs/testing.md](docs/testing.md) for the coverage workflow, the shared fixtures, the
+integration-test layout, and the rules that keep the suite deterministic — poll with `waitFor`
+instead of `time.Sleep`, inject a clock and fast-forward instead of sleeping through real windows,
+keep real timeouts short, guard cross-goroutine state with a mutex, and run `-race`.
 
 ## Commit & PR conventions
 

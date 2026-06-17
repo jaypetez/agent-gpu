@@ -37,13 +37,95 @@ go test -race ./...
 go test ./internal/httpapi/ -run TestModelAggregationMultiWorker -count=5
 ```
 
-CI runs `go test -race ./...` (see `.github/workflows/ci.yml`). There are no build tags on the
-integration tests, so they always run. A change that makes them flaky will fail the build, so the
+CI runs `go test -race -covermode=atomic -coverprofile=coverage.out ./...` (see
+`.github/workflows/ci.yml`) — the race detector and coverage in one pass. There are no build tags on
+the integration tests, so they always run. A change that makes them flaky will fail the build, so the
 guidance below is mandatory, not optional.
 
 > The race detector (`-race`) is not supported on every host. ThreadSanitizer does not run on
-> 32-bit or some arm64 hosts; if `-race` refuses to start locally, run the new tests with
-> `-count=5` (without `-race`) for stability and rely on CI's amd64 runner for the race check.
+> 32-bit or some arm64 hosts, and it needs cgo (a C toolchain); if `-race` refuses to start locally,
+> run the suite with `make cover` (no `-race`) for coverage and `-count=5` for flake-stability, and
+> rely on CI's amd64 runner for the race check.
+
+## Coverage
+
+Coverage is measured on every CI run and gated by a threshold.
+
+### Measuring coverage locally
+
+```bash
+# Run the suite with coverage and print the total. No -race, so it works on a
+# dev box without a C toolchain (Windows included).
+make cover
+
+# Render the profile to a browsable HTML report (coverage.html).
+make cover-html
+```
+
+`make cover` writes `coverage.out` and prints the `total:` line from `go tool cover -func`. Both
+`coverage.out` and `coverage.html` are gitignored.
+
+### The CI coverage gate
+
+The `go` job runs tests with `-coverprofile=coverage.out`, then:
+
+1. Filters the generated `proto/agentgpu/v1` package out of the profile. That code is generated and
+   0%-covered by design, so counting it would unfairly drag the total down.
+2. Computes the overall percentage with `go tool cover -func` and **fails the job if the total drops
+   below the floor** (currently `65.0%`).
+3. Writes a coverage summary to the GitHub Actions job summary — the overall percentage plus the
+   per-function table — and uploads `coverage.out` + an HTML report (`coverage.html`) as the
+   `coverage-report` artifact (7-day retention).
+
+The `65.0%` floor is a **ratchet**: it sits just under the current number and is meant to be raised
+over time as coverage improves. Lower it only with a deliberate decision, never to make a red build
+pass.
+
+To reproduce the gate metric locally:
+
+```bash
+make cover
+grep -v 'proto/agentgpu/v1' coverage.out > coverage.gate.out
+go tool cover -func=coverage.gate.out | tail -1
+```
+
+## Shared fixtures — `internal/testutil`
+
+`internal/testutil` holds the shared test fixtures so a test states only what it cares about and
+inherits sane defaults for the rest. It is imported **only** from `_test.go` files; it depends on
+production packages (`types`, `store`, `auth`, `worker`) and takes `*testing.T` in its minting
+helpers, so production code must never import it.
+
+White-box internal test files (`package server`, `package httpapi`, …) that assert on **unexported**
+types cannot use it and are left alone; the builders serve the black-box `_test` packages.
+
+Each builder applies its defaults first, then the supplied functional options in order (so a later
+option wins). The zero-argument form returns a valid value.
+
+- `testutil.Job(opts...) types.Job` — a dispatchable job (`WithModel`, `WithPrompt`, `WithMessages`,
+  `WithTools`, `WithSessionID`).
+- `testutil.Worker(opts...) types.Worker` and `testutil.Heartbeat(opts...) types.Heartbeat` — fleet
+  snapshots / liveness reports (`WithWorkerModels`, `WithFreeVRAM`, `WithLoad`, …).
+- `testutil.Key(opts...) store.APIKey` (a bare record) and
+  `testutil.MintKey(t, svc, opts...) (store.APIKey, token)` / `testutil.MintToken(t, svc, opts...)`
+  (a real, authenticatable key via `auth.Service`): `WithRoles`, `WithAllowModels`, `WithDenyModels`,
+  `WithRPM`, `WithLimits`.
+- `testutil.FakeExecutor` — one configurable `worker.Executor` that folds the old
+  `scriptedExecutor` / `recordingExecutor` / `blockingExecutor`: scripted deltas
+  (`WithDeltas`), an echo or reply (`WithReply` / `WithReplyPerRune`), a tool call (`WithToolCall`),
+  a token split (`WithTokens`), call recording (`Handled`, `LastJob`, `Pulls`), and an optional
+  block/release for in-flight and mid-stream-disconnect tests (`WithBlock`, `WithEmitSignal`).
+
+```go
+exec := testutil.NewFakeExecutor(testutil.WithExecModels("llama3"), testutil.WithReply("hi"))
+token := testutil.MintToken(t, authSvc,
+    testutil.WithRoles(authz.RoleUser), testutil.WithAllowModels("llama3"), testutil.WithRPM(1))
+job := testutil.Job(testutil.WithMessages(testutil.UserMessage("hello")), testutil.WithPrompt(""))
+```
+
+> The bufconn/gRPC harnesses (`newHarness`, `inferenceHarness`, `buildSessionHarness`) and the
+> white-box internal tests are deliberately **not** migrated wholesale — cross-package harness
+> refactors are risky. Use the builders in new black-box tests and when touching existing ones.
 
 ## Avoiding flaky integration tests
 

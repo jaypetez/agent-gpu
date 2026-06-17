@@ -11,28 +11,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/jaypetez/agent-gpu/internal/server"
+	"github.com/jaypetez/agent-gpu/internal/testutil"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	"github.com/jaypetez/agent-gpu/internal/worker"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
 )
-
-// blockingExecutor holds each job until released, so a test can observe a job
-// counted as active in the worker's heartbeats while it is in flight.
-type blockingExecutor struct{ release chan struct{} }
-
-func (b blockingExecutor) Execute(ctx context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
-	select {
-	case <-b.release:
-	case <-ctx.Done():
-	}
-	if emit != nil {
-		emit(types.JobChunk{JobID: job.ID, Delta: "done"})
-	}
-	return types.JobResult{JobID: job.ID, Output: "done"}
-}
-
-func (b blockingExecutor) ListModels(context.Context) ([]types.Model, error) { return nil, nil }
-func (b blockingExecutor) Pull(context.Context, string) error                { return nil }
 
 // testClock is a mutable, mutex-guarded clock so the eviction loop's staleness
 // decisions can be fast-forwarded without real sleeps.
@@ -399,7 +382,7 @@ func TestWorkerReportsCapacityAndActiveJobs(t *testing.T) {
 		FreeVRAM:  6 << 30,
 		GPUType:   "test-gpu",
 		Load:      7,
-		Executor:  blockingExecutor{release: release},
+		Executor:  testutil.NewFakeExecutor(testutil.WithBlock(release)),
 	})
 	go func() { _ = w.Run(ctx) }()
 

@@ -60,6 +60,15 @@ build: ## Build all packages and the agentgpu binary
 test: ## Run the test suite
 	$(GO) test ./...
 
+.PHONY: cover
+cover: ## Run tests with coverage and print the total (mirrors CI; no -race so it works without cgo)
+	$(GO) test -covermode=atomic -coverprofile=coverage.out ./...
+	$(GO) tool cover -func=coverage.out | tail -1
+
+.PHONY: cover-html
+cover-html: cover ## Render the coverage profile to coverage.html and open it
+	$(GO) tool cover -html=coverage.out -o coverage.html
+
 .PHONY: vet
 vet: ## Run go vet
 	$(GO) vet ./...

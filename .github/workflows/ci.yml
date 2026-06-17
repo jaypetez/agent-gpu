@@ -96,8 +96,79 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test -race ./...
+      - name: Test (race + coverage)
+        # Race detector and coverage in one pass. covermode=atomic is required
+        # under -race. The profile feeds the gate and report steps below.
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage report + threshold gate
+        shell: bash
+        # Generated protobuf code (proto/agentgpu/v1) is 0%-covered by design and
+        # would unfairly drag the total down, so it is filtered out of the gate
+        # metric. The job FAILS if total coverage drops below COVERAGE_MIN. That
+        # floor is a deliberate RATCHET: it sits just under today's number and is
+        # meant to be raised over time as coverage improves, never lowered to make
+        # a red build pass.
+        env:
+          COVERAGE_MIN: "65.0"
+        run: |
+          set -euo pipefail
+
+          # Drop generated proto from the gate metric, then compute the func table.
+          grep -v 'proto/agentgpu/v1' coverage.out > coverage.gate.out
+          go tool cover -func=coverage.gate.out > coverage.func.txt
+
+          total="$(awk '/^total:/ { gsub(/%/, "", $3); print $3 }' coverage.func.txt)"
+          if [ -z "$total" ]; then
+            echo "could not parse total coverage from go tool cover output" >&2
+            cat coverage.func.txt >&2
+            exit 1
+          fi
+
+          # Render the run's coverage to the job summary: overall % plus the
+          # per-package/per-func table (collapsed) so reviewers see it on each run.
+          {
+            echo "## Test coverage"
+            echo ""
+            echo "**Total (excl. generated proto): ${total}%** — gate floor ${COVERAGE_MIN}% (ratchet)."
+            echo ""
+            echo "<details><summary>Per-function coverage</summary>"
+            echo ""
+            echo '```text'
+            cat coverage.func.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Portable float compare via awk: fail when total < floor.
+          if awk -v t="$total" -v min="$COVERAGE_MIN" 'BEGIN { exit !(t < min) }'; then
+            echo "::error::coverage ${total}% is below the ${COVERAGE_MIN}% gate floor"
+            exit 1
+          fi
+          echo "coverage ${total}% meets the ${COVERAGE_MIN}% gate floor"
+
+      - name: Generate HTML coverage report
+        if: always()
+        shell: bash
+        # Best-effort: only render if a profile was produced (skip when the test
+        # step failed before writing one).
+        run: |
+          set -euo pipefail
+          if [ -f coverage.out ]; then
+            go tool cover -html=coverage.out -o coverage.html
+          fi
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: |
+            coverage.out
+            coverage.html
+          retention-days: 7
+          if-no-files-found: ignore
 
   docker:
     name: docker

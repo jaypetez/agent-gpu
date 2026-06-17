@@ -24,6 +24,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/session"
 	"github.com/jaypetez/agent-gpu/internal/store"
+	"github.com/jaypetez/agent-gpu/internal/testutil"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	"github.com/jaypetez/agent-gpu/internal/worker"
 )
@@ -84,43 +85,6 @@ func (e *recordingExecutor) ListModels(context.Context) ([]types.Model, error) {
 func (e *recordingExecutor) Pull(context.Context, string) error                { return nil }
 
 func (e *recordingExecutor) handled() int64 { return e.count.Load() }
-
-// blockingExecutor is a worker.Executor that emits a couple of deltas, signals
-// that it has done so (via emitted), then blocks until its context is cancelled
-// — never sending a terminal Done chunk. It backs the disconnect test: a stateful
-// streaming turn can be cancelled client-side AFTER the deltas land but BEFORE any
-// terminal chunk, exercising the mid-stream-disconnect path without sleeps. The
-// model field advertises a model so the worker registers and dispatch reaches it.
-type blockingExecutor struct {
-	workerID string
-	models   []types.Model
-	// emitted is closed once the executor has emitted its deltas, so the test can
-	// deterministically wait for tokens to be in flight before cancelling.
-	emitted chan struct{}
-
-	count atomic.Int64
-}
-
-func (e *blockingExecutor) Execute(ctx context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
-	e.count.Add(1)
-	if emit != nil {
-		emit(types.JobChunk{JobID: job.ID, Delta: "par"})
-		emit(types.JobChunk{JobID: job.ID, Delta: "tial"})
-	}
-	close(e.emitted)
-	// Block until the client disconnects (which cancels connCtx upstream). Never
-	// emit a terminal chunk: the worker only sends Done AFTER Execute returns, so
-	// returning here without the client having received a terminal chunk models a
-	// genuine mid-stream abort.
-	<-ctx.Done()
-	return types.JobResult{JobID: job.ID, FinishReason: "stop"}
-}
-
-func (e *blockingExecutor) ListModels(context.Context) ([]types.Model, error) {
-	return e.models, nil
-}
-func (e *blockingExecutor) Pull(context.Context, string) error { return nil }
-func (e *blockingExecutor) handled() int64                     { return e.count.Load() }
 
 func (e *recordingExecutor) job() *types.Job {
 	e.mu.Lock()
@@ -580,12 +544,18 @@ func TestSessionStatefulStreaming(t *testing.T) {
 // client request once the deltas are in flight, modelling a genuine abort with no
 // error frame and no Done chunk.
 func TestSessionStatefulStreamingDisconnect(t *testing.T) {
-	exec := &blockingExecutor{
-		workerID: "worker-1",
-		models:   []types.Model{{Name: "llama3", Digest: "sha256:test"}},
-		emitted:  make(chan struct{}),
-	}
-	h := buildSessionHarness(t, "llama3", []namedExecutor{{id: exec.workerID, exec: exec}})
+	emitted := make(chan struct{})
+	// A blocking fake: it emits two deltas, signals via emitted, then waits on the
+	// context (no release channel) — never sending a terminal chunk, so a client
+	// disconnect mid-stream is the only thing that unblocks it.
+	exec := testutil.NewFakeExecutor(
+		testutil.WithExecModelObjects(types.Model{Name: "llama3", Digest: "sha256:test"}),
+		testutil.WithDeltas("par", "tial"),
+		testutil.WithEmitSignal(emitted),
+		testutil.WithBlock(nil),
+	)
+	const workerID = "worker-1"
+	h := buildSessionHarness(t, "llama3", []namedExecutor{{id: workerID, exec: exec}})
 
 	sid := h.createSession(t, "llama3")
 
@@ -616,7 +586,7 @@ func TestSessionStatefulStreamingDisconnect(t *testing.T) {
 	// Wait until the executor has emitted its deltas (tokens are in flight), then
 	// abort the client request mid-stream — before any terminal/Done chunk.
 	select {
-	case <-exec.emitted:
+	case <-emitted:
 	case <-time.After(3 * time.Second):
 		_ = resp.Body.Close()
 		t.Fatal("executor never emitted deltas")
@@ -628,7 +598,7 @@ func TestSessionStatefulStreamingDisconnect(t *testing.T) {
 	// down the upstream job). Wait for that so any erroneous persistence would have
 	// had its chance to run.
 	waitFor(t, 3*time.Second, "executor observed disconnect", func() bool {
-		return exec.handled() == 1
+		return exec.Handled() == 1
 	})
 
 	// The disconnected turn persisted NOTHING: no orphaned user turn, no partial

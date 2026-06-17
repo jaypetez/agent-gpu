@@ -1,7 +1,6 @@
 package httpapi_test
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -12,7 +11,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
-	"github.com/jaypetez/agent-gpu/internal/store"
+	"github.com/jaypetez/agent-gpu/internal/testutil"
 )
 
 // retryAfterSeconds reads and parses the Retry-After header, failing the test
@@ -35,21 +34,20 @@ func retryAfterSeconds(t *testing.T, resp *http.Response) int {
 }
 
 // mintUserKey creates a fresh user key permitted for the given model, optionally
-// with an RPM cap, returning its bearer token.
+// with an RPM cap, returning its bearer token. It is a thin alias over
+// testutil.MintToken specialized to this suite's "user role + one allowed model"
+// shape (rpm == 0 leaves the key uncapped).
 func mintUserKey(t *testing.T, authSvc *auth.Service, model string, rpm uint64) string {
 	t.Helper()
-	ctx := context.Background()
-	token, created, err := authSvc.CreateWithPermissions(ctx, "user",
-		auth.Permissions{Roles: []string{authz.RoleUser}, AllowModels: []string{model}})
-	if err != nil {
-		t.Fatalf("create key: %v", err)
+	opts := []testutil.KeyOption{
+		testutil.WithKeyName("user"),
+		testutil.WithRoles(authz.RoleUser),
+		testutil.WithAllowModels(model),
 	}
 	if rpm != 0 {
-		if _, err := authSvc.SetLimits(ctx, created.ID, &store.Limits{RPM: rpm}); err != nil {
-			t.Fatalf("set limits: %v", err)
-		}
+		opts = append(opts, testutil.WithRPM(rpm))
 	}
-	return token
+	return testutil.MintToken(t, authSvc, opts...)
 }
 
 // TestPerKeyRateLimitRetryAfter proves a per-key over-limit request returns 429
