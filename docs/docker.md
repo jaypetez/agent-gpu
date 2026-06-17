@@ -221,8 +221,8 @@ agentgpu models list
 > **Why `--local` only for the first key.** The file-backed key store is loaded
 > into memory **once at server start** and is not hot-reloaded, so a `--local` key
 > created while the server is already running is on the `/data` volume but the
-> running server does not see it until it reloads — hence the one restart in step
-> 1. The CLI's default (HTTP) mode and the admin endpoints under `/v1/admin/keys`
+> running server does not see it until it reloads — hence the one restart in
+> step 1. The CLI's default (HTTP) mode and the admin endpoints under `/v1/admin/keys`
 > mutate the running server's own store, so they take effect immediately — they
 > just need the admin token that step 1 bootstraps.
 
