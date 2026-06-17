@@ -1,0 +1,309 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     viewBox="0 0 1200 460" width="1200" height="460" role="img"
+     aria-labelledby="title desc" font-family="'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif">
+  <title id="title">agent-gpu</title>
+  <desc id="desc">Distributed inference layer for Ollama: client agents call one OpenAI-compatible server that authenticates, applies quotas, and schedules each job onto a fleet of GPU workers running Ollama; tokens stream back.</desc>
+
+  <defs>
+    <!-- backgrounds -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"   stop-color="#0a0f1f"/>
+      <stop offset="0.55" stop-color="#0c1430"/>
+      <stop offset="1"   stop-color="#0a1226"/>
+    </linearGradient>
+    <linearGradient id="titleGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0"   stop-color="#34d399"/>
+      <stop offset="0.5" stop-color="#22d3ee"/>
+      <stop offset="1"   stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="nodeFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#152043"/>
+      <stop offset="1" stop-color="#0e1733"/>
+    </linearGradient>
+    <linearGradient id="serverFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16224a"/>
+      <stop offset="1" stop-color="#0d1733"/>
+    </linearGradient>
+    <linearGradient id="linkL" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0.75"/>
+    </linearGradient>
+    <linearGradient id="linkR" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#818cf8" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#818cf8" stop-opacity="0.18"/>
+    </linearGradient>
+    <linearGradient id="vram" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <radialGradient id="orbC" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orbV" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#a855f7" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#a855f7" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- soft glow for packets / cores -->
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+
+    <!-- faint dotted grid -->
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#27407a" fill-opacity="0.18"/>
+    </pattern>
+  </defs>
+
+  <!-- ===== card ===== -->
+  <rect x="2" y="2" width="1196" height="456" rx="22" fill="url(#bg)" stroke="#23365f" stroke-width="1.5"/>
+  <rect x="2" y="2" width="1196" height="456" rx="22" fill="url(#grid)"/>
+  <ellipse cx="180" cy="90" rx="320" ry="220" fill="url(#orbC)">
+    <animate attributeName="opacity" values="0.7;1;0.7" dur="6s" repeatCount="indefinite"/>
+  </ellipse>
+  <ellipse cx="1040" cy="400" rx="340" ry="240" fill="url(#orbV)">
+    <animate attributeName="opacity" values="0.6;1;0.6" dur="7s" repeatCount="indefinite"/>
+  </ellipse>
+
+  <!-- ===== header ===== -->
+  <text x="600" y="74" text-anchor="middle" font-size="50" font-weight="800" letter-spacing="-1">
+    <tspan fill="#eef2fb">agent</tspan><tspan fill="url(#titleGrad)">-gpu</tspan>
+  </text>
+  <!-- shimmer underline -->
+  <rect x="500" y="88" width="200" height="3" rx="1.5" fill="url(#titleGrad)" opacity="0.5"/>
+  <rect x="500" y="88" width="60" height="3" rx="1.5" fill="#ffffff" opacity="0.9">
+    <animate attributeName="x" values="500;640;500" dur="3.6s" repeatCount="indefinite"
+             calcMode="spline" keyTimes="0;0.5;1" keySplines="0.5 0 0.5 1;0.5 0 0.5 1"/>
+  </rect>
+  <text x="600" y="116" text-anchor="middle" font-size="16.5" fill="#9fb0d6">
+    Distributed inference for Ollama — pool your GPUs behind one OpenAI-compatible API
+  </text>
+
+  <!-- badges -->
+  <g font-size="12" font-weight="600">
+    <g transform="translate(380,134)">
+      <rect width="150" height="24" rx="12" fill="#0e1a3a" stroke="#2a4a7a" stroke-width="1"/>
+      <circle cx="16" cy="12" r="3.5" fill="#22d3ee"/>
+      <text x="28" y="16" fill="#bcd3ef">OpenAI-compatible</text>
+    </g>
+    <g transform="translate(540,134)">
+      <rect width="120" height="24" rx="12" fill="#0e1a3a" stroke="#2a4a7a" stroke-width="1"/>
+      <circle cx="16" cy="12" r="3.5" fill="#34d399"/>
+      <text x="28" y="16" fill="#bcd3ef">GPU-aware fleet</text>
+    </g>
+    <g transform="translate(670,134)">
+      <rect width="150" height="24" rx="12" fill="#0e1a3a" stroke="#2a4a7a" stroke-width="1"/>
+      <circle cx="16" cy="12" r="3.5" fill="#a855f7"/>
+      <text x="28" y="16" fill="#bcd3ef">streaming · sessions</text>
+    </g>
+  </g>
+
+  <!-- ===== connection links ===== -->
+  <!-- client -> server (left) -->
+  <g fill="none" stroke="url(#linkL)" stroke-width="2" stroke-linecap="round">
+    <path d="M230,228 C 340,228 380,285 470,285"/>
+    <path d="M230,300 C 360,300 380,300 470,300"/>
+    <path d="M230,372 C 340,372 380,315 470,315"/>
+  </g>
+  <!-- server -> worker (right) -->
+  <g fill="none" stroke="url(#linkR)" stroke-width="2" stroke-linecap="round">
+    <path d="M730,285 C 850,285 850,218 950,218"/>
+    <path d="M730,300 L 950,300"/>
+    <path d="M730,315 C 850,315 850,382 950,382"/>
+  </g>
+  <!-- animated "energy" dashes flowing along the links -->
+  <g fill="none" stroke="#22d3ee" stroke-width="2" stroke-dasharray="2 12" stroke-linecap="round" opacity="0.55">
+    <path d="M230,228 C 340,228 380,285 470,285"><animate attributeName="stroke-dashoffset" values="0;-28" dur="0.9s" repeatCount="indefinite"/></path>
+    <path d="M230,300 C 360,300 380,300 470,300"><animate attributeName="stroke-dashoffset" values="0;-28" dur="0.9s" repeatCount="indefinite"/></path>
+    <path d="M230,372 C 340,372 380,315 470,315"><animate attributeName="stroke-dashoffset" values="0;-28" dur="0.9s" repeatCount="indefinite"/></path>
+  </g>
+  <g fill="none" stroke="#818cf8" stroke-width="2" stroke-dasharray="2 12" stroke-linecap="round" opacity="0.55">
+    <path d="M730,285 C 850,285 850,218 950,218"><animate attributeName="stroke-dashoffset" values="0;-28" dur="0.9s" repeatCount="indefinite"/></path>
+    <path d="M730,300 L 950,300"><animate attributeName="stroke-dashoffset" values="0;-28" dur="0.9s" repeatCount="indefinite"/></path>
+    <path d="M730,315 C 850,315 850,382 950,382"><animate attributeName="stroke-dashoffset" values="0;-28" dur="0.9s" repeatCount="indefinite"/></path>
+  </g>
+
+  <!-- ===== client nodes ===== -->
+  <g font-size="13">
+    <g transform="translate(70,202)">
+      <rect width="160" height="52" rx="12" fill="url(#nodeFill)" stroke="#27406f" stroke-width="1.2"/>
+      <circle cx="18" cy="26" r="5" fill="#22d3ee"/>
+      <text x="34" y="23" fill="#e7edfb" font-weight="700">agent loop</text>
+      <text x="34" y="39" fill="#7e92bd" font-size="10.5">autonomous</text>
+    </g>
+    <g transform="translate(70,274)">
+      <rect width="160" height="52" rx="12" fill="url(#nodeFill)" stroke="#27406f" stroke-width="1.2"/>
+      <circle cx="18" cy="26" r="5" fill="#22d3ee"/>
+      <text x="34" y="23" fill="#e7edfb" font-weight="700">OpenAI SDK</text>
+      <text x="34" y="39" fill="#7e92bd" font-size="10.5">python · js · go</text>
+    </g>
+    <g transform="translate(70,346)">
+      <rect width="160" height="52" rx="12" fill="url(#nodeFill)" stroke="#27406f" stroke-width="1.2"/>
+      <circle cx="18" cy="26" r="5" fill="#22d3ee"/>
+      <text x="34" y="23" fill="#e7edfb" font-weight="700">curl / app</text>
+      <text x="34" y="39" fill="#7e92bd" font-size="10.5">/v1/chat/completions</text>
+    </g>
+  </g>
+
+  <!-- ===== server ===== -->
+  <g>
+    <rect x="470" y="210" width="260" height="180" rx="18" fill="url(#serverFill)" stroke="#3b5ca0" stroke-width="1.6"/>
+    <text x="600" y="238" text-anchor="middle" font-size="15" font-weight="800" fill="#eef2fb" letter-spacing="0.5">agent-gpu server</text>
+
+    <!-- feature chips -->
+    <g font-size="11" font-weight="600" text-anchor="middle" fill="#bcd3ef">
+      <g><rect x="488" y="250" width="62" height="22" rx="11" fill="#0e1b3c" stroke="#2a4a7a"/><text x="519" y="265">auth</text></g>
+      <g><rect x="558" y="250" width="74" height="22" rx="11" fill="#0e1b3c" stroke="#2a4a7a"/><text x="595" y="265">quotas</text></g>
+      <g><rect x="640" y="250" width="74" height="22" rx="11" fill="#0e1b3c" stroke="#2a4a7a"/><text x="677" y="265">perms</text></g>
+    </g>
+
+    <!-- scheduler / router core: rotating dashed ring + pulsing hexagon -->
+    <g>
+      <circle cx="600" cy="312" r="40" fill="none" stroke="#22d3ee" stroke-width="1.4" stroke-dasharray="4 9" opacity="0.7">
+        <animateTransform attributeName="transform" type="rotate" from="0 600 312" to="360 600 312" dur="9s" repeatCount="indefinite"/>
+      </circle>
+      <polygon points="630,312 615,338 585,338 570,312 585,286 615,286" fill="#0c1838" stroke="#34d399" stroke-width="1.6" filter="url(#glow)">
+        <animate attributeName="stroke" values="#34d399;#22d3ee;#818cf8;#34d399" dur="4s" repeatCount="indefinite"/>
+      </polygon>
+      <circle cx="600" cy="312" r="7" fill="#22d3ee" filter="url(#glow)">
+        <animate attributeName="r" values="5;9;5" dur="1.4s" repeatCount="indefinite"
+                 calcMode="spline" keyTimes="0;0.5;1" keySplines="0.2 0.8 0.2 1;0.8 0 0.8 0.2"/>
+      </circle>
+      <text x="600" y="372" text-anchor="middle" font-size="10.5" font-weight="600" fill="#7e92bd" letter-spacing="1">SCHEDULER · QUEUE</text>
+    </g>
+  </g>
+
+  <!-- ===== GPU workers (inline so every heartbeat + VRAM bar animates reliably) ===== -->
+  <!-- worker 1 -->
+  <g transform="translate(950,186)">
+    <rect width="210" height="64" rx="14" fill="url(#nodeFill)" stroke="#27406f" stroke-width="1.2"/>
+    <rect x="16" y="18" width="28" height="28" rx="5" fill="#0b1530" stroke="#34d399" stroke-width="1.6"/>
+    <rect x="23" y="25" width="14" height="14" rx="2.5" fill="#34d399" fill-opacity="0.22" stroke="#34d399" stroke-width="1.2"/>
+    <g stroke="#34d399" stroke-width="1.4" stroke-linecap="round" opacity="0.85">
+      <line x1="23" y1="14" x2="23" y2="18"/><line x1="30" y1="14" x2="30" y2="18"/><line x1="37" y1="14" x2="37" y2="18"/>
+      <line x1="23" y1="46" x2="23" y2="50"/><line x1="30" y1="46" x2="30" y2="50"/><line x1="37" y1="46" x2="37" y2="50"/>
+    </g>
+    <circle cx="30" cy="32" r="14" fill="none" stroke="#34d399" stroke-width="1.5">
+      <animate attributeName="r" values="14;28" dur="2.4s" begin="0s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines="0.16 0.84 0.24 1"/>
+      <animate attributeName="opacity" values="0.75;0" dur="2.4s" begin="0s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines="0.16 0.84 0.24 1"/>
+    </circle>
+    <text x="58" y="25" fill="#e7edfb" font-size="13" font-weight="700">worker · GPU</text>
+    <text x="58" y="40" fill="#7e92bd" font-size="10.5">Ollama · NVIDIA</text>
+    <rect x="58" y="47" width="120" height="6" rx="3" fill="#0a1330" stroke="#27406f" stroke-width="1"/>
+    <rect x="58" y="47" width="60" height="6" rx="3" fill="url(#vram)">
+      <animate attributeName="width" values="40;108;72;96;52;88" dur="3.2s" repeatCount="indefinite"
+               calcMode="spline" keyTimes="0;0.2;0.4;0.6;0.8;1"
+               keySplines="0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1"/>
+    </rect>
+  </g>
+  <!-- worker 2 -->
+  <g transform="translate(950,268)">
+    <rect width="210" height="64" rx="14" fill="url(#nodeFill)" stroke="#27406f" stroke-width="1.2"/>
+    <rect x="16" y="18" width="28" height="28" rx="5" fill="#0b1530" stroke="#34d399" stroke-width="1.6"/>
+    <rect x="23" y="25" width="14" height="14" rx="2.5" fill="#34d399" fill-opacity="0.22" stroke="#34d399" stroke-width="1.2"/>
+    <g stroke="#34d399" stroke-width="1.4" stroke-linecap="round" opacity="0.85">
+      <line x1="23" y1="14" x2="23" y2="18"/><line x1="30" y1="14" x2="30" y2="18"/><line x1="37" y1="14" x2="37" y2="18"/>
+      <line x1="23" y1="46" x2="23" y2="50"/><line x1="30" y1="46" x2="30" y2="50"/><line x1="37" y1="46" x2="37" y2="50"/>
+    </g>
+    <circle cx="30" cy="32" r="14" fill="none" stroke="#34d399" stroke-width="1.5">
+      <animate attributeName="r" values="14;28" dur="2.4s" begin="0.8s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines="0.16 0.84 0.24 1"/>
+      <animate attributeName="opacity" values="0.75;0" dur="2.4s" begin="0.8s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines="0.16 0.84 0.24 1"/>
+    </circle>
+    <text x="58" y="25" fill="#e7edfb" font-size="13" font-weight="700">worker · GPU</text>
+    <text x="58" y="40" fill="#7e92bd" font-size="10.5">Ollama · AMD</text>
+    <rect x="58" y="47" width="120" height="6" rx="3" fill="#0a1330" stroke="#27406f" stroke-width="1"/>
+    <rect x="58" y="47" width="90" height="6" rx="3" fill="url(#vram)">
+      <animate attributeName="width" values="96;56;104;68;90;110" dur="3.6s" repeatCount="indefinite"
+               calcMode="spline" keyTimes="0;0.2;0.4;0.6;0.8;1"
+               keySplines="0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1"/>
+    </rect>
+  </g>
+  <!-- worker 3 -->
+  <g transform="translate(950,350)">
+    <rect width="210" height="64" rx="14" fill="url(#nodeFill)" stroke="#27406f" stroke-width="1.2"/>
+    <rect x="16" y="18" width="28" height="28" rx="5" fill="#0b1530" stroke="#34d399" stroke-width="1.6"/>
+    <rect x="23" y="25" width="14" height="14" rx="2.5" fill="#34d399" fill-opacity="0.22" stroke="#34d399" stroke-width="1.2"/>
+    <g stroke="#34d399" stroke-width="1.4" stroke-linecap="round" opacity="0.85">
+      <line x1="23" y1="14" x2="23" y2="18"/><line x1="30" y1="14" x2="30" y2="18"/><line x1="37" y1="14" x2="37" y2="18"/>
+      <line x1="23" y1="46" x2="23" y2="50"/><line x1="30" y1="46" x2="30" y2="50"/><line x1="37" y1="46" x2="37" y2="50"/>
+    </g>
+    <circle cx="30" cy="32" r="14" fill="none" stroke="#34d399" stroke-width="1.5">
+      <animate attributeName="r" values="14;28" dur="2.4s" begin="1.6s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines="0.16 0.84 0.24 1"/>
+      <animate attributeName="opacity" values="0.75;0" dur="2.4s" begin="1.6s" repeatCount="indefinite" calcMode="spline" keyTimes="0;1" keySplines="0.16 0.84 0.24 1"/>
+    </circle>
+    <text x="58" y="25" fill="#e7edfb" font-size="13" font-weight="700">worker · GPU</text>
+    <text x="58" y="40" fill="#7e92bd" font-size="10.5">Ollama · Apple · CPU</text>
+    <rect x="58" y="47" width="120" height="6" rx="3" fill="#0a1330" stroke="#27406f" stroke-width="1"/>
+    <rect x="58" y="47" width="70" height="6" rx="3" fill="url(#vram)">
+      <animate attributeName="width" values="60;100;44;84;112;70" dur="2.9s" repeatCount="indefinite"
+               calcMode="spline" keyTimes="0;0.2;0.4;0.6;0.8;1"
+               keySplines="0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1;0.2 0.8 0.2 1"/>
+    </rect>
+  </g>
+
+  <!-- ===== job packets: client -> server -> worker (snappy shoot + hold) ===== -->
+  <g filter="url(#glow)">
+    <g>
+      <rect x="-7" y="-4.5" width="14" height="9" rx="3" fill="#22d3ee"/>
+      <animateMotion dur="2.6s" begin="0s" repeatCount="indefinite" rotate="auto"
+        keyPoints="0;1;1" keyTimes="0;0.55;1" calcMode="spline"
+        keySplines="0.16 0.84 0.24 1;0 0 1 1"
+        path="M230,228 C 340,228 380,285 470,285 L 730,285 C 850,285 850,218 950,218"/>
+      <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.06;0.55;0.62;1" dur="2.6s" begin="0s" repeatCount="indefinite"/>
+    </g>
+    <g>
+      <rect x="-7" y="-4.5" width="14" height="9" rx="3" fill="#22d3ee"/>
+      <animateMotion dur="2.6s" begin="0.5s" repeatCount="indefinite" rotate="auto"
+        keyPoints="0;1;1" keyTimes="0;0.55;1" calcMode="spline"
+        keySplines="0.16 0.84 0.24 1;0 0 1 1"
+        path="M230,300 C 360,300 380,300 470,300 L 730,300 L 950,300"/>
+      <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.06;0.55;0.62;1" dur="2.6s" begin="0.5s" repeatCount="indefinite"/>
+    </g>
+    <g>
+      <rect x="-7" y="-4.5" width="14" height="9" rx="3" fill="#22d3ee"/>
+      <animateMotion dur="2.6s" begin="1s" repeatCount="indefinite" rotate="auto"
+        keyPoints="0;1;1" keyTimes="0;0.55;1" calcMode="spline"
+        keySplines="0.16 0.84 0.24 1;0 0 1 1"
+        path="M230,372 C 340,372 380,315 470,315 L 730,315 C 850,315 850,382 950,382"/>
+      <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.06;0.55;0.62;1" dur="2.6s" begin="1s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- ===== token packets: worker -> server -> client (streamed back) ===== -->
+  <g filter="url(#glow)">
+    <g>
+      <circle r="4.5" fill="#f472b6"/>
+      <animateMotion dur="2.6s" begin="1.3s" repeatCount="indefinite"
+        keyPoints="0;1;1" keyTimes="0;0.6;1" calcMode="spline"
+        keySplines="0.16 0.84 0.24 1;0 0 1 1"
+        path="M950,218 C 850,218 850,285 730,285 L 470,285 C 380,285 340,228 230,228"/>
+      <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.06;0.6;0.67;1" dur="2.6s" begin="1.3s" repeatCount="indefinite"/>
+    </g>
+    <g>
+      <circle r="4.5" fill="#a855f7"/>
+      <animateMotion dur="2.6s" begin="1.8s" repeatCount="indefinite"
+        keyPoints="0;1;1" keyTimes="0;0.6;1" calcMode="spline"
+        keySplines="0.16 0.84 0.24 1;0 0 1 1"
+        path="M950,300 L 730,300 L 470,300 C 380,300 360,300 230,300"/>
+      <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.06;0.6;0.67;1" dur="2.6s" begin="1.8s" repeatCount="indefinite"/>
+    </g>
+    <g>
+      <circle r="4.5" fill="#f472b6"/>
+      <animateMotion dur="2.6s" begin="2.3s" repeatCount="indefinite"
+        keyPoints="0;1;1" keyTimes="0;0.6;1" calcMode="spline"
+        keySplines="0.16 0.84 0.24 1;0 0 1 1"
+        path="M950,382 C 850,382 850,315 730,315 L 470,315 C 380,315 340,372 230,372"/>
+      <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.06;0.6;0.67;1" dur="2.6s" begin="2.3s" repeatCount="indefinite"/>
+    </g>
+  </g>
+
+  <!-- flow legend -->
+  <g font-size="11" font-weight="600">
+    <rect x="470" y="416" width="14" height="9" rx="3" fill="#22d3ee"/>
+    <text x="490" y="424" fill="#9fb0d6">job dispatch</text>
+    <circle cx="600" cy="420" r="4.5" fill="#f472b6"/>
+    <text x="612" y="424" fill="#9fb0d6">token stream</text>
+  </g>
+</svg>

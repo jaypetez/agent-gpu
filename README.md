@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.svg" alt="agent-gpu — distributed inference layer for Ollama: client agents call one OpenAI-compatible server that authenticates, applies quotas, and schedules each job onto a fleet of GPU workers running Ollama; tokens stream back" width="100%">
+</p>
+
 # agent-gpu
 
 [![CI](https://github.com/jaypetez/agent-gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/jaypetez/agent-gpu/actions/workflows/ci.yml)
