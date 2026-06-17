@@ -195,6 +195,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// client-supplied messages through unchanged.
 	job.SessionID = sessionID
 	if mode == modeStateful {
+		newTurns := toDomainMessages(req.Messages)
+		// In OverflowReject mode, refuse a turn whose persistence would exceed a
+		// per-session cap BEFORE dispatching, so no inference is wasted on a turn the
+		// session cannot accept (#37). The check is owner-scoped and maps a missing
+		// session to the same 404 as elsewhere. Under the default trim policy this is
+		// always a no-op. It necessarily checks only the client-supplied new
+		// message(s) — the assistant reply's size is unknown until inference runs — so
+		// a turn that fits on input but tips over the cap once the reply is appended is
+		// delivered to the client and then dropped from history (logged in
+		// persistTurn, which stores atomically); the next turn re-establishes context.
+		if err := s.sessionMgr.CheckAppendable(r.Context(), sessionID, key.ID, newTurns...); err != nil {
+			s.writeSessionLookupError(r, w, err)
+			return
+		}
 		hist, err := s.sessionMgr.History(r.Context(), sessionID, key.ID)
 		if err != nil {
 			s.writeSessionLookupError(r, w, err)
@@ -203,7 +217,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// The reconstructed context is stored history followed by this turn's new
 		// messages, so the worker receives the full conversation even though the
 		// client sent only the new turn(s).
-		job.Messages = append(hist, toDomainMessages(req.Messages)...)
+		job.Messages = append(hist, newTurns...)
 	}
 
 	if req.Stream {
@@ -247,22 +261,22 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // persistTurn appends a completed stateful turn to the session's history: each
 // new user/tool message the client sent this turn, followed by the assistant
-// reply (content + any tool_calls). It is called only after a successful
-// response so a failed inference never stores a half-turn. Append errors are
-// logged and swallowed — a persistence failure must never fail an inference the
-// client already received (the reply is still returned; at worst the next turn
-// lacks this one's context). The assistant reply is stored even when empty
-// (e.g. a pure tool_calls turn) so the conversation stays well-formed.
+// reply (content + any tool_calls), stored ATOMICALLY via AppendTurns so a
+// reject-mode cap never leaves a half-turn (either the whole turn persists or
+// none of it does). It is called only after a successful response so a failed
+// inference never stores a turn. Append errors are logged and swallowed — a
+// persistence failure must never fail an inference the client already received
+// (the reply is still returned; at worst the next turn lacks this one's
+// context). The reject-mode over-cap case is already prevented up front by the
+// pre-dispatch CheckAppendable gate in handleChatCompletions, so a reject here is
+// only an unlikely race (the session filled concurrently); swallowing it keeps
+// the delivered response authoritative. The assistant reply is stored even when
+// empty (e.g. a pure tool_calls turn) so the conversation stays well-formed.
 func (s *Server) persistTurn(ctx context.Context, sessionID, ownerKeyID string, newMessages []chatMessage, output string, toolCalls []types.ToolCall) {
-	log := s.reqLog(ctx)
-	for _, m := range toDomainMessages(newMessages) {
-		if err := s.sessionMgr.AppendTurn(ctx, sessionID, ownerKeyID, m); err != nil {
-			log.Warn("session append (request turn) failed", "session", sessionID, "err", err)
-		}
-	}
-	assistant := types.Message{Role: "assistant", Content: output, ToolCalls: toolCalls}
-	if err := s.sessionMgr.AppendTurn(ctx, sessionID, ownerKeyID, assistant); err != nil {
-		log.Warn("session append (assistant turn) failed", "session", sessionID, "err", err)
+	turns := toDomainMessages(newMessages)
+	turns = append(turns, types.Message{Role: "assistant", Content: output, ToolCalls: toolCalls})
+	if err := s.sessionMgr.AppendTurns(ctx, sessionID, ownerKeyID, turns...); err != nil {
+		s.reqLog(ctx).Warn("session append turn failed", "session", sessionID, "err", err)
 	}
 }
 
