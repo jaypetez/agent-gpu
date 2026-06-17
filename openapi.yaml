@@ -140,6 +140,13 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/ChatCompletionRequest"
+            example:
+              model: llama3
+              messages:
+                - role: system
+                  content: You are a helpful assistant.
+                - role: user
+                  content: Say hello to the agent-gpu fleet in one sentence.
       responses:
         "200":
           description: |
@@ -150,17 +157,50 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ChatCompletionResponse"
+              example:
+                id: chatcmpl-9f1c2a7b3d4e5f60
+                object: chat.completion
+                created: 1718521200
+                model: llama3
+                choices:
+                  - index: 0
+                    message:
+                      role: assistant
+                      content: Hello to the entire agent-gpu fleet!
+                    finish_reason: stop
+                usage:
+                  prompt_tokens: 24
+                  completion_tokens: 9
+                  total_tokens: 33
             text/event-stream:
               schema:
                 $ref: "#/components/schemas/ChatCompletionChunk"
+              # One representative SSE frame. On the wire each chunk is sent as a
+              # `data: <json>\n\n` event and the stream ends with `data: [DONE]\n\n`
+              # (see the endpoint description); this example shows a single decoded
+              # `chat.completion.chunk` payload.
+              example:
+                id: chatcmpl-9f1c2a7b3d4e5f60
+                object: chat.completion.chunk
+                created: 1718521200
+                model: llama3
+                choices:
+                  - index: 0
+                    delta:
+                      content: " to the fleet!"
+                    finish_reason: null
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/SessionHistoryLimit"
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
@@ -191,6 +231,9 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CompletionRequest"
+            example:
+              model: llama3
+              prompt: "Complete this sentence: agent-gpu pools GPUs so that"
       responses:
         "200":
           description: |
@@ -201,9 +244,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompletionResponse"
+              example:
+                id: cmpl-3a8d1e9f04b27c65
+                object: text_completion
+                created: 1718521200
+                model: llama3
+                choices:
+                  - text: " one API endpoint can serve many machines at once."
+                    index: 0
+                    finish_reason: stop
+                usage:
+                  prompt_tokens: 12
+                  completion_tokens: 11
+                  total_tokens: 23
             text/event-stream:
               schema:
                 $ref: "#/components/schemas/CompletionChunk"
+              # One representative SSE frame. On the wire each chunk is sent as a
+              # `data: <json>\n\n` event and the stream ends with `data: [DONE]\n\n`
+              # (see the endpoint description); this example shows a single decoded
+              # `text_completion` payload.
+              example:
+                id: cmpl-3a8d1e9f04b27c65
+                object: text_completion
+                created: 1718521200
+                model: llama3
+                choices:
+                  - text: " can serve many machines at once."
+                    index: 0
+                    finish_reason: stop
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -227,6 +296,9 @@ paths:
         Mints a new owner-scoped conversation session targeting the requested model and returns its
         id. The session is owned by the authenticated key; only that key may read, append to, or
         delete it.
+
+        When the server enforces a concurrent-session cap per key and the key is already at it, the
+        request is rejected with `429` and code `session_limit_exceeded`.
       tags:
         - Sessions
       requestBody:
@@ -246,6 +318,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/SessionLimitExceeded"
         "500":
           $ref: "#/components/responses/InternalError"
         "501":
@@ -316,6 +390,12 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/AdminCreateKeyRequest"
+            example:
+              name: my-agent
+              roles:
+                - user
+              allow_models:
+                - llama3
       responses:
         "201":
           description: The created key, including its one-time plaintext token.
@@ -323,6 +403,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminCreateKeyResponse"
+              example:
+                id: key_8f3a1c2b
+                name: my-agent
+                token: agpu_8f3a1c2b_Sx9Qd2m7nKpZ4tL6yR0wF1hJ3vC5bN8
+                roles:
+                  - user
+                allow_models:
+                  - llama3
+                deny_models: []
+                created: 1718521200
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -442,6 +532,14 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/AdminPermissionsRequest"
+            example:
+              roles:
+                - user
+              allow_models:
+                - llama3
+                - qwen2:0.5b
+              deny_models:
+                - gpt-oss
       responses:
         "200":
           description: The updated API key metadata.
@@ -449,6 +547,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminKeyView"
+              example:
+                id: key_8f3a1c2b
+                name: my-agent
+                roles:
+                  - user
+                allow_models:
+                  - llama3
+                  - qwen2:0.5b
+                deny_models:
+                  - gpt-oss
+                revoked: false
+                usage_count: 128
+                created: 1718521200
+                last_used: 1718607600
+                limits: null
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -480,6 +593,11 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/AdminQuotaRequest"
+            example:
+              rpm: 60
+              tpm: 40000
+              daily_tokens: 1000000
+              monthly_tokens: 20000000
       responses:
         "200":
           description: The updated API key metadata.
@@ -487,6 +605,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminKeyView"
+              example:
+                id: key_8f3a1c2b
+                name: my-agent
+                roles:
+                  - user
+                allow_models:
+                  - llama3
+                deny_models: []
+                revoked: false
+                usage_count: 128
+                created: 1718521200
+                last_used: 1718607600
+                limits:
+                  rpm: 60
+                  tpm: 40000
+                  daily_tokens: 1000000
+                  monthly_tokens: 20000000
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -515,6 +650,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminQuotaUsageResponse"
+              example:
+                key_id: key_8f3a1c2b
+                limits:
+                  rpm: 60
+                  tpm: 40000
+                  daily_tokens: 1000000
+                  monthly_tokens: 20000000
+                requests_this_minute: 7
+                tokens_this_minute: 5120
+                tokens_today: 412000
+                tokens_this_month: 8900000
+                minute_resets_at: 1718521260
+                day_resets_at: 1718582400
+                month_resets_at: 1719792000
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -589,6 +738,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminStatsResponse"
+              example:
+                queue:
+                  total: 3
+                  by_priority:
+                    normal: 2
+                    high: 1
+                workers:
+                  - id: worker-a
+                    active_jobs: 2
+                    load: 45
+                    status: online
+                  - id: worker-b
+                    active_jobs: 0
+                    load: 0
+                    status: draining
+                wait_time:
+                  count: 128
+                  sum_ms: 76800
+                  max_ms: 4200
+                  mean_ms: 600
+                  buckets:
+                    - le_ms: 100
+                      count: 40
+                    - le_ms: 500
+                      count: 96
+                    - le_ms: 1000
+                      count: 118
+                    - le_ms: 0
+                      count: 128
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -740,6 +918,31 @@ components:
             error:
               message: sessions are not enabled
               code: not_implemented
+    SessionLimitExceeded:
+      description: |
+        The authenticated key has reached its concurrent-session cap. End an existing session (or
+        wait for one to idle out) before creating another.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: concurrent session limit reached
+              code: session_limit_exceeded
+    SessionHistoryLimit:
+      description: |
+        Appending this turn would exceed a per-session history limit (turns or context tokens) and
+        the server is configured to reject rather than trim. Start a new session or shorten the
+        conversation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: session history limit reached
+              code: session_limit_exceeded
 
   schemas:
     Error:
@@ -769,6 +972,7 @@ components:
                 - unauthorized
                 - forbidden
                 - rate_limit_exceeded
+                - session_limit_exceeded
                 - unavailable
                 - invalid_request_error
                 - not_found

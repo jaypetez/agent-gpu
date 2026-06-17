@@ -19,6 +19,7 @@ package session
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -27,6 +28,55 @@ import (
 // the API never leaks the existence of another owner's session. Match it with
 // errors.Is.
 var ErrSessionNotFound = errors.New("session: not found")
+
+// ErrSessionLimitExceeded is returned when a session limit is hit (#37): the
+// per-owner concurrent-session cap on Create, or — in OverflowReject mode — a
+// per-session turn/byte/context-token cap on AppendTurn. It is the typed seam
+// the HTTP layer maps to a 4xx (the concurrent cap → 429, an append overflow →
+// 409); see internal/httpapi/sessions.go. Match it with errors.Is.
+var ErrSessionLimitExceeded = errors.New("session: limit exceeded")
+
+// OverflowPolicy selects what a HistoryStore does when appending a turn would
+// exceed a per-session history cap (turns, bytes, or context tokens).
+type OverflowPolicy int
+
+const (
+	// OverflowTrim drops oldest turns until the caps hold again, keeping the most
+	// recent context. It is the DEFAULT and preserves the pre-#37 behavior so a
+	// live conversation is never wedged by a write rejection.
+	OverflowTrim OverflowPolicy = iota
+	// OverflowReject refuses an append that would exceed a cap, returning
+	// ErrSessionLimitExceeded and leaving the stored history unchanged. A turn that
+	// fits is appended normally. It lets a caller enforce a hard ceiling rather than
+	// silently forgetting old context.
+	OverflowReject
+)
+
+// String renders the policy for logs/config echoes.
+func (p OverflowPolicy) String() string {
+	switch p {
+	case OverflowReject:
+		return "reject"
+	default:
+		return "trim"
+	}
+}
+
+// ParseOverflowPolicy maps a config string ("trim"|"reject", case-insensitive)
+// to an OverflowPolicy. An empty or unrecognized value falls back to
+// OverflowTrim (the non-breaking default), and ok reports whether the input was
+// a recognized policy name so a caller can warn on a typo without wedging
+// startup (mirroring the silent-fallback resolvers in internal/config).
+func ParseOverflowPolicy(s string) (p OverflowPolicy, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "trim":
+		return OverflowTrim, true
+	case "reject":
+		return OverflowReject, true
+	default:
+		return OverflowTrim, false
+	}
+}
 
 // Status is the lifecycle state of a session.
 type Status string

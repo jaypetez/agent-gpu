@@ -13,9 +13,13 @@
 //     calls ObserveRequest / AddTokens / IncThrottle on the hot path.
 //   - A live custom Collector (see collector.go) that reads the control-plane
 //     server's in-memory snapshots at scrape time — queue depth, the time-in-queue
-//     histogram, per-worker GPU utilization / VRAM / active jobs / start time, and
-//     affinity hit/miss — so those gauges always reflect real state without a
-//     background poller.
+//     histogram, per-worker GPU utilization / VRAM / active jobs / start time,
+//     affinity hit/miss, and the session-rebind counter — so those gauges always
+//     reflect real state without a background poller.
+//   - Session observability (see session.go, #38): a scrape-time gauge of the live
+//     session count (a second collector over the session Manager) plus two
+//     push-observed lifetime histograms (turns and duration) recorded once per
+//     session end via ObserveSessionEnd.
 //
 // The Go runtime and process collectors are registered too, so standard
 // process_* and go_* metrics come for free.
@@ -60,6 +64,13 @@ type Metrics struct {
 	requestDuration *prometheus.HistogramVec
 	tokensTotal     *prometheus.CounterVec
 	throttledTotal  *prometheus.CounterVec
+
+	// Session-lifetime histograms (#38), observed once per session END (delete or
+	// idle expiry) via ObserveSessionEnd. They are unlabeled (no session id / key
+	// id — that would be unbounded), so they summarize the fleet-wide distribution
+	// of how many turns sessions ran and how long they lived. See session.go.
+	sessionTurns    prometheus.Histogram
+	sessionDuration prometheus.Histogram
 }
 
 // durationBuckets are the latency histogram boundaries (seconds). They span the
@@ -67,6 +78,17 @@ type Metrics struct {
 // inference completions, so the same histogram gives a usable p50/p95/p99 for
 // both fast and slow endpoints. The implicit +Inf bucket catches anything slower.
 var durationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
+// sessionTurnsBuckets are the turn-count histogram boundaries for a session's
+// lifetime (#38): a short exchange (1-2 turns) through a long multi-hundred-turn
+// conversation, so p50/p95 are meaningful across both. The implicit +Inf bucket
+// catches anything beyond a typical per-session turn cap.
+var sessionTurnsBuckets = []float64{1, 2, 5, 10, 20, 50, 100, 200, 500}
+
+// sessionDurationBuckets are the session-lifetime histogram boundaries (seconds),
+// spanning a few-second throwaway session through multi-hour conversations, so the
+// distribution and its quantiles are usable across short and long-lived sessions.
+var sessionDurationBuckets = []float64{1, 5, 15, 30, 60, 300, 900, 1800, 3600, 7200, 21600}
 
 // New constructs a Metrics with a fresh, isolated registry (not the global
 // default, so tests and multiple instances never cross-contaminate), registers
@@ -99,12 +121,26 @@ func New() *Metrics {
 			Name:      "throttled_total",
 			Help:      "Total requests rejected by rate limiting, labeled by scope (global|key).",
 		}, []string{"scope"}),
+		sessionTurns: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "session_turns",
+			Help:      "Number of conversation turns a session accumulated over its lifetime, observed when the session ends (delete or idle expiry).",
+			Buckets:   sessionTurnsBuckets,
+		}),
+		sessionDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "session_duration_seconds",
+			Help:      "How long a session lived (end minus creation) in seconds, observed when the session ends (delete or idle expiry).",
+			Buckets:   sessionDurationBuckets,
+		}),
 	}
 	reg.MustRegister(
 		m.requestsTotal,
 		m.requestDuration,
 		m.tokensTotal,
 		m.throttledTotal,
+		m.sessionTurns,
+		m.sessionDuration,
 		// Standard process_* and go_* metrics for free operational visibility.
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		collectors.NewGoCollector(),

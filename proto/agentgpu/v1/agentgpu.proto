@@ -93,6 +93,17 @@ message Job {
   // Tools (function definitions) the model may call. Threaded to Ollama
   // /api/chat so the model can emit tool_calls.
   repeated Tool tools = 5;
+  // Model-warmth hint (#35): how long the worker should ask Ollama to keep the
+  // model resident after this job, as a `keep_alive` duration in SECONDS. The
+  // server sets it for session-bound turns (derived from the session's idle TTL)
+  // so a model stays warm across an active conversation and unloads on its own
+  // once the session goes idle; it is left 0 for session-less jobs. Semantics
+  // mirror Ollama's keep_alive: 0 means "unset" — the worker omits keep_alive
+  // and Ollama's default (5m) applies — a positive value keeps the model loaded
+  // that many seconds (re-sent each turn, which resets Ollama's unload timer),
+  // and a negative value keeps it loaded indefinitely. Additive and back-compat:
+  // an unset (0) field reproduces the pre-#35 behavior exactly.
+  int64 keep_alive_seconds = 6;
 }
 
 // JobResult is the worker's response to a dispatched Job.
@@ -211,6 +222,19 @@ message PullModel {
   string model = 1;
 }
 
+// UnloadModel instructs a worker to evict a model from its local Ollama's
+// memory now (keep_alive=0), freeing the VRAM (#35). The server sends it
+// best-effort to a session's bound worker when that session is explicitly
+// ended, so the conversation's model is released promptly rather than lingering
+// for the remainder of its keep_alive window. Like PullModel it is additive and
+// fire-and-forget: a missing/already-unloaded model is a no-op on the worker and
+// no result is streamed back. The idle keep_alive timer remains the backstop
+// release path, so a dropped UnloadModel still frees VRAM within the warm window.
+message UnloadModel {
+  // Name of the model to unload (e.g. "llama3").
+  string model = 1;
+}
+
 // WorkerMessage is the worker -> server side of the bidi stream.
 message WorkerMessage {
   oneof payload {
@@ -228,6 +252,7 @@ message ServerMessage {
     RegisterAck register_ack = 1;
     Job job = 2;
     PullModel pull_model = 3;
+    UnloadModel unload_model = 4;
   }
 }
 

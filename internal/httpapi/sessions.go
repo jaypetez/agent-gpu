@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -69,10 +70,26 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	sess, err := s.sessionMgr.Create(r.Context(), key.ID, req.Model)
 	if err != nil {
+		if errors.Is(err, session.ErrSessionLimitExceeded) {
+			// The owner is at its concurrent-session cap (#37). 429 (a rate-style
+			// limit) with the typed code lets a client back off / end an old session
+			// and retry; no internal detail (e.g. the cap value) is leaked.
+			s.reqLog(r.Context()).Warn("session create throttled: per-key cap", "key_id", key.ID)
+			writeError(w, http.StatusTooManyRequests, "session_limit_exceeded",
+				"concurrent session limit reached")
+			return
+		}
 		s.reqLog(r.Context()).Error("session create failed", "key_id", key.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create session")
 		return
 	}
+
+	// Log the create with the new session_id (alongside request_id) so the
+	// conversation is traceable from its first moment, mirroring the session_id
+	// correlation the chat path adds (#38). The owner key id is already implied by
+	// auth and is not a metric label, but logging it here is consistent with the
+	// rest of the session lifecycle lines.
+	s.reqLog(r.Context()).Info("session created", "session_id", sess.ID, "model", sess.Model)
 
 	writeJSON(w, http.StatusCreated, sessionResponse{
 		ID:      sess.ID,
@@ -96,6 +113,9 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := r.PathValue("id")
+	// Bind session_id onto the request-scoped logger so any line this request logs
+	// (e.g. a lookup error) carries it alongside request_id (#38).
+	r = r.WithContext(s.withSessionLog(r.Context(), id))
 	sess, err := s.sessionMgr.Get(r.Context(), id, key.ID)
 	if err != nil {
 		s.writeSessionLookupError(r, w, err)
@@ -122,6 +142,13 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 // handleDeleteSession serves DELETE /v1/sessions/{id}. It ends the owner's
 // session and purges its history, returning 204. A missing/not-owned session
 // yields 404, no existence leak.
+//
+// On a successful delete it best-effort asks the session's bound worker to unload
+// the conversation's model, freeing its VRAM promptly rather than after the
+// keep_alive window (#35). The bound worker + model are read BEFORE the delete
+// (which erases them); the unload is fire-and-forget and never affects the 204
+// the client receives — Ollama's idle keep_alive timer is the backstop release
+// path if the worker is gone or the message is dropped.
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	key, ok := keyFromContext(r.Context())
 	if !ok {
@@ -133,11 +160,46 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := r.PathValue("id")
+	// Bind session_id onto the request-scoped logger so the delete (and any lookup
+	// error) is traceable alongside request_id (#38).
+	r = r.WithContext(s.withSessionLog(r.Context(), id))
+	// Capture the bound worker + model before deleting, so we know where to send
+	// the unload. A lookup failure is non-fatal: Delete below produces the
+	// authoritative 404 for a missing/not-owned session.
+	var boundWorker, model string
+	if sess, err := s.sessionMgr.Get(r.Context(), id, key.ID); err == nil {
+		boundWorker, model = sess.BoundWorkerID, sess.Model
+	}
 	if err := s.sessionMgr.Delete(r.Context(), id, key.ID); err != nil {
 		s.writeSessionLookupError(r, w, err)
 		return
 	}
+	s.reqLog(r.Context()).Info("session deleted")
+	s.unloadSessionModel(r.Context(), boundWorker, model)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// modelUnloader is the optional engine capability used to release a session's
+// model on its bound worker (#35). *server.Server satisfies it
+// (UnloadSessionModel); the chat/completions handlers' inferenceEngine does NOT
+// require it, so test fakes that only exercise inference are unaffected — the
+// delete handler simply skips the unload when the engine does not implement it.
+type modelUnloader interface {
+	UnloadSessionModel(ctx context.Context, workerID, model string)
+}
+
+// unloadSessionModel best-effort releases an ended session's model on its bound
+// worker, when both are known and the engine supports unloading. It is a no-op
+// otherwise (an unbound session, a model-less session, or an engine without the
+// capability), so the keep_alive idle timer remains the release path in those
+// cases. It never blocks or fails the delete response.
+func (s *Server) unloadSessionModel(ctx context.Context, workerID, model string) {
+	if workerID == "" || model == "" {
+		return
+	}
+	if u, ok := s.engine.(modelUnloader); ok {
+		u.UnloadSessionModel(ctx, workerID, model)
+	}
 }
 
 // sessionsEnabled reports whether the session subsystem is wired in. When it is
@@ -160,6 +222,16 @@ func (s *Server) sessionsEnabled(w http.ResponseWriter) bool {
 func (s *Server) writeSessionLookupError(r *http.Request, w http.ResponseWriter, err error) {
 	if errors.Is(err, session.ErrSessionNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "session not found")
+		return
+	}
+	if errors.Is(err, session.ErrSessionLimitExceeded) {
+		// A per-session history cap was hit in OverflowReject mode (#37). 409
+		// Conflict: the session's stored state conflicts with accepting the turn;
+		// the client must shorten the conversation (e.g. start a new session) rather
+		// than simply retry. No internal detail (which cap, the limit) is leaked.
+		s.reqLog(r.Context()).Warn("session turn rejected: history cap")
+		writeError(w, http.StatusConflict, "session_limit_exceeded",
+			"session history limit reached")
 		return
 	}
 	s.reqLog(r.Context()).Error("session lookup failed", "err", err)

@@ -30,6 +30,12 @@ type Executor interface {
 	// Pull fetches a model onto the worker. It is invoked only after the server
 	// has authorized the requesting key for the Pull action.
 	Pull(ctx context.Context, model string) error
+	// Unload evicts a model from the backend's memory, freeing its VRAM. It backs
+	// the model-warmth feature's explicit-release path (#35): the server asks the
+	// session's bound worker to unload the conversation's model when the session is
+	// ended, rather than waiting out the keep_alive window. It is best-effort — a
+	// missing/already-unloaded model is not an error — so it never fails a caller.
+	Unload(ctx context.Context, model string) error
 }
 
 // EchoExecutor is the stub executor: it echoes the prompt back as output. It
@@ -68,6 +74,9 @@ func (e EchoExecutor) ListModels(_ context.Context) ([]types.Model, error) {
 // Pull is a no-op for the echo stub: it advertises no real backend to pull onto.
 func (e EchoExecutor) Pull(_ context.Context, _ string) error { return nil }
 
+// Unload is a no-op for the echo stub: it holds no model in memory to evict.
+func (e EchoExecutor) Unload(_ context.Context, _ string) error { return nil }
+
 // OllamaExecutor implements Executor over a local Ollama instance. Execute
 // streams /api/chat token-by-token; ListModels reads /api/tags; Pull drives
 // /api/pull.
@@ -98,9 +107,10 @@ func (e *OllamaExecutor) Execute(ctx context.Context, job types.Job, emit func(t
 
 	var sb strings.Builder
 	res, err := e.client.ChatStream(ctx, ollama.ChatRequest{
-		Model:    job.Model,
-		Messages: messages,
-		Tools:    job.Tools,
+		Model:     job.Model,
+		Messages:  messages,
+		Tools:     job.Tools,
+		KeepAlive: keepAlive(job.KeepAliveSeconds),
 	}, func(delta string, calls []types.ToolCall) {
 		sb.WriteString(delta)
 		if emit != nil && (delta != "" || len(calls) > 0) {
@@ -119,6 +129,19 @@ func (e *OllamaExecutor) Execute(ctx context.Context, job types.Job, emit func(t
 		ToolCalls:        res.ToolCalls,
 		FinishReason:     finishReason(res),
 	}
+}
+
+// keepAlive maps a job's KeepAliveSeconds (#35) to the optional keep_alive value
+// the ollama client sends. A zero value means "unset" — return nil so the client
+// omits keep_alive and Ollama's default unload window applies (back-compat with
+// every pre-#35 job, which carries 0). A non-zero value (a session's warm window,
+// or a negative "keep loaded" sentinel) is passed through as a pointer so it is
+// sent verbatim.
+func keepAlive(seconds int64) *int64 {
+	if seconds == 0 {
+		return nil
+	}
+	return &seconds
 }
 
 // finishReason derives the OpenAI finish_reason from a chat result. A tool call
@@ -153,6 +176,11 @@ func (e *OllamaExecutor) ListModels(ctx context.Context) ([]types.Model, error) 
 // Pull fetches a model onto Ollama.
 func (e *OllamaExecutor) Pull(ctx context.Context, model string) error {
 	return e.client.Pull(ctx, model)
+}
+
+// Unload evicts a model from Ollama's memory (keep_alive=0), freeing its VRAM.
+func (e *OllamaExecutor) Unload(ctx context.Context, model string) error {
+	return e.client.Unload(ctx, model)
 }
 
 // jobError coerces an error returned by the ollama client into a *types.JobError.

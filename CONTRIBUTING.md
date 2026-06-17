@@ -29,10 +29,9 @@ project board tracks status across these columns:
 
 ## Local setup
 
-> The implementation language/runtime is decided in
-> [#1 Server + Worker Architecture](https://github.com/jaypetez/agent-gpu/issues/1); build and run
-> instructions will be filled in as the toolchain lands. Until then, use Docker Compose for a
-> full local stack (see [#18](https://github.com/jaypetez/agent-gpu/issues/18)).
+The project is a single Go module (Go 1.23+). See the
+[Developer Guide](docs/developer-guide.md) for the full build/run/test workflow,
+or use Docker Compose for a full local stack (see [docs/docker.md](docs/docker.md)):
 
 ```bash
 # Bring up server + workers + backing services

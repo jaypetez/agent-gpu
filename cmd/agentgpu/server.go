@@ -59,6 +59,11 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	hbTimeout := fs.Duration("heartbeat-timeout", 0, "evict a worker after this long without a heartbeat (default 45s or $AGENTGPU_HEARTBEAT_TIMEOUT)")
 	sessionPath := fs.String("session-path", "", "path to the session+history checkpoint (default $AGENTGPU_SESSION_PATH or ~/.agentgpu/sessions.json)")
 	sessionTTL := fs.Duration("session-ttl", 0, "per-session idle timeout (default 30m or $AGENTGPU_SESSION_TTL)")
+	maxSessionsPerKey := fs.Int("max-sessions-per-key", 0, "max concurrent sessions per API key (0 = unlimited or $AGENTGPU_MAX_SESSIONS_PER_KEY)")
+	maxSessionTurns := fs.Int("max-session-turns", 0, "per-session conversation turn cap (default 200 or $AGENTGPU_MAX_SESSION_TURNS)")
+	maxSessionContextTokens := fs.Int("max-session-context-tokens", 0, "per-session cumulative context-token cap (0 = unlimited or $AGENTGPU_MAX_SESSION_CONTEXT_TOKENS)")
+	sessionOverflow := fs.String("session-overflow-policy", "", "history over-cap policy: trim (drop oldest, default) or reject (default trim or $AGENTGPU_SESSION_OVERFLOW_POLICY)")
+	modelWarmMax := fs.Duration("model-warm-max", 0, "max model-warmth keep_alive window for session-bound jobs; keep_alive = min(session TTL, this) (default 1h or $AGENTGPU_MODEL_WARM_MAX)")
 	setUsage(fs, "Usage: agentgpu server start [--listen host:port] [--http-listen host:port] [flags]")
 	// The server/worker commands have no caller-injected writer; their help goes to
 	// stdout (a success), matching the informational top-level help.
@@ -88,8 +93,13 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		GlobalTPM:            *globalTPM,
 	}, nil, nil)
 	scfg := config.ResolveSession(config.SessionConfig{
-		Path: *sessionPath,
-		TTL:  *sessionTTL,
+		Path:              *sessionPath,
+		TTL:               *sessionTTL,
+		ModelWarmMax:      *modelWarmMax,
+		MaxTurns:          *maxSessionTurns,
+		MaxContextTokens:  *maxSessionContextTokens,
+		MaxSessionsPerKey: *maxSessionsPerKey,
+		OverflowPolicy:    *sessionOverflow,
 	}, nil, nil)
 	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout)
 }
@@ -162,7 +172,14 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 	sessPath := scfg.Path
 	histPath := sessionHistoryPath(sessPath)
 	sessStore := session.NewMemorySessionStore()
-	histStore := session.NewMemoryHistoryStore(scfg.MaxTurns, scfg.MaxBytes)
+	// History caps + overflow policy (#37): an unrecognized policy string falls back
+	// to trim (the non-breaking default) and is logged so a typo is visible without
+	// wedging startup, mirroring the silent-fallback config resolvers.
+	overflow, okPolicy := session.ParseOverflowPolicy(scfg.OverflowPolicy)
+	if !okPolicy {
+		logger.Warn("unrecognized session overflow policy; defaulting to trim", "value", scfg.OverflowPolicy)
+	}
+	histStore := session.NewMemoryHistoryStoreWithPolicy(scfg.MaxTurns, scfg.MaxBytes, scfg.MaxContextTokens, overflow)
 	now := time.Now()
 	dropped, err := sessStore.LoadCheckpoint(sessPath, now)
 	if err != nil {
@@ -173,12 +190,39 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 	if err := histStore.LoadCheckpoint(histPath, keep); err != nil {
 		return fmt.Errorf("load history checkpoint: %w", err)
 	}
+
+	// Prometheus instrument (#24): one registry shared by the request-path
+	// collectors (updated inline by the HTTP layer), the live server collector
+	// (read at scrape time), and the session observability added in #38 — the live
+	// active-sessions gauge (a collector over the Manager) and the session-lifetime
+	// histograms (pushed on session end via the Manager's observer hook). It is
+	// built here, before the Manager, so the Manager's end-observer can feed the
+	// histograms; the collectors over the server/Manager are registered once those
+	// exist, just below.
+	m := metrics.New()
+
 	mgr := session.NewManager(sessStore, histStore,
 		session.WithLogger(logger),
 		session.WithTTL(scfg.TTL),
+		// Concurrent-session cap per owner key (#37): 0 = unlimited.
+		session.WithMaxSessionsPerKey(scfg.MaxSessionsPerKey),
+		// Session observability (#38): record each session's turn count and lifetime
+		// in the Prometheus histograms when it ends (delete or idle expiry). nil-safe
+		// and bounded-cardinality (no session/key id is observed, only the aggregates).
+		session.WithSessionObserver(func(end session.SessionEndStats) {
+			m.ObserveSessionEnd(end.Turns, end.Duration)
+		}),
 	)
 	mgr.Start()
 	defer func() { _ = mgr.Close() }()
+
+	// The live session collector reads the Manager's active-session count at every
+	// scrape, so agentgpu_active_sessions always reflects current state. A
+	// registration failure (a descriptor clash) is a programming error, surfaced as
+	// a startup error rather than silently dropped.
+	if err := m.RegisterSessionCollector(mgr); err != nil {
+		return fmt.Errorf("register session metrics collector: %w", err)
+	}
 
 	gs := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -199,24 +243,26 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		// The same manager backs affinity routing in the dispatcher and the session
 		// API + stateful history in the HTTP layer — one source of truth.
 		server.WithSessionManager(mgr),
+		// Model warmth (#35): cap the keep_alive window the dispatcher sends for
+		// session-bound jobs at min(session TTL, this), so a conversation's model
+		// stays resident across active turns and unloads within a bounded window
+		// once the session goes idle.
+		server.WithModelWarmMax(scfg.ModelWarmMax),
 	)
 	srv.Register(gs)
 	// Start the stale-worker eviction loop; Close stops it on shutdown.
 	srv.Start()
 	defer func() { _ = srv.Close() }()
 
-	// Prometheus instrument (#24): one registry shared by the request-path
-	// collectors (updated inline by the HTTP layer) and the live server collector
-	// (read at scrape time). Building it here, before the HTTP server, lets the
-	// request path record into it; the server collector is registered just below
-	// once srv exists. metricsAddr is the resolved metrics listener address; the
-	// MetricsListenDisabled sentinel maps to "" which disables the listener.
+	// metricsAddr is the resolved metrics listener address; the
+	// MetricsListenDisabled sentinel maps to "" which disables the listener. The
+	// instrument itself (m) was built above, before the Manager, so the request
+	// path and the session end-observer can both feed it.
 	metricsAddr := config.MetricsListenAddr(cfg.MetricsListen)
-	m := metrics.New()
-	// The live collector reads queue depth, the fleet, the time-in-queue
-	// distribution, and affinity counters from the control-plane server at every
-	// scrape. A registration failure (a descriptor clash) is a programming error,
-	// so surface it as a startup error rather than silently dropping the metrics.
+	// The live server collector reads queue depth, the fleet, the time-in-queue
+	// distribution, and the affinity/rebind counters from the control-plane server
+	// at every scrape. A registration failure (a descriptor clash) is a programming
+	// error, so surface it as a startup error rather than silently dropping the metrics.
 	if err := m.RegisterServerCollector(srv); err != nil {
 		return fmt.Errorf("register metrics collector: %w", err)
 	}
@@ -246,6 +292,8 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		"addr", lis.Addr().String(), "http_addr", cfg.HTTPListen, "quota_path", qcfg.Path,
 		"global_rpm", qcfg.GlobalRPM, "global_tpm", qcfg.GlobalTPM,
 		"session_path", sessPath, "session_ttl", scfg.TTL.String(),
+		"max_sessions_per_key", scfg.MaxSessionsPerKey, "max_session_turns", scfg.MaxTurns,
+		"max_session_context_tokens", scfg.MaxContextTokens, "session_overflow_policy", overflow.String(),
 		"metrics_addr", metricsAddr, "heartbeat_timeout", heartbeatTimeout.String())
 
 	// Periodic checkpoint so a crash loses at most quotaCheckpointInterval of usage.

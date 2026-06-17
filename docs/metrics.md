@@ -4,8 +4,8 @@ agent-gpu exposes operational metrics in the [Prometheus text exposition
 format](https://prometheus.io/docs/instrumenting/exposition_formats/) so a
 Prometheus server (or any compatible scraper) can collect request throughput and
 latency, token usage, queue pressure, per-worker GPU/VRAM utilization, worker
-uptime, session-affinity effectiveness, and rate-limit throttling — plus the
-standard Go runtime and process metrics.
+uptime, session-affinity effectiveness, live and historical session activity, and
+rate-limit throttling — plus the standard Go runtime and process metrics.
 
 Metrics are served by the **server** process only (the public API + scheduler
 own the request, queue, and fleet state). Workers report their capacity to the
@@ -65,9 +65,39 @@ All metric names are prefixed `agentgpu_`. Two kinds of metrics are exported:
 | `agentgpu_worker_start_time_seconds` | gauge | `worker` | Unix time the worker registered. Derive uptime as `time() - agentgpu_worker_start_time_seconds`. |
 | `agentgpu_fleet_workers` | gauge | `status` | Connected workers by `status` (`online`/`draining`/`stale`); a series is present for every status. |
 | `agentgpu_affinity_total` | counter | `result` | Session-affinity routing outcomes: `result` is `hit` (routed back to the warm worker) or `miss` (rebound elsewhere). |
+| `agentgpu_session_rebinds_total` | counter | — | Session affinity rebindings: a turn whose session moved to a different worker because the bound one was gone/draining/stale/unfit. Equals `agentgpu_affinity_total{result="miss"}` (every miss is a rebind); exposed separately as a clearly-named rebind signal. |
+| `agentgpu_active_sessions` | gauge | — | Conversation sessions currently live (created and not yet ended by delete or idle expiry). Read live from the session manager at scrape time. |
+| `agentgpu_session_turns` | histogram | — | Number of conversation turns a session accumulated over its lifetime, observed once when the session ends (delete or idle expiry). |
+| `agentgpu_session_duration_seconds` | histogram | — | How long a session lived (end minus creation), in seconds, observed once when the session ends (delete or idle expiry). |
 
 The standard `go_*` (runtime) and `process_*` (CPU/memory/FDs) collectors are
 registered too, so they appear in the exposition for free.
+
+> **`agentgpu_session_rebinds_total` and `agentgpu_affinity_total{result="miss"}`
+> count the same events** — a session moving to a different worker is exactly an
+> affinity miss. Both are exported so dashboards can chart a "sessions are moving
+> workers" rate directly (`rate(agentgpu_session_rebinds_total[5m])`) without
+> filtering the affinity counter by label. Watch the rebind rate climb when a
+> worker drains or goes stale: live sessions on it re-pin to a healthy peer.
+
+### Tracing a conversation in the logs
+
+Metrics tell you the aggregate shape of session activity; the **logs** let you
+follow one conversation. Every request carries a `request_id` (see
+[architecture.md](architecture.md) on correlation, and the `X-Request-Id`
+header), and every session-aware log line additionally carries a `session_id`:
+
+- The stateful/affinity chat path logs a `session chat turn` line per turn,
+  carrying both `request_id` (that one turn) and `session_id` (the conversation).
+- The session CRUD handlers log `session created` and `session deleted` with the
+  `session_id`, and the session manager logs `session expired` when the idle
+  sweeper reaps one.
+
+So you can pivot between the two granularities: filter your logs by `session_id`
+to see a whole multi-turn conversation end-to-end, or by `request_id` to isolate a
+single turn (which is also the worker-side `job_id`, linking the HTTP request to
+the worker that executed it). `session_id` and `request_id` are **identifiers,
+never secrets** — the owning API key's secret is never logged.
 
 > **Worker uptime resets on reconnect.** `agentgpu_worker_start_time_seconds` is
 > stamped when a worker registers. A worker that drops and reconnects gets a
@@ -93,14 +123,18 @@ client input — so the time-series count stays predictable.
 | `kind` | `prompt`, `completion`. |
 | `result` | `hit`, `miss`. |
 
-**Metrics are deliberately NOT labeled by API key id.** The number of API keys is
-unbounded and operator-driven, so a `key_id` label would let the time-series
-count grow without limit (a classic Prometheus cardinality blow-up). This is a
-conscious deviation from the issue's "label by … key" wording: per-key usage is
-already available — at full fidelity — through the **admin/quota API**
-(`GET /v1/admin/keys/{id}/quota`), which is the right tool for per-key
-accounting. The aggregate throttle counter (`agentgpu_throttled_total{scope}`)
-still shows how much per-key vs. global limiting is happening fleet-wide.
+**Metrics are deliberately NOT labeled by API key id or session id.** The
+number of API keys and of sessions is unbounded and driven by clients, so a
+`key_id` or `session_id` label would let the time-series count grow without limit
+(a classic Prometheus cardinality blow-up). The session metrics are therefore
+unlabeled aggregates: `agentgpu_active_sessions` is a single gauge, and
+`agentgpu_session_turns` / `agentgpu_session_duration_seconds` are single
+histograms over all sessions. Per-key usage is available — at full fidelity —
+through the **admin/quota API** (`GET /v1/admin/keys/{id}/quota`), and a specific
+conversation is traceable through the logs by its `session_id` (see *Tracing a
+conversation in the logs* above), which is the right tool for per-entity detail.
+The aggregate throttle counter (`agentgpu_throttled_total{scope}`) still shows how
+much per-key vs. global limiting is happening fleet-wide.
 
 ## Example exposition
 
@@ -153,6 +187,26 @@ agentgpu_fleet_workers{status="stale"} 0
 # TYPE agentgpu_affinity_total counter
 agentgpu_affinity_total{result="hit"} 8
 agentgpu_affinity_total{result="miss"} 2
+# HELP agentgpu_session_rebinds_total Total session affinity rebindings since startup: a turn whose session moved to a different worker because the bound one was gone/draining/stale/unfit. Equals affinity_total{result="miss"}.
+# TYPE agentgpu_session_rebinds_total counter
+agentgpu_session_rebinds_total 2
+# HELP agentgpu_active_sessions Number of conversation sessions currently live (created and not yet ended by delete or idle expiry).
+# TYPE agentgpu_active_sessions gauge
+agentgpu_active_sessions 5
+# HELP agentgpu_session_turns Number of conversation turns a session accumulated over its lifetime, observed when the session ends (delete or idle expiry).
+# TYPE agentgpu_session_turns histogram
+agentgpu_session_turns_bucket{le="5"} 3
+agentgpu_session_turns_bucket{le="10"} 6
+agentgpu_session_turns_bucket{le="+Inf"} 7
+agentgpu_session_turns_sum 58
+agentgpu_session_turns_count 7
+# HELP agentgpu_session_duration_seconds How long a session lived (end minus creation) in seconds, observed when the session ends (delete or idle expiry).
+# TYPE agentgpu_session_duration_seconds histogram
+agentgpu_session_duration_seconds_bucket{le="300"} 4
+agentgpu_session_duration_seconds_bucket{le="900"} 6
+agentgpu_session_duration_seconds_bucket{le="+Inf"} 7
+agentgpu_session_duration_seconds_sum 4123
+agentgpu_session_duration_seconds_count 7
 ```
 
 ## Useful queries (PromQL)
@@ -228,6 +282,32 @@ sum by (scope) (rate(agentgpu_throttled_total[5m]))
 ```promql
 sum(rate(agentgpu_affinity_total{result="hit"}[5m]))
   / sum(rate(agentgpu_affinity_total[5m]))
+```
+
+**Live session count:**
+
+```promql
+agentgpu_active_sessions
+```
+
+**Session rebind rate (sessions moving workers per second):**
+
+```promql
+rate(agentgpu_session_rebinds_total[5m])
+```
+
+**p50 / p95 conversation length (turns per session):**
+
+```promql
+histogram_quantile(0.50, sum by (le) (rate(agentgpu_session_turns_bucket[1h])))
+histogram_quantile(0.95, sum by (le) (rate(agentgpu_session_turns_bucket[1h])))
+```
+
+**p50 / p95 session lifetime (seconds):**
+
+```promql
+histogram_quantile(0.50, sum by (le) (rate(agentgpu_session_duration_seconds_bucket[1h])))
+histogram_quantile(0.95, sum by (le) (rate(agentgpu_session_duration_seconds_bucket[1h])))
 ```
 
 These cover the metrics the dashboards you build will most often chart; the

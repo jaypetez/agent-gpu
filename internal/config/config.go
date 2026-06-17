@@ -28,6 +28,24 @@ const (
 	EnvOllamaURL         = "AGENTGPU_OLLAMA_URL"
 	EnvSessionPath       = "AGENTGPU_SESSION_PATH"
 	EnvSessionTTL        = "AGENTGPU_SESSION_TTL"
+	// EnvMaxSessionsPerKey caps the number of concurrent active sessions a single
+	// owner key may hold (#37). 0 = unlimited.
+	EnvMaxSessionsPerKey = "AGENTGPU_MAX_SESSIONS_PER_KEY"
+	// EnvSessionMaxTurns / EnvSessionMaxContextTokens override the per-session
+	// conversation turn cap and the cumulative context-token cap (#37). 0 =
+	// unlimited for that dimension.
+	EnvSessionMaxTurns         = "AGENTGPU_MAX_SESSION_TURNS"
+	EnvSessionMaxContextTokens = "AGENTGPU_MAX_SESSION_CONTEXT_TOKENS"
+	// EnvSessionOverflowPolicy selects what happens when a per-session history cap
+	// is exceeded: "trim" (drop oldest turns — the default, non-breaking) or
+	// "reject" (refuse the append). See internal/session.OverflowPolicy.
+	EnvSessionOverflowPolicy = "AGENTGPU_SESSION_OVERFLOW_POLICY"
+	// EnvModelWarmMax caps the model-warmth keep_alive window (#35): the longest a
+	// session-bound model is kept resident on its worker after a turn. The server
+	// sends keep_alive = min(session TTL, this cap) so an idle/abandoned session's
+	// model unloads within a bounded window and never pins VRAM indefinitely. A
+	// session with no idle TTL falls back to exactly this cap.
+	EnvModelWarmMax = "AGENTGPU_MODEL_WARM_MAX"
 	// EnvGPUDetect toggles automatic GPU detection on the worker (#16). When
 	// false, detection is skipped and the manual EnvGPUType/EnvTotalVRAM (or their
 	// flags) describe the worker's capacity instead.
@@ -86,6 +104,26 @@ const (
 	// DefaultSessionMaxBytes is the default per-session cumulative-content byte
 	// cap (1 MiB), bounding history memory growth from a long conversation.
 	DefaultSessionMaxBytes = 1 << 20
+	// DefaultMaxSessionsPerKey is the default concurrent-session cap per owner key
+	// (#37): 0 = unlimited, preserving prior behavior. Operators set a positive cap
+	// to bound how many simultaneous conversations a single key can hold.
+	DefaultMaxSessionsPerKey = 0
+	// DefaultSessionMaxContextTokens is the default per-session cumulative
+	// context-token cap (#37): 0 = unlimited. The byte cap already bounds memory; a
+	// token cap is opt-in for operators who want to bound conversation context size
+	// by an (estimated) token count instead of raw bytes.
+	DefaultSessionMaxContextTokens = 0
+	// DefaultSessionOverflowPolicy is the default over-cap behavior for per-session
+	// history (#37): trim oldest turns, preserving the pre-#37 non-breaking
+	// behavior. "reject" is the opt-in hard-ceiling alternative.
+	DefaultSessionOverflowPolicy = "trim"
+	// DefaultModelWarmMax is the default cap on the model-warmth keep_alive window
+	// (#35): a session-bound model is kept resident on its worker for at most this
+	// long after a turn. One hour gives generous headroom over the 30-minute
+	// default session TTL (so the common case is never clipped) while still
+	// bounding how long an idle/abandoned session can pin VRAM. The keep_alive sent
+	// to Ollama is min(session TTL, this cap); a never-idle session uses this cap.
+	DefaultModelWarmMax = time.Hour
 	// DefaultGPUDetect is the default for the worker's automatic GPU detection
 	// (#16): on, so a worker advertises real hardware capacity out of the box.
 	DefaultGPUDetect = true
@@ -171,6 +209,24 @@ type SessionConfig struct {
 	MaxTurns int
 	// MaxBytes is the per-session cumulative-content byte cap (0 = unbounded).
 	MaxBytes int
+	// MaxContextTokens is the per-session cumulative estimated context-token cap
+	// (#37; 0 = unbounded). The estimate is a whitespace-token count, matching the
+	// rest of the project's token accounting (there is no real tokenizer).
+	MaxContextTokens int
+	// MaxSessionsPerKey caps the concurrent active sessions one owner key may hold
+	// (#37; 0 = unlimited).
+	MaxSessionsPerKey int
+	// OverflowPolicy is the over-cap behavior for history (#37): "trim" (drop
+	// oldest, default) or "reject" (refuse the append). An empty value resolves to
+	// DefaultSessionOverflowPolicy; an unrecognized value falls back to "trim" when
+	// parsed by internal/session.ParseOverflowPolicy.
+	OverflowPolicy string
+	// ModelWarmMax caps the model-warmth keep_alive window (#35): the longest a
+	// session-bound model is kept resident on its worker after a turn. 0 selects
+	// DefaultModelWarmMax via ResolveSession. The server sends keep_alive =
+	// min(session TTL, this cap), so an idle/abandoned session's model unloads
+	// within a bounded window; a never-idle session falls back to this cap.
+	ModelWarmMax time.Duration
 }
 
 // LogConfig configures structured logging (#23) for the server and worker
@@ -222,6 +278,20 @@ func durationEnvOr(look EnvLookup, key string, fallback time.Duration) time.Dura
 func uintEnvOr(look EnvLookup, key string, fallback uint64) uint64 {
 	if v, ok := look(key); ok && v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+// intEnvOr returns the non-negative integer parsed from the env value if set and
+// parseable, else the fallback. A negative or unparseable value falls back
+// silently so a typo cannot wedge startup (mirroring uintEnvOr); it is used for
+// the count-style session caps (turns, context tokens, sessions-per-key) which
+// are plain ints elsewhere.
+func intEnvOr(look EnvLookup, key string, fallback int) int {
+	if v, ok := look(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
 		}
 	}
@@ -503,17 +573,91 @@ func ResolveSessionTTL(flagValue time.Duration, look EnvLookup) time.Duration {
 	return durationEnvOr(look, EnvSessionTTL, DefaultSessionTTL)
 }
 
+// ResolveModelWarmMax resolves the model-warmth keep_alive cap (#35) with flag >
+// env > default precedence. A non-positive flag value means "unset"; the result
+// is always positive (DefaultModelWarmMax when nothing else is configured) so the
+// derived warm window is always bounded.
+func ResolveModelWarmMax(flagValue time.Duration, look EnvLookup) time.Duration {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return durationEnvOr(look, EnvModelWarmMax, DefaultModelWarmMax)
+}
+
+// ResolveSessionMaxTurns resolves the per-session turn cap with flag > env >
+// default precedence (#37). A non-positive flag value means "unset"; the result
+// is the env value, then DefaultSessionMaxTurns. (Unlike the unlimited-by-default
+// caps below, the turn cap keeps its long-standing 200 default so history is
+// always bounded.)
+func ResolveSessionMaxTurns(flagValue int, look EnvLookup) int {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return intEnvOr(look, EnvSessionMaxTurns, DefaultSessionMaxTurns)
+}
+
+// ResolveMaxSessionsPerKey resolves the concurrent-session-per-key cap with flag
+// > env > default(0=unlimited) precedence (#37). A non-positive flag value means
+// "unset"; the env is then consulted, defaulting to unlimited.
+func ResolveMaxSessionsPerKey(flagValue int, look EnvLookup) int {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return intEnvOr(look, EnvMaxSessionsPerKey, DefaultMaxSessionsPerKey)
+}
+
+// ResolveSessionMaxContextTokens resolves the per-session context-token cap with
+// flag > env > default(0=unlimited) precedence (#37). A non-positive flag value
+// means "unset".
+func ResolveSessionMaxContextTokens(flagValue int, look EnvLookup) int {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue > 0 {
+		return flagValue
+	}
+	return intEnvOr(look, EnvSessionMaxContextTokens, DefaultSessionMaxContextTokens)
+}
+
+// ResolveSessionOverflowPolicy resolves the history over-cap policy string with
+// flag > env > default("trim") precedence (#37). An empty flag value means
+// "unset". The returned string is validated/parsed by
+// internal/session.ParseOverflowPolicy at wiring time (an unrecognized value
+// falls back to trim there), mirroring how ResolveLog leaves level/format
+// spelling validation to the logger builder.
+func ResolveSessionOverflowPolicy(flagValue string, look EnvLookup) string {
+	if look == nil {
+		look = os.LookupEnv
+	}
+	if flagValue != "" {
+		return flagValue
+	}
+	return envOr(look, EnvSessionOverflowPolicy, DefaultSessionOverflowPolicy)
+}
+
 // ResolveSession fills a SessionConfig with flag > env > default precedence for
-// the path and TTL, and applies the cap defaults when a cap is left at zero
-// ("unset"). The cap fields have no env override today (they change rarely),
-// matching how QuotaConfig's limits are passed through.
+// the path, TTL, model-warmth cap, history caps (turns/bytes/context-tokens),
+// the concurrent-session-per-key cap, and the overflow policy (#37). MaxBytes
+// keeps its passed-through-then-defaulted handling (it changes rarely and has no
+// env override); the other caps resolve flag > env > default via their helpers.
 func ResolveSession(flags SessionConfig, look EnvLookup, homeDir func() (string, error)) SessionConfig {
 	out := flags
 	out.Path = ResolveSessionPath(flags.Path, look, homeDir)
 	out.TTL = ResolveSessionTTL(flags.TTL, look)
-	if out.MaxTurns <= 0 {
-		out.MaxTurns = DefaultSessionMaxTurns
-	}
+	out.ModelWarmMax = ResolveModelWarmMax(flags.ModelWarmMax, look)
+	out.MaxTurns = ResolveSessionMaxTurns(flags.MaxTurns, look)
+	out.MaxContextTokens = ResolveSessionMaxContextTokens(flags.MaxContextTokens, look)
+	out.MaxSessionsPerKey = ResolveMaxSessionsPerKey(flags.MaxSessionsPerKey, look)
+	out.OverflowPolicy = ResolveSessionOverflowPolicy(flags.OverflowPolicy, look)
 	if out.MaxBytes <= 0 {
 		out.MaxBytes = DefaultSessionMaxBytes
 	}

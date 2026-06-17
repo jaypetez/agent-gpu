@@ -61,6 +61,22 @@ func (s *Server) reqLog(ctx context.Context) *slog.Logger {
 	return s.log
 }
 
+// withSessionLog binds session_id onto the request-scoped logger and returns a
+// context carrying the enriched logger (#38). After this, every line a handler
+// logs through reqLog for the rest of the request carries BOTH request_id (per
+// turn, from requestIDMiddleware) and session_id (across turns), so a multi-turn
+// conversation is traceable end-to-end: filter logs by session_id to see the whole
+// conversation, by request_id to see one turn. An empty id is a no-op (the logger
+// is returned unchanged) so a stateless request never gains an empty session_id
+// attribute. It is the session-aware counterpart of the request-id binding and is
+// used by the stateful chat path and the session CRUD handlers.
+func (s *Server) withSessionLog(ctx context.Context, sessionID string) context.Context {
+	if sessionID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestLoggerContextKey, s.reqLog(ctx).With("session_id", sessionID))
+}
+
 // authMiddleware authenticates the request's Bearer token and, on success,
 // stashes the resolved store.APIKey on the request context before calling next.
 // It is the single shared entry point every authenticated HTTP route wraps —

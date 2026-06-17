@@ -38,6 +38,15 @@ import (
 // no-queue variant in future.
 var ErrNoWorkers = errors.New("server: no workers connected")
 
+// defaultModelWarmMax is the fallback cap on the model-warmth keep_alive window
+// (#35) when WithModelWarmMax is not set: a session-bound model is kept resident
+// for at most this long after a turn. It mirrors config.DefaultModelWarmMax (one
+// hour); the server keeps a local constant rather than importing config so the
+// control plane stays free of the config package (matching how it takes plain
+// durations like the heartbeat timeout). The cmd layer passes the resolved value
+// in via WithModelWarmMax.
+const defaultModelWarmMax = time.Hour
+
 // ErrShuttingDown is returned when a job is submitted during shutdown.
 var ErrShuttingDown = errors.New("server: shutting down")
 
@@ -340,13 +349,32 @@ type Server struct {
 	// existing scheduler/dispatch/quota/authz path is unchanged. Wired by #36.
 	sessionMgr *session.Manager
 
-	// affinityMu guards the affinity hit/miss counters below. A hit is counted
-	// when a turn routes to the worker its session was already bound to; a miss
-	// when the session had a binding but a different worker was chosen (a rebind).
-	// No counting happens when there is no session or no prior binding.
-	affinityMu     sync.Mutex
-	affinityHits   uint64
-	affinityMisses uint64
+	// modelWarmMax caps the model-warmth keep_alive window (#35): for a
+	// session-bound job the dispatcher sets Job.KeepAliveSeconds to
+	// min(session TTL, modelWarmMax) so the model stays resident across the
+	// conversation and unloads within a BOUNDED window once the session goes idle —
+	// an abandoned session can never pin VRAM indefinitely. A session with no idle
+	// TTL falls back to exactly this cap. It is only consulted when sessionMgr is
+	// set; defaults to config.DefaultModelWarmMax. Session-less jobs are never
+	// warmed (KeepAliveSeconds stays 0 → Ollama's own default applies).
+	modelWarmMax time.Duration
+
+	// affinityMu guards the affinity hit/miss/rebind counters below. A hit is
+	// counted when a turn routes to the worker its session was already bound to; a
+	// miss when the session had a binding but a different worker was chosen (a
+	// rebind). No counting happens when there is no session or no prior binding.
+	//
+	// affinityRebinds counts the same events as affinityMisses today — a turn whose
+	// session re-bound to a different worker because the bound one was
+	// gone/draining/stale/unfit — and is surfaced as the dedicated
+	// agentgpu_session_rebinds_total metric (#38). It is tracked as its own counter
+	// (rather than reusing misses) so "a session moved workers" stays a distinct,
+	// clearly-named signal even if the miss accounting later grows cases that are
+	// not rebinds.
+	affinityMu      sync.Mutex
+	affinityHits    uint64
+	affinityMisses  uint64
+	affinityRebinds uint64
 
 	// waitMu guards the time-in-queue distribution below: the count of placed-
 	// from-queue jobs, the running sum and max of their queue wait (ms), and the
@@ -480,6 +508,20 @@ func WithSessionManager(m *session.Manager) Option {
 	}
 }
 
+// WithModelWarmMax caps the model-warmth keep_alive window (#35): a session-bound
+// job's keep_alive is set to min(session TTL, d) so the conversation's model
+// stays resident across active turns and unloads within a bounded window once the
+// session goes idle. A non-positive value is ignored (the default applies). It
+// only has effect alongside WithSessionManager; the cmd layer wires it from the
+// resolved session config (config.ResolveModelWarmMax).
+func WithModelWarmMax(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.modelWarmMax = d
+		}
+	}
+}
+
 // WithClock overrides the time source used for heartbeat stamping and stale
 // eviction (for tests). A nil clock is ignored. Defaults to time.Now.
 func WithClock(now func() time.Time) Option {
@@ -598,6 +640,9 @@ func New(opts ...Option) *Server {
 	}
 	if s.placeScan <= 0 {
 		s.placeScan = s.evictScan
+	}
+	if s.modelWarmMax <= 0 {
+		s.modelWarmMax = defaultModelWarmMax
 	}
 	if s.queue == nil {
 		// Stamp enqueue times against the server's (possibly injected) clock so the
@@ -986,6 +1031,53 @@ func (s *Server) affinityFor(ctx context.Context, job types.Job, keyID string) s
 	return sess.BoundWorkerID
 }
 
+// sessionDispatchHints resolves both per-session dispatch hints in a single
+// owner-checked session lookup, for the dispatch entry points (submit /
+// SubmitAuthorizedJobStream): the affinity-bound worker (#34) and the model-warmth
+// keep_alive window in seconds (#35). It returns ("", 0) — no preference, no
+// warmth — unless a session manager is configured AND the job carries a SessionID
+// AND the session resolves; a missing/not-owned/expired session is non-fatal
+// (both are best-effort hints). Folding the two into one Get keeps the hot path to
+// a single session read. placeItem still uses affinityFor alone, because a queued
+// job already had its keep_alive stamped before it was enqueued.
+func (s *Server) sessionDispatchHints(ctx context.Context, job types.Job, keyID string) (preferred string, keepAliveSeconds int64) {
+	if s.sessionMgr == nil || job.SessionID == "" || keyID == "" {
+		return "", 0
+	}
+	sess, err := s.sessionMgr.Get(ctx, job.SessionID, keyID)
+	if err != nil {
+		s.log.Debug("session dispatch hints: lookup failed",
+			"session", job.SessionID, "key_id", keyID, "err", err)
+		return "", 0
+	}
+	return sess.BoundWorkerID, warmWindowSeconds(sess.TTL, s.modelWarmMax)
+}
+
+// warmWindowSeconds derives the keep_alive window (in whole seconds) for a
+// session-bound job from the session's idle TTL and the configured cap (#35):
+//
+//   - TTL > 0: min(TTL, max) — re-sent each turn this resets Ollama's unload
+//     timer so the model stays warm across the conversation, and once the session
+//     goes idle the model unloads within at most this window.
+//   - TTL <= 0 (a session that never idles out): the cap, so even a never-idle
+//     session's model is released within a BOUNDED window if the conversation is
+//     abandoned — it is never kept "forever".
+//
+// The result is always >= 1 second (a sub-second window rounds up to 1 rather
+// than to 0, which would mean "unload immediately"). max is always positive (the
+// server defaults it), so the window is always bounded and positive.
+func warmWindowSeconds(ttl, max time.Duration) int64 {
+	window := ttl
+	if window <= 0 || (max > 0 && window > max) {
+		window = max
+	}
+	secs := int64(window / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return secs
+}
+
 // recordAffinity updates the session→worker binding after a successful dispatch
 // and counts the affinity hit/miss (#34). preferred is the worker the session
 // was bound to before this turn (from affinityFor); chosen is the worker the
@@ -1018,8 +1110,12 @@ func (s *Server) recordAffinity(ctx context.Context, job types.Job, keyID, chose
 		s.affinityMu.Unlock()
 	default:
 		// Bound worker was not chosen (rebind): affinity miss, update the binding.
+		// A miss here is exactly a rebind (the session moves to a different worker),
+		// so bump both counters under the one lock; rebinds surfaces as the dedicated
+		// agentgpu_session_rebinds_total metric (#38).
 		s.affinityMu.Lock()
 		s.affinityMisses++
+		s.affinityRebinds++
 		s.affinityMu.Unlock()
 		s.log.Debug("affinity: rebinding session",
 			"session", job.SessionID, "key_id", keyID, "old_worker", preferred, "new_worker", chosen)
@@ -1177,17 +1273,23 @@ func (s *Server) QueueStats() queue.Stats { return s.queue.Stats() }
 // bound to (warm KV cache reused); Misses counts turns that rebound to a
 // different worker because the bound one was gone/draining/stale/unfit. Neither
 // counts a session's first turn (no prior binding) nor any non-session job.
+//
+// Rebinds (#38) counts the session→worker rebindings — a turn whose session moved
+// to a different worker. It equals Misses today (every miss is a rebind) but is
+// reported separately so the rebind signal stays distinct and clearly named; the
+// metrics layer exports it as agentgpu_session_rebinds_total.
 type AffinityStats struct {
-	Hits   uint64
-	Misses uint64
+	Hits    uint64
+	Misses  uint64
+	Rebinds uint64
 }
 
-// AffinityStats returns a point-in-time snapshot of the affinity hit/miss
-// counters. It mirrors QueueStats as the metrics seam for #24 (Prometheus).
+// AffinityStats returns a point-in-time snapshot of the affinity hit/miss/rebind
+// counters. It mirrors QueueStats as the metrics seam for #24/#38 (Prometheus).
 func (s *Server) AffinityStats() AffinityStats {
 	s.affinityMu.Lock()
 	defer s.affinityMu.Unlock()
-	return AffinityStats{Hits: s.affinityHits, Misses: s.affinityMisses}
+	return AffinityStats{Hits: s.affinityHits, Misses: s.affinityMisses, Rebinds: s.affinityRebinds}
 }
 
 // WaitBucket is one cumulative bucket of the time-in-queue histogram: Count is
@@ -1386,9 +1488,12 @@ func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey
 	if err := s.quota.CheckAndReserve(ctx, key); err != nil {
 		return nil, err
 	}
-	// Resolve session affinity (#34): prefer the worker this conversation is bound
-	// to. Empty when there is no session/manager.
-	preferred := s.affinityFor(ctx, job, key.ID)
+	// Resolve session affinity (#34) and model warmth (#35) in one lookup: prefer
+	// the bound worker and stamp the keep_alive window so the worker keeps the
+	// model resident across the conversation. Both are zero-valued without a
+	// session/manager, leaving the stream path unchanged.
+	preferred, keepAlive := s.sessionDispatchHints(ctx, job, key.ID)
+	job.KeepAliveSeconds = keepAlive
 	w, ok := s.pickWorker(job.Model, preferred)
 	if !ok {
 		// No live worker for the model: there is nothing to attach a stream to.
@@ -1484,6 +1589,50 @@ func (s *Server) PullModel(ctx context.Context, key store.APIKey, workerID, mode
 	return nil
 }
 
+// UnloadSessionModel best-effort asks workerID to evict model from its Ollama,
+// freeing the VRAM (#35). It is the explicit-release path for model warmth: the
+// HTTP layer calls it after an authorized session is ended (DELETE /v1/sessions)
+// so the conversation's model is released promptly on the worker it was bound to,
+// rather than lingering for the remainder of its keep_alive window. It is
+// deliberately unauthenticated at this layer — the caller has already
+// owner-checked and deleted the session — and entirely best-effort:
+//
+//   - An empty workerID or model is a no-op (an unbound or model-less session has
+//     nothing to release).
+//   - A worker that is not connected (drained/stale/never-bound) is a no-op, not
+//     an error: its model is already gone or will be reaped by Ollama's idle
+//     timer, the backstop release path.
+//   - A full/again-closed worker send channel is dropped rather than blocking the
+//     delete response; the keep_alive timer still releases the model.
+//
+// It never returns an error to the caller, so a release attempt can never fail a
+// session-delete the client already succeeded at; failures are logged at debug.
+func (s *Server) UnloadSessionModel(ctx context.Context, workerID, model string) {
+	if workerID == "" || model == "" {
+		return
+	}
+	s.mu.RLock()
+	w, ok := s.workers[workerID]
+	s.mu.RUnlock()
+	if !ok {
+		s.log.Debug("unload skipped: worker not connected", "worker", workerID, "model", model)
+		return
+	}
+	select {
+	case w.send <- &agentgpuv1.ServerMessage{
+		Payload: &agentgpuv1.ServerMessage_UnloadModel{
+			UnloadModel: &agentgpuv1.UnloadModel{Model: model},
+		},
+	}:
+		s.log.Info("session model unload requested", "worker", workerID, "model", model)
+	case <-ctx.Done():
+	default:
+		// Worker writer is not keeping up (or has exited); do not block the caller.
+		// Ollama's idle keep_alive timer will release the model regardless.
+		s.log.Debug("unload dropped: worker send not ready", "worker", workerID, "model", model)
+	}
+}
+
 // SubmitJob dispatches a job to a worker and waits for the result. This is the
 // minimal foundational dispatch primitive with no authorization; callers on the
 // public request path must use SubmitAuthorizedJob so inference is gated.
@@ -1509,9 +1658,15 @@ func (s *Server) submit(ctx context.Context, job types.Job, keyID string, prio q
 		return types.JobResult{}, err
 	}
 
-	// Resolve session affinity (#34): prefer the worker this conversation is bound
-	// to. Empty when there is no session/manager, leaving placement unchanged.
-	preferred := s.affinityFor(ctx, job, keyID)
+	// Resolve session affinity (#34) and model warmth (#35) in one lookup: prefer
+	// the worker this conversation is bound to, and stamp the keep_alive window so
+	// the worker keeps the model resident across the session. Both are zero-valued
+	// when there is no session/manager, leaving placement and the worker request
+	// byte-identical to the no-session path. Stamp keep_alive on the job BEFORE the
+	// fast-path dispatch and before enqueue so both the synchronous and queued
+	// dispatch paths carry it.
+	preferred, keepAlive := s.sessionDispatchHints(ctx, job, keyID)
+	job.KeepAliveSeconds = keepAlive
 
 	// Fast path: a worker fits right now. Dispatch synchronously.
 	if w, ok := s.pickWorker(job.Model, preferred); ok {

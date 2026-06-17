@@ -7,3 +7,7 @@ https://localhost
 http://127.0.0.1
 # User-owned Projects boards 404 for unauthenticated/token link checkers, though valid in-browser
 https://github.com/users/jaypetez/projects/
+# GitHub Pages site (the hosted API reference) 404s until the Pages publish workflow's first deploy
+https://jaypetez.github.io/agent-gpu
+# OpenSSF Scorecard badge endpoint intermittently returns 503 to the link checker (valid in-browser)
+https://api.scorecard.dev

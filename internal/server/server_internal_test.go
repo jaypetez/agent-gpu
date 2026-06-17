@@ -125,3 +125,32 @@ func TestWorkerNeverHeartbeatedNotStale(t *testing.T) {
 		t.Fatal("never-heartbeated worker should still be available")
 	}
 }
+
+// TestWarmWindowSeconds covers the model-warmth window derivation (#35): a
+// session-bound job's keep_alive is min(TTL, max) when the session idles out, the
+// cap when it never idles out, and always a bounded value >= 1s (so it never
+// degenerates to 0 == "unload immediately").
+func TestWarmWindowSeconds(t *testing.T) {
+	const max = time.Hour
+	tests := []struct {
+		name string
+		ttl  time.Duration
+		max  time.Duration
+		want int64
+	}{
+		{"ttl below cap uses ttl", 30 * time.Minute, max, 1800},
+		{"ttl above cap is capped", 2 * time.Hour, max, 3600},
+		{"ttl equals cap", time.Hour, max, 3600},
+		{"never-idle ttl falls back to cap", 0, max, 3600},
+		{"negative ttl falls back to cap", -time.Minute, max, 3600},
+		{"sub-second window rounds up to 1", 500 * time.Millisecond, max, 1},
+		{"cap applies even with tiny ttl", time.Second, max, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := warmWindowSeconds(tt.ttl, tt.max); got != tt.want {
+				t.Fatalf("warmWindowSeconds(%v, %v) = %d, want %d", tt.ttl, tt.max, got, tt.want)
+			}
+		})
+	}
+}
