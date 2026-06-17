@@ -195,8 +195,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
+        "409":
+          $ref: "#/components/responses/SessionHistoryLimit"
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
@@ -292,6 +296,9 @@ paths:
         Mints a new owner-scoped conversation session targeting the requested model and returns its
         id. The session is owned by the authenticated key; only that key may read, append to, or
         delete it.
+
+        When the server enforces a concurrent-session cap per key and the key is already at it, the
+        request is rejected with `429` and code `session_limit_exceeded`.
       tags:
         - Sessions
       requestBody:
@@ -311,6 +318,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/SessionLimitExceeded"
         "500":
           $ref: "#/components/responses/InternalError"
         "501":
@@ -909,6 +918,31 @@ components:
             error:
               message: sessions are not enabled
               code: not_implemented
+    SessionLimitExceeded:
+      description: |
+        The authenticated key has reached its concurrent-session cap. End an existing session (or
+        wait for one to idle out) before creating another.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: concurrent session limit reached
+              code: session_limit_exceeded
+    SessionHistoryLimit:
+      description: |
+        Appending this turn would exceed a per-session history limit (turns or context tokens) and
+        the server is configured to reject rather than trim. Start a new session or shorten the
+        conversation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: session history limit reached
+              code: session_limit_exceeded
 
   schemas:
     Error:
@@ -938,6 +972,7 @@ components:
                 - unauthorized
                 - forbidden
                 - rate_limit_exceeded
+                - session_limit_exceeded
                 - unavailable
                 - invalid_request_error
                 - not_found

@@ -70,6 +70,15 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	sess, err := s.sessionMgr.Create(r.Context(), key.ID, req.Model)
 	if err != nil {
+		if errors.Is(err, session.ErrSessionLimitExceeded) {
+			// The owner is at its concurrent-session cap (#37). 429 (a rate-style
+			// limit) with the typed code lets a client back off / end an old session
+			// and retry; no internal detail (e.g. the cap value) is leaked.
+			s.reqLog(r.Context()).Warn("session create throttled: per-key cap", "key_id", key.ID)
+			writeError(w, http.StatusTooManyRequests, "session_limit_exceeded",
+				"concurrent session limit reached")
+			return
+		}
 		s.reqLog(r.Context()).Error("session create failed", "key_id", key.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create session")
 		return
@@ -199,6 +208,16 @@ func (s *Server) sessionsEnabled(w http.ResponseWriter) bool {
 func (s *Server) writeSessionLookupError(r *http.Request, w http.ResponseWriter, err error) {
 	if errors.Is(err, session.ErrSessionNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "session not found")
+		return
+	}
+	if errors.Is(err, session.ErrSessionLimitExceeded) {
+		// A per-session history cap was hit in OverflowReject mode (#37). 409
+		// Conflict: the session's stored state conflicts with accepting the turn;
+		// the client must shorten the conversation (e.g. start a new session) rather
+		// than simply retry. No internal detail (which cap, the limit) is leaked.
+		s.reqLog(r.Context()).Warn("session turn rejected: history cap")
+		writeError(w, http.StatusConflict, "session_limit_exceeded",
+			"session history limit reached")
 		return
 	}
 	s.reqLog(r.Context()).Error("session lookup failed", "err", err)

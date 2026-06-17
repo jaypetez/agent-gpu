@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,28 +38,51 @@ type SessionStore interface {
 }
 
 // HistoryStore is the persistence seam for per-session conversation history. It
-// enforces the per-session turn-count AND cumulative-byte caps on Append:
+// enforces the per-session turn-count, cumulative-byte, AND cumulative
+// context-token caps on Append under a configurable overflow policy (#37):
 //
-// Cap policy (TRIM-OLDEST): when appending a turn would exceed either cap, the
-// oldest turns are dropped until both caps hold for the resulting slice (with
-// the new turn included). This keeps a conversation usable — the most recent
-// context is always retained — rather than rejecting writes and stalling a live
-// chat. A single turn larger than the byte cap is still stored (it becomes the
+// OverflowTrim (DEFAULT): when appending a turn would exceed any cap, the oldest
+// turns are dropped until every cap holds for the resulting slice (with the new
+// turn included). This keeps a conversation usable — the most recent context is
+// always retained — rather than rejecting writes and stalling a live chat. A
+// single turn larger than the byte/token cap is still stored (it becomes the
 // sole turn): the alternative, refusing it, would make the session permanently
 // unwritable.
+//
+// OverflowReject: an append that would exceed any cap returns
+// ErrSessionLimitExceeded and leaves the stored history unchanged, enforcing a
+// hard per-session ceiling. A turn that still fits is appended normally; a
+// first turn that alone exceeds a cap is rejected (there is no prior context to
+// preserve, so the hard ceiling applies).
 //
 // Implementations MUST be safe for concurrent use and MUST return deep copies
 // from Get so a caller cannot mutate stored turns.
 type HistoryStore interface {
-	// Append adds turn to sessionID's history, enforcing the configured caps by
-	// trimming oldest turns as documented above.
+	// Append adds turn to sessionID's history, enforcing the configured caps under
+	// the configured overflow policy (trim oldest, or reject with
+	// ErrSessionLimitExceeded) as documented above.
 	Append(sessionID string, turn types.Message) error
+	// AppendBatch adds several turns ATOMICALLY under OverflowReject: if the whole
+	// batch would exceed a cap it returns ErrSessionLimitExceeded and stores none
+	// of them (so a multi-message turn — user message(s) plus the assistant reply —
+	// never persists a half-turn). Under OverflowTrim it appends the turns in order
+	// with trimming, equivalent to calling Append for each. An empty batch is a
+	// no-op.
+	AppendBatch(sessionID string, turns ...types.Message) error
 	// Get returns a copy of sessionID's ordered turns (oldest first). A session
 	// with no history returns an empty slice and no error.
 	Get(sessionID string) ([]types.Message, error)
 	// DeleteBySession removes all history for sessionID. Deleting missing history
 	// is not an error.
 	DeleteBySession(sessionID string) error
+	// WouldReject reports whether appending the given turns to sessionID's current
+	// history would be REJECTED under the store's overflow policy (#37). It is
+	// always false under OverflowTrim (trimming never rejects). Under
+	// OverflowReject it returns true iff the resulting history would exceed a cap.
+	// It is the read-only pre-dispatch check the HTTP stateful-chat path uses to
+	// reject a turn BEFORE running inference, so no work is wasted on a turn whose
+	// persistence would be refused. It does not mutate stored history.
+	WouldReject(sessionID string, turns ...types.Message) bool
 }
 
 // cloneMessage deep-copies a chat turn so the store and callers never share the
@@ -90,6 +114,21 @@ func turnBytes(m types.Message) int {
 	n := len(m.Role) + len(m.Content) + len(m.ToolCallID) + len(m.Name)
 	for _, tc := range m.ToolCalls {
 		n += len(tc.ID) + len(tc.Type) + len(tc.FunctionName) + len(tc.Arguments)
+	}
+	return n
+}
+
+// turnTokens is the estimated context-token cost of a turn. There is no real
+// tokenizer in the project, so this uses the same whitespace-token heuristic the
+// echo executor counts output tokens with (len(strings.Fields(...))) applied to
+// the user-supplied text fields plus any tool-call function name/arguments. It
+// is a documented, deterministic estimate — NOT an exact model token count — for
+// bounding cumulative conversation size; real per-model counts are out of scope
+// (the same simplification quota accounting makes for token budgets).
+func turnTokens(m types.Message) int {
+	n := len(strings.Fields(m.Content)) + len(strings.Fields(m.Name))
+	for _, tc := range m.ToolCalls {
+		n += len(strings.Fields(tc.FunctionName)) + len(strings.Fields(tc.Arguments))
 	}
 	return n
 }
@@ -191,45 +230,131 @@ func (m *MemorySessionStore) LoadCheckpoint(path string, now time.Time) (dropped
 }
 
 // MemoryHistoryStore is an in-memory, concurrency-safe HistoryStore enforcing
-// per-session turn-count and cumulative-byte caps with the trim-oldest policy
-// documented on HistoryStore. History survives restarts via Checkpoint/
-// LoadCheckpoint.
+// per-session turn-count, cumulative-byte, and cumulative context-token caps
+// under a configurable overflow policy (trim-oldest by default), as documented
+// on HistoryStore. History survives restarts via Checkpoint/LoadCheckpoint.
 type MemoryHistoryStore struct {
-	maxTurns int
-	maxBytes int
+	maxTurns  int
+	maxBytes  int
+	maxTokens int
+	policy    OverflowPolicy
 
 	mu      sync.RWMutex
 	history map[string][]types.Message
 }
 
 // NewMemoryHistoryStore returns an empty in-memory HistoryStore bounded by
-// maxTurns (turn count) and maxBytes (cumulative content bytes). A non-positive
-// cap means "unbounded" for that dimension.
+// maxTurns (turn count) and maxBytes (cumulative content bytes), with no
+// context-token cap and the trim-oldest overflow policy. A non-positive cap
+// means "unbounded" for that dimension. It is retained as the original
+// two-dimension constructor (so existing callers/tests are unchanged);
+// NewMemoryHistoryStoreWithPolicy adds the context-token cap and overflow
+// policy (#37).
 func NewMemoryHistoryStore(maxTurns, maxBytes int) *MemoryHistoryStore {
+	return NewMemoryHistoryStoreWithPolicy(maxTurns, maxBytes, 0, OverflowTrim)
+}
+
+// NewMemoryHistoryStoreWithPolicy returns an empty in-memory HistoryStore
+// bounded by maxTurns (turn count), maxBytes (cumulative content bytes), and
+// maxTokens (cumulative estimated context tokens — see turnTokens), enforced
+// under policy. A non-positive cap means "unbounded" for that dimension (#37).
+func NewMemoryHistoryStoreWithPolicy(maxTurns, maxBytes, maxTokens int, policy OverflowPolicy) *MemoryHistoryStore {
 	return &MemoryHistoryStore{
-		maxTurns: maxTurns,
-		maxBytes: maxBytes,
-		history:  make(map[string][]types.Message),
+		maxTurns:  maxTurns,
+		maxBytes:  maxBytes,
+		maxTokens: maxTokens,
+		policy:    policy,
+		history:   make(map[string][]types.Message),
 	}
 }
 
-// Append implements HistoryStore, trimming oldest turns to keep both caps.
+// Append implements HistoryStore. Under OverflowTrim it trims oldest turns to
+// keep every cap; under OverflowReject it returns ErrSessionLimitExceeded and
+// leaves the stored history untouched when the new turn would exceed a cap.
 func (m *MemoryHistoryStore) Append(sessionID string, turn types.Message) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	turns := append(m.history[sessionID], cloneMessage(turn))
+	existing := m.history[sessionID]
+	turns := append(existing, cloneMessage(turn))
+	if m.policy == OverflowReject && m.exceedsCap(turns) {
+		// Reject without mutating stored history: append produced a fresh header but
+		// the backing array up to len(existing) may be shared, so we simply do not
+		// store the new slice. The existing turns remain as they were.
+		return ErrSessionLimitExceeded
+	}
 	m.history[sessionID] = m.trim(turns)
 	return nil
 }
 
-// trim drops oldest turns until both the turn-count and byte caps hold. The most
-// recent turn is always retained even if it alone exceeds the byte cap (the
-// alternative — rejecting it — would wedge the session). Callers hold m.mu.
-func (m *MemoryHistoryStore) trim(turns []types.Message) []types.Message {
+// AppendBatch implements HistoryStore: atomic, all-or-nothing append under
+// OverflowReject so a multi-message turn never persists a half-turn.
+func (m *MemoryHistoryStore) AppendBatch(sessionID string, turns ...types.Message) error {
+	if len(turns) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	combined := append(m.history[sessionID], cloneMessages(turns)...)
+	if m.policy == OverflowReject && m.exceedsCap(combined) {
+		return ErrSessionLimitExceeded
+	}
+	m.history[sessionID] = m.trim(combined)
+	return nil
+}
+
+// WouldReject implements HistoryStore: it reports whether appending turns to
+// sessionID's current history would be refused under OverflowReject. It is
+// always false under OverflowTrim. It takes the read lock and does not mutate.
+func (m *MemoryHistoryStore) WouldReject(sessionID string, turns ...types.Message) bool {
+	if m.policy != OverflowReject || len(turns) == 0 {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	combined := make([]types.Message, 0, len(m.history[sessionID])+len(turns))
+	combined = append(combined, m.history[sessionID]...)
+	combined = append(combined, turns...)
+	return m.exceedsCap(combined)
+}
+
+// exceedsCap reports whether turns violates any configured cap (turns, bytes, or
+// context tokens). It is the OverflowReject predicate; a single turn larger than
+// the byte/token cap is treated as exceeding so the hard ceiling is enforced.
+// Callers hold m.mu (read or write).
+func (m *MemoryHistoryStore) exceedsCap(turns []types.Message) bool {
 	if m.maxTurns > 0 && len(turns) > m.maxTurns {
-		// Drop from the front; re-slice onto a fresh backing array so the trimmed
-		// turns become collectable and we do not retain the old (larger) array.
-		turns = append([]types.Message(nil), turns[len(turns)-m.maxTurns:]...)
+		return true
+	}
+	if m.maxBytes > 0 {
+		total := 0
+		for _, t := range turns {
+			total += turnBytes(t)
+		}
+		if total > m.maxBytes {
+			return true
+		}
+	}
+	if m.maxTokens > 0 {
+		total := 0
+		for _, t := range turns {
+			total += turnTokens(t)
+		}
+		if total > m.maxTokens {
+			return true
+		}
+	}
+	return false
+}
+
+// trim drops oldest turns until the turn-count, byte, and context-token caps all
+// hold. The most recent turn is always retained even if it alone exceeds the
+// byte/token cap (the alternative — rejecting it — would wedge the session under
+// the trim policy). Callers hold m.mu.
+func (m *MemoryHistoryStore) trim(turns []types.Message) []types.Message {
+	dropped := false
+	if m.maxTurns > 0 && len(turns) > m.maxTurns {
+		turns = turns[len(turns)-m.maxTurns:]
+		dropped = true
 	}
 	if m.maxBytes > 0 {
 		total := 0
@@ -239,9 +364,23 @@ func (m *MemoryHistoryStore) trim(turns []types.Message) []types.Message {
 		for total > m.maxBytes && len(turns) > 1 {
 			total -= turnBytes(turns[0])
 			turns = turns[1:]
+			dropped = true
 		}
-		// Compact onto a fresh array if we dropped any leading turns above so the
-		// dropped content is not retained by the underlying array.
+	}
+	if m.maxTokens > 0 {
+		total := 0
+		for _, t := range turns {
+			total += turnTokens(t)
+		}
+		for total > m.maxTokens && len(turns) > 1 {
+			total -= turnTokens(turns[0])
+			turns = turns[1:]
+			dropped = true
+		}
+	}
+	if dropped {
+		// Compact onto a fresh array so the dropped leading turns become collectable
+		// and we do not retain the old (larger) backing array.
 		turns = append([]types.Message(nil), turns...)
 	}
 	return turns

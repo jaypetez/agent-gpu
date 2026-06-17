@@ -56,9 +56,31 @@ leak secrets or internal detail; clients should branch on `code`:
 ```
 
 The `code` values are a fixed set (see the `Error` schema in the spec):
-`unauthorized`, `forbidden`, `rate_limit_exceeded`, `unavailable`,
-`invalid_request_error`, `not_found`, `method_not_allowed`, `not_implemented`,
-and `internal_error`.
+`unauthorized`, `forbidden`, `rate_limit_exceeded`, `session_limit_exceeded`,
+`unavailable`, `invalid_request_error`, `not_found`, `method_not_allowed`,
+`not_implemented`, and `internal_error`.
+
+### Session limits
+
+A server may cap conversation **sessions** in addition to per-request quota
+(configured globally via the `server start` flags listed at the end of this
+section). Two limits surface to clients, both with code `session_limit_exceeded`:
+
+- **Concurrent sessions per key** — `POST /v1/sessions` returns `429` when the
+  authenticated key already holds the maximum number of live sessions. End an
+  existing session (`DELETE /v1/sessions/{id}`) or wait for one to idle out.
+- **Per-session history** (turns / context tokens) — in stateful chat, when the
+  server is configured to *reject* (rather than *trim*) on overflow, a turn that
+  would exceed a session's history cap returns `409` from
+  `POST /v1/chat/completions`. The default policy is *trim* (oldest turns are
+  dropped), in which case turns never fail for this reason.
+
+The relevant `server start` flags (each with an `AGENTGPU_*` env equivalent):
+`--max-sessions-per-key` (0 = unlimited), `--max-session-turns` (default 200),
+`--max-session-context-tokens` (0 = unlimited), and
+`--session-overflow-policy` (`trim` | `reject`, default `trim`). The context-token
+count is a whitespace-token estimate (there is no model tokenizer), consistent
+with the rest of the project's token accounting.
 
 ### Streaming
 

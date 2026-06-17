@@ -34,6 +34,20 @@ type Manager struct {
 	now func() time.Time
 	ttl time.Duration
 
+	// maxPerKey is the maximum number of concurrent active sessions a single owner
+	// key may hold (#37). 0 means unlimited. Create rejects with
+	// ErrSessionLimitExceeded when the owner is already at the cap; the count
+	// decrements on Delete and on idle-expiry by the sweeper.
+	maxPerKey int
+
+	// countMu guards counts. It is a dedicated mutex (not the store's) so the
+	// per-owner tally stays consistent with the create/delete/sweep operations the
+	// Manager performs even though the underlying SessionStore is a separate
+	// concurrency domain. counts maps OwnerKeyID -> number of live sessions; an
+	// owner drops out of the map when its count returns to zero.
+	countMu sync.Mutex
+	counts  map[string]int
+
 	// randRead is the entropy source for session ids (defaults to crypto/rand);
 	// injectable so a test can force an id-generation failure deterministically.
 	randRead func([]byte) (int, error)
@@ -104,6 +118,18 @@ func WithRandReader(read func([]byte) (int, error)) Option {
 	}
 }
 
+// WithMaxSessionsPerKey caps the number of concurrent active sessions a single
+// owner key may hold (#37). A non-positive value means unlimited (the default).
+// Create rejects an owner already at the cap with ErrSessionLimitExceeded; the
+// per-owner tally decrements on Delete and on idle-expiry by the sweeper.
+func WithMaxSessionsPerKey(n int) Option {
+	return func(m *Manager) {
+		if n > 0 {
+			m.maxPerKey = n
+		}
+	}
+}
+
 // DefaultTTL is the default idle timeout stamped onto new sessions when no TTL
 // is configured.
 const DefaultTTL = 30 * time.Minute
@@ -118,12 +144,17 @@ func NewManager(sessions SessionStore, history HistoryStore, opts ...Option) *Ma
 		now:      time.Now,
 		ttl:      DefaultTTL,
 		randRead: rand.Read,
+		counts:   make(map[string]int),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(m)
 	}
+	// Reconcile the per-owner active-session tally from any sessions already in the
+	// store (e.g. restored from a checkpoint at boot) so the concurrent-session cap
+	// counts pre-existing sessions, not just ones created in this process.
+	m.reconcileCounts()
 	if m.sweepInterval <= 0 {
 		// Wake several times per TTL so an expired session is reaped well within a
 		// TTL of going idle, without a tight busy-loop.
@@ -146,14 +177,76 @@ func (m *Manager) newID() (string, error) {
 	return idPrefix + hex.EncodeToString(b[:]), nil
 }
 
+// reconcileCounts rebuilds the per-owner active-session tally from the store. It
+// is called once at construction so checkpoint-restored sessions are counted
+// against the concurrent-session cap. A List error leaves the tally empty (the
+// in-memory store never errors; a future backend that does simply starts the cap
+// from zero rather than wedging construction).
+func (m *Manager) reconcileCounts() {
+	sessions, err := m.sessions.List()
+	if err != nil {
+		return
+	}
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	m.counts = make(map[string]int, len(sessions))
+	for _, s := range sessions {
+		m.counts[s.OwnerKeyID]++
+	}
+}
+
+// reserveSlot increments ownerKeyID's active-session tally if it is below the
+// cap, returning false (without mutating) when the owner is already at the cap.
+// A non-positive cap is unlimited. It is the atomic check-and-increment that
+// makes the concurrent-session limit race-free under concurrent Create calls.
+func (m *Manager) reserveSlot(ownerKeyID string) bool {
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	if m.maxPerKey > 0 && m.counts[ownerKeyID] >= m.maxPerKey {
+		return false
+	}
+	m.counts[ownerKeyID]++
+	return true
+}
+
+// releaseSlot decrements ownerKeyID's active-session tally (on a failed create,
+// a delete, or an idle expiry), dropping the owner from the map when it reaches
+// zero so the map does not grow unbounded with retired keys. It never goes
+// negative.
+func (m *Manager) releaseSlot(ownerKeyID string) {
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	if n := m.counts[ownerKeyID]; n > 1 {
+		m.counts[ownerKeyID] = n - 1
+	} else {
+		delete(m.counts, ownerKeyID)
+	}
+}
+
+// activeCount returns ownerKeyID's current active-session tally. It backs the
+// concurrent-cap tests and is cheap enough for an occasional metric read.
+func (m *Manager) activeCount(ownerKeyID string) int {
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	return m.counts[ownerKeyID]
+}
+
 // Create mints a new active session owned by ownerKeyID targeting model. It
 // returns a copy of the created session, including its stable, unguessable id.
 func (m *Manager) Create(_ context.Context, ownerKeyID, model string) (Session, error) {
 	if ownerKeyID == "" {
 		return Session{}, fmt.Errorf("session: empty owner key id")
 	}
+	// Reserve a concurrency slot BEFORE minting/persisting so the per-owner cap is
+	// enforced atomically against concurrent creates. Release it if anything below
+	// fails so a failed create never permanently consumes a slot.
+	if !m.reserveSlot(ownerKeyID) {
+		m.log.Debug("session create rejected: per-key cap", "key_id", ownerKeyID, "cap", m.maxPerKey)
+		return Session{}, ErrSessionLimitExceeded
+	}
 	id, err := m.newID()
 	if err != nil {
+		m.releaseSlot(ownerKeyID)
 		return Session{}, err
 	}
 	now := m.now()
@@ -167,6 +260,7 @@ func (m *Manager) Create(_ context.Context, ownerKeyID, model string) (Session, 
 		Status:       StatusActive,
 	}
 	if err := m.sessions.Put(s); err != nil {
+		m.releaseSlot(ownerKeyID)
 		return Session{}, err
 	}
 	m.log.Debug("session created", "session", s.ID, "key_id", ownerKeyID, "model", model)
@@ -231,18 +325,42 @@ func (m *Manager) Delete(_ context.Context, id, ownerKeyID string) error {
 	if s.OwnerKeyID != ownerKeyID {
 		return ErrSessionNotFound
 	}
-	return m.deleteSession(id)
+	return m.deleteSession(id, s.OwnerKeyID)
 }
 
-// deleteSession removes a session and its history. History is deleted first so a
-// crash between the two leaves no session pointing at vanished history; an
-// orphaned history with no session is harmless (it is purged on the next load or
-// can be re-deleted).
-func (m *Manager) deleteSession(id string) error {
+// deleteSession removes a session and its history and releases the owner's
+// concurrency slot EXACTLY ONCE (#37). History is deleted first so a crash
+// between the two leaves no session pointing at vanished history; an orphaned
+// history with no session is harmless (it is purged on the next load or can be
+// re-deleted).
+//
+// The session-row delete and the slot release are performed together under
+// countMu and gated on the session still being present, so a Delete racing the
+// sweeper (both targeting the same id) decrements the owner's tally only once:
+// whichever call observes the row removes it and releases the slot; the other
+// sees it already gone and does nothing. Without this gate the two idempotent
+// store deletes would each release a slot and under-count the owner.
+func (m *Manager) deleteSession(id, ownerKeyID string) error {
 	if err := m.history.DeleteBySession(id); err != nil {
 		return err
 	}
-	return m.sessions.Delete(id)
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	// Re-check presence under the lock; only the call that actually removes the row
+	// releases the slot, so concurrent removals of the same id decrement once.
+	if _, err := m.sessions.Get(id); err != nil {
+		// Already gone (e.g. reaped by a racing sweep): nothing to release here.
+		return nil
+	}
+	if err := m.sessions.Delete(id); err != nil {
+		return err
+	}
+	if n := m.counts[ownerKeyID]; n > 1 {
+		m.counts[ownerKeyID] = n - 1
+	} else {
+		delete(m.counts, ownerKeyID)
+	}
+	return nil
 }
 
 // Bind records the worker a session is affinity-bound to (#34): the worker that
@@ -270,8 +388,9 @@ func (m *Manager) Bind(_ context.Context, id, ownerKeyID, workerID string) (Sess
 
 // AppendTurn appends a chat turn to the owner's session history and touches the
 // session's LastActiveAt (a turn is activity, so it keeps the session alive).
-// Returns ErrSessionNotFound if missing, not owned, or expired. The history
-// store enforces the configured turn/byte caps.
+// Returns ErrSessionNotFound if missing, not owned, or expired, and
+// ErrSessionLimitExceeded when a per-session history cap is hit under
+// OverflowReject. The history store enforces the configured turn/byte/token caps.
 func (m *Manager) AppendTurn(_ context.Context, id, ownerKeyID string, turn types.Message) error {
 	now := m.now()
 	s, err := m.ownedActive(id, ownerKeyID, now)
@@ -283,6 +402,45 @@ func (m *Manager) AppendTurn(_ context.Context, id, ownerKeyID string, turn type
 	}
 	s.LastActiveAt = now
 	return m.sessions.Put(s)
+}
+
+// AppendTurns appends several turns to the owner's session history ATOMICALLY
+// (all-or-nothing under OverflowReject, so a multi-message turn — the new
+// user/tool message(s) plus the assistant reply — never persists a half-turn)
+// and touches LastActiveAt once. Returns ErrSessionNotFound if missing, not
+// owned, or expired, and ErrSessionLimitExceeded when the batch would exceed a
+// cap under OverflowReject (in which case nothing is stored). An empty batch
+// still touches LastActiveAt (the turn was activity). It is the persistence path
+// the stateful chat handler uses.
+func (m *Manager) AppendTurns(_ context.Context, id, ownerKeyID string, turns ...types.Message) error {
+	now := m.now()
+	s, err := m.ownedActive(id, ownerKeyID, now)
+	if err != nil {
+		return err
+	}
+	if err := m.history.AppendBatch(id, turns...); err != nil {
+		return err
+	}
+	s.LastActiveAt = now
+	return m.sessions.Put(s)
+}
+
+// CheckAppendable reports whether appending turns to the owner's session would
+// be REJECTED by the configured history overflow policy (#37). It returns
+// ErrSessionNotFound for a missing/not-owned/expired session (so it never leaks
+// existence) and ErrSessionLimitExceeded when the turns would exceed a cap under
+// OverflowReject; it returns nil when the append would be accepted (always so
+// under OverflowTrim). It is the pre-dispatch gate the stateful chat path uses to
+// refuse a turn BEFORE inference runs, so no work is wasted on a turn whose
+// persistence would be refused. It does not mutate any state.
+func (m *Manager) CheckAppendable(_ context.Context, id, ownerKeyID string, turns ...types.Message) error {
+	if _, err := m.ownedActive(id, ownerKeyID, m.now()); err != nil {
+		return err
+	}
+	if m.history.WouldReject(id, turns...) {
+		return ErrSessionLimitExceeded
+	}
+	return nil
 }
 
 // History returns a copy of the owner's session history (oldest turn first).
@@ -349,7 +507,7 @@ func (m *Manager) sweepExpired() {
 		if !s.expired(now) {
 			continue
 		}
-		if err := m.deleteSession(s.ID); err != nil {
+		if err := m.deleteSession(s.ID, s.OwnerKeyID); err != nil {
 			m.log.Warn("session sweep: delete failed", "session", s.ID, "err", err)
 			continue
 		}
