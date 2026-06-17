@@ -13,10 +13,23 @@ One or more **workers** run Ollama locally and execute inference jobs dispatched
 
 ## Why
 
-- **Pool your GPUs.** Run one API endpoint backed by many machines and accelerators.
-- **Made for agents.** OpenAI-compatible `/v1/chat/completions` with streaming and function calling.
-- **Multi-tenant by design.** API keys, role-based permissions, per-model allow/deny lists, and quotas.
-- **Runs anywhere.** Standalone binaries for Windows/macOS/Linux (x64 + ARM64), or via Docker.
+- **Pool your GPUs.** One API endpoint backed by many machines. A capacity-aware
+  scheduler routes each job by free VRAM and load, with a global queue and
+  session-affinity so a conversation sticks to the worker that already has its
+  context warm.
+- **Made for agents.** OpenAI-compatible `/v1/chat/completions`, `/v1/completions`,
+  and `/v1/models`, plus multi-turn **sessions** that keep history server-side.
+- **Multi-tenant by design.** API keys with role-based permissions, per-model
+  allow/deny lists, and per-key plus server-wide **quotas / rate limits** (with a
+  `Retry-After` on throttle).
+- **GPU-aware workers.** Workers drive a local [Ollama](https://ollama.com) and
+  auto-detect the accelerator (NVIDIA / AMD / Apple, with a CPU fallback).
+- **Operable.** A single `agentgpu` CLI, Prometheus `/metrics`, structured JSON
+  logs with correlation IDs, an [OpenAPI 3.1 spec](openapi.yaml), and a built-in
+  load-testing harness.
+- **Runs anywhere.** A Docker Compose dev stack for one-command bring-up, two
+  minimal container images, and standalone binaries for Windows/macOS/Linux
+  (x64 + ARM64).
 
 ## Architecture
 
@@ -68,34 +81,97 @@ go install github.com/jaypetez/agent-gpu/cmd/agentgpu@latest
 
 ## Quickstart
 
-```bash
-# 1. Bootstrap the first admin key into the on-disk store BEFORE the server runs.
-#    --local writes the key file directly; the server loads it at boot.
-agentgpu key create --name bootstrap --role admin --local
-#    -> prints a one-time token; save it.
+The fastest path to a successful inference call is **Docker Compose**: it brings
+up the server, a worker, and a local Ollama, and pulls a tiny model
+(`qwen2:0.5b`, ~350 MB) automatically, so there is something to serve out of the
+box. You need only Docker.
 
-# 2. Start the server (it reads the store written above).
+```bash
+# 1. Clone and bring the whole stack up (server + worker + Ollama + backing services).
+git clone https://github.com/jaypetez/agent-gpu.git
+cd agent-gpu
+docker compose up -d --build
+
+# 2. Wait for the server: an unauthenticated GET /v1/models returns 401 once it is up.
+until [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/v1/models)" = "401" ]; do
+  sleep 2
+done
+```
+
+There is no auto-seeded admin key, and before any key exists there is no token to
+authenticate with — so bootstrap the first keys directly into the on-disk store
+with `--local`, then **restart the server once** so it loads them at boot (the
+file store is read only at startup). The plaintext token is printed **once** —
+save it.
+
+```bash
+# 3. Mint an admin key and a user key scoped to the demo model, then restart so they load.
+docker compose exec -T server /agentgpu key create --name admin --role admin --local
+docker compose exec -T server /agentgpu key create --name app --role user --allow-model qwen2:0.5b --local
+docker compose restart server
+# Copy the "Token: ..." line from the user-key output into USER_TOKEN below.
+export USER_TOKEN=<the user token printed above>
+```
+
+```bash
+# 4. Wait until the model is advertised to your key (the worker discovers it from
+#    Ollama, and ollama-init's pull can take a while on a cold cache).
+until curl -s -H "Authorization: Bearer $USER_TOKEN" http://localhost:8080/v1/models \
+  | grep -q '"id":"qwen2:0.5b"'; do sleep 2; done
+
+# 5. Make an OpenAI-compatible chat request — this is your successful inference call.
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $USER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2:0.5b","messages":[{"role":"user","content":"Say hi in one word."}]}'
+
+# When you are done:
+docker compose down -v   # stop the stack and remove its volumes
+```
+
+After step 3 you can manage the **running** server over its HTTP admin API with
+the admin token (`key revoke`, `quota set`, permission changes — all immediate,
+no restart). The full Compose walkthrough — managing live keys, scaling workers,
+persistence, and GPU access — is in [docs/docker.md](docs/docker.md), and
+`make compose-e2e` runs this exact flow end to end as a smoke test.
+
+### Quickstart from source (no Docker)
+
+With the [Go toolchain](#install) and a local [Ollama](https://ollama.com), run
+the same flow by hand. Every command is a subcommand of the one `agentgpu`
+binary (`go run ./cmd/agentgpu …` from a clone works too).
+
+```bash
+# 1. Bootstrap the first admin key into the on-disk store BEFORE the server runs;
+#    --local writes the key file the server loads at boot.
+agentgpu key create --name bootstrap --role admin --local   # -> prints a one-time token; save it
+
+# 2. Start the server (HTTP API on :8080, gRPC control plane on :50051).
 agentgpu server start
 
-# 3. Start a worker on a machine with Ollama installed (gRPC host:port).
-agentgpu worker start --server SERVER_HOST:50051
+# 3. In another shell, start a worker pointed at the gRPC control plane and Ollama.
+#    --server here is the gRPC host:port; --ollama-url is the local Ollama.
+agentgpu worker start --server 127.0.0.1:50051 --ollama-url http://localhost:11434
 
-# 4. Point the CLI at the running server and mint a user key over the admin API.
-export AGENTGPU_HTTP_ADDR=http://SERVER_HOST:8080
+# 4. Point the CLI at the RUNNING server and mint a user key over the admin API.
+export AGENTGPU_HTTP_ADDR=http://127.0.0.1:8080
 export AGENTGPU_TOKEN=<the admin token from step 1>
-agentgpu key create --name my-agent --role user      # -> prints the user token
-agentgpu models list                                 # the permitted catalog
+agentgpu key create --name my-agent --role user --allow-model llama3   # -> prints the user token
+agentgpu models list                                                   # the permitted catalog
 
-# 5. Make a request (OpenAI-compatible) with the user token.
-curl http://SERVER_HOST:8080/v1/chat/completions \
-  -H "Authorization: Bearer $AGENTGPU_USER_KEY" \
+# 5. Make an OpenAI-compatible request with the user token (use a model your
+#    worker serves — pull one first with `ollama pull llama3`).
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer <the user token from step 4>" \
   -H "Content-Type: application/json" \
   -d '{"model":"llama3","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
 After step 4 the CLI manages the **running** server over its HTTP admin API, so
 `key revoke`, `quota set`, and permission changes take effect immediately (no
-restart). See [CLI](#cli) for the full command reference.
+restart). See [CLI](#cli) for the full command reference and
+[docs/developer-guide.md](docs/developer-guide.md) for a deeper from-source
+walkthrough.
 
 ### CLI
 
@@ -150,22 +226,14 @@ Commands return distinct exit codes so scripts can branch: `0` success
 
 ### Run with Docker
 
-The fastest way to a working stack is Docker Compose — server, a worker, a local
-Ollama (with a tiny model pulled automatically), and the backing services, in one
-command:
+The [Quickstart](#quickstart) above uses the Docker Compose dev stack, which is
+the fastest way to a working server, worker, and Ollama in one command. Scale
+workers with `docker compose up -d --scale worker=3`. The full guide (managing
+live keys, persistence demo, GPU access) is in [docs/docker.md](docs/docker.md).
 
-```bash
-docker compose up -d --build
-# Bootstrap a key, then call http://localhost:8080 — see docs/docker.md.
-docker compose down -v   # clean teardown
-```
-
-Scale workers with `docker compose up -d --scale worker=3`. The full guide
-(key bootstrap, sample inference request, persistence demo, GPU access) is in
-[docs/docker.md](docs/docker.md).
-
-Or run the two minimal, non-root images directly. They are built from one
-multi-stage [`Dockerfile`](Dockerfile) and published to GHCR on each release:
+To wire agent-gpu into your own infrastructure, run the two minimal, non-root
+images directly. They are built from one multi-stage [`Dockerfile`](Dockerfile)
+and published to GHCR on each release:
 
 ```bash
 # Server: the public API + control plane. /data holds key/quota/session state.
@@ -188,14 +256,14 @@ container itself) — use the Ollama service name or `host.docker.internal`. See
 
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Developer Guide](docs/developer-guide.md)
-- [Running with Docker](docs/docker.md)
-- [Metrics (Prometheus)](docs/metrics.md)
-- [Testing](docs/testing.md) · [Load testing](docs/load-testing.md)
-- [Releasing](docs/releasing.md)
+- [Architecture](docs/architecture.md) — the implemented design, request flow, and scheduler.
+- [API Reference](docs/api-reference.md) — the HTTP surface, generated from [`openapi.yaml`](openapi.yaml).
+- [Developer Guide](docs/developer-guide.md) — build, run, and contribute to the code.
+- [Running with Docker](docs/docker.md) — the container images and the Compose dev stack.
+- [Metrics (Prometheus)](docs/metrics.md) — the `/metrics` endpoint and its reference.
+- [Testing](docs/testing.md) · [Load testing](docs/load-testing.md) — the test suite and the perf harness.
+- [Releasing](docs/releasing.md) — cutting a release with GoReleaser.
 - [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Changelog](CHANGELOG.md)
-- [API Reference](docs/api-reference.md)
 
 ## Project status
 
