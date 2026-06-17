@@ -32,6 +32,8 @@ func dispatch(args []string) error {
 		return runQuotaCmd(ctx, os.Stdout, args[1:])
 	case "models":
 		return runModelsCmd(ctx, os.Stdout, args[1:])
+	case "loadtest":
+		return runLoadtestCmd(ctx, logger, os.Stdout, args[1:])
 	default:
 		usage(os.Stderr)
 		return usagef("unknown subcommand %q", args[0])

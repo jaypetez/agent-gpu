@@ -136,6 +136,7 @@ Usage:
   agentgpu key    <create|list|revoke|rotate|perms|quota> [flags]
   agentgpu quota  <set|show> <id> [flags]
   agentgpu models list [--json|--openai]
+  agentgpu loadtest [--mode remote|inproc] [flags]
   agentgpu version
 
 The key, quota, and models commands act against a RUNNING server over its public
