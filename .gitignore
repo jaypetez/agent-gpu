@@ -26,8 +26,12 @@ tmp/
 *.exe
 *.test
 *.out
-# Coverage profiles
+# Coverage profiles + rendered reports (make cover / make cover-html / CI)
 coverage.txt
+coverage.out
+coverage.gate.out
+coverage.func.txt
+coverage.html
 # We use Go modules, not vendoring
 /vendor/
 

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/ollama"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
+	"github.com/jaypetez/agent-gpu/internal/testutil"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	"github.com/jaypetez/agent-gpu/internal/worker"
 )
@@ -138,46 +138,13 @@ func TestOllamaInferenceErrorResolvesWaiter(t *testing.T) {
 	}
 }
 
-// recordingExecutor is a worker.Executor that records Pull calls so a test can
-// assert whether a permission-gated pull reached the worker's Ollama. Its
-// Execute echoes (streaming a single delta) so dispatch still works.
-type recordingExecutor struct {
-	mu     sync.Mutex
-	pulled []string
-}
-
-func (e *recordingExecutor) Execute(_ context.Context, job types.Job, emit func(types.JobChunk)) types.JobResult {
-	out := "echo: " + job.Prompt
-	if emit != nil {
-		emit(types.JobChunk{JobID: job.ID, Delta: out})
-	}
-	return types.JobResult{JobID: job.ID, Output: out}
-}
-
-func (e *recordingExecutor) ListModels(context.Context) ([]types.Model, error) {
-	return []types.Model{{Name: "llama3"}}, nil
-}
-
-func (e *recordingExecutor) Pull(_ context.Context, model string) error {
-	e.mu.Lock()
-	e.pulled = append(e.pulled, model)
-	e.mu.Unlock()
-	return nil
-}
-
-func (e *recordingExecutor) pulls() []string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return append([]string(nil), e.pulled...)
-}
-
 // pullHarness wires a server (with an authorizer) to a worker whose executor
-// records pulls, plus an auth.Service, so the permission-gated pull path can be
-// exercised end to end.
+// records pulls (a testutil.FakeExecutor advertising llama3), plus an
+// auth.Service, so the permission-gated pull path can be exercised end to end.
 type pullHarness struct {
 	h    *harness
 	auth *auth.Service
-	exec *recordingExecutor
+	exec *testutil.FakeExecutor
 }
 
 func newPullHarness(t *testing.T) *pullHarness {
@@ -190,7 +157,7 @@ func newPullHarness(t *testing.T) *pullHarness {
 	h.start()
 	t.Cleanup(h.close)
 
-	exec := &recordingExecutor{}
+	exec := testutil.NewFakeExecutor(testutil.WithExecModels("llama3"))
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	w := worker.New(worker.Config{
@@ -235,7 +202,7 @@ func TestPullModelPermitted(t *testing.T) {
 		t.Fatalf("PullModel: %v", err)
 	}
 	waitFor(t, 2*time.Second, "worker to pull the model", func() bool {
-		for _, m := range p.exec.pulls() {
+		for _, m := range p.exec.Pulls() {
 			if m == "llama3" {
 				return true
 			}
@@ -259,7 +226,7 @@ func TestPullModelDenied(t *testing.T) {
 	// Give any (erroneously-sent) message time to reach the worker, then assert
 	// the executor was never asked to pull.
 	time.Sleep(100 * time.Millisecond)
-	if pulls := p.exec.pulls(); len(pulls) != 0 {
+	if pulls := p.exec.Pulls(); len(pulls) != 0 {
 		t.Fatalf("denied pull reached the worker: %v", pulls)
 	}
 }
