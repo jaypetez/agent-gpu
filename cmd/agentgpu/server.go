@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -57,7 +58,9 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	sessionPath := fs.String("session-path", "", "path to the session+history checkpoint (default $AGENTGPU_SESSION_PATH or ~/.agentgpu/sessions.json)")
 	sessionTTL := fs.Duration("session-ttl", 0, "per-session idle timeout (default 30m or $AGENTGPU_SESSION_TTL)")
 	setUsage(fs, "Usage: agentgpu server start [--listen host:port] [--http-listen host:port] [flags]")
-	if err := parseFlags(fs, args[1:]); err != nil {
+	// The server/worker commands have no caller-injected writer; their help goes to
+	// stdout (a success), matching the informational top-level help.
+	if err := parseFlags(fs, os.Stdout, args[1:]); err != nil {
 		return err
 	}
 

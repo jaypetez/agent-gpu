@@ -45,16 +45,15 @@ func TestExitCodeMapping(t *testing.T) {
 	}
 }
 
-// TestExitCodeNotFoundWrappedAPIError proves a 404 *APIError (the real client
-// shape) maps to exitNotFound via the embedded sentinel, not just the bare
-// sentinel.
-func TestExitCodeNotFoundWrappedAPIError(t *testing.T) {
+// TestExitCodeSentinelless404FallsBackToGeneral proves a 404 *APIError that has
+// NOT been tagged with the ErrNotFound sentinel falls back to the general error
+// code. The exported APIError does not let a test set its unexported class, so
+// this only covers the fallback; the real 404→exitNotFound path (where the client
+// attaches the sentinel) is exercised end-to-end in http_test.go's
+// TestHTTPErrorExitCodes.
+func TestExitCodeSentinelless404FallsBackToGeneral(t *testing.T) {
 	t.Parallel()
 	err := &apiclient.APIError{Status: 404, Message: "key not found"}
-	// Reconstruct via the client's own path so the sentinel is attached: emulate
-	// by wrapping. The exported APIError does not let tests set the class, so we
-	// assert through errors.Is against the live client behaviour in http_test.go;
-	// here we only assert a 404 status APIError without a sentinel falls back to 1.
 	if got := exitCode(err); got != exitError {
 		t.Fatalf("a 404 APIError without sentinel maps to %d (documented fallback is general error)", got)
 	}
@@ -82,7 +81,9 @@ func TestTopLevelHelpExitsZero(t *testing.T) {
 }
 
 // TestSubcommandHelpExitsZero proves a per-command `--help` prints that command's
-// usage (with its flags) and returns flag.ErrHelp, which maps to exit 0.
+// usage (with its flags) and returns flag.ErrHelp, which maps to exit 0. Help is
+// captured via the handler's injected writer (a buffer), so the subtests run in
+// parallel without racing on the process-global os.Stdout.
 func TestSubcommandHelpExitsZero(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -99,15 +100,13 @@ func TestSubcommandHelpExitsZero(t *testing.T) {
 		tc := tc
 		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
 			t.Parallel()
-			out := captureStdout(t, func() {
-				err := dispatchForTest(tc.args)
-				if !errors.Is(err, flag.ErrHelp) {
-					t.Fatalf("err = %v, want flag.ErrHelp", err)
-				}
-				if exitCode(err) != exitOK {
-					t.Fatalf("help should exit 0, got %d", exitCode(err))
-				}
-			})
+			out, err := dispatchForTest(tc.args)
+			if !errors.Is(err, flag.ErrHelp) {
+				t.Fatalf("err = %v, want flag.ErrHelp", err)
+			}
+			if exitCode(err) != exitOK {
+				t.Fatalf("help should exit 0, got %d", exitCode(err))
+			}
 			if !strings.Contains(out, tc.wantUsage) {
 				t.Fatalf("help missing usage %q: %q", tc.wantUsage, out)
 			}
@@ -118,21 +117,25 @@ func TestSubcommandHelpExitsZero(t *testing.T) {
 	}
 }
 
-// dispatchForTest routes a subcommand to its handler with a discarding writer,
+// dispatchForTest routes a subcommand to its handler with an injected buffer,
 // mirroring dispatch() but without the signal/logging setup so help/usage paths
-// can be exercised directly. It is test-only glue.
-func dispatchForTest(args []string) error {
+// can be exercised directly. It returns what the handler wrote to that buffer so
+// help text is asserted without touching the process-global os.Stdout. Test-only
+// glue.
+func dispatchForTest(args []string) (string, error) {
 	var out bytes.Buffer
+	var err error
 	switch args[0] {
 	case "key":
-		return runKeyCmd(context.Background(), &out, args[1:])
+		err = runKeyCmd(context.Background(), &out, args[1:])
 	case "quota":
-		return runQuotaCmd(context.Background(), &out, args[1:])
+		err = runQuotaCmd(context.Background(), &out, args[1:])
 	case "models":
-		return runModelsCmd(context.Background(), &out, args[1:])
+		err = runModelsCmd(context.Background(), &out, args[1:])
 	default:
-		return usagef("unknown %q", args[0])
+		err = usagef("unknown %q", args[0])
 	}
+	return out.String(), err
 }
 
 // TestUnknownSubcommandIsUsageError proves an unknown subcommand is a usage error

@@ -26,7 +26,7 @@ import (
 // effect. Secrets are never printed.
 func runQuotaCmd(ctx context.Context, out io.Writer, args []string) error {
 	if len(args) >= 1 && isHelpArg(args[0]) {
-		return groupHelp(quotaUsage)
+		return groupHelp(out, quotaUsage)
 	}
 	if len(args) >= 1 && args[0] == "set" {
 		return runQuotaSet(ctx, out, args[1:])
@@ -57,7 +57,7 @@ func runQuotaShow(ctx context.Context, out io.Writer, args []string) error {
 	setUsage(fs, "Usage: agentgpu quota show <id> [--local [--quota-path path]]")
 	valueFlags := clientValueFlags()
 	valueFlags["quota-path"] = true
-	if err := parseFlags(fs, reorderFlagsFirst(args, valueFlags)); err != nil {
+	if err := parseFlags(fs, out, reorderFlagsFirst(args, valueFlags)); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -151,7 +151,7 @@ func runQuotaSet(ctx context.Context, out io.Writer, args []string) error {
 	setUsage(fs, "Usage: agentgpu quota set <id> [--rpm N] [--tpm N] [--daily-tokens N] [--monthly-tokens N] [--clear] [--local]")
 	valueFlags := clientValueFlags()
 	valueFlags["rpm"], valueFlags["tpm"], valueFlags["daily-tokens"], valueFlags["monthly-tokens"] = true, true, true, true
-	if err := parseFlags(fs, reorderFlagsFirst(args, valueFlags)); err != nil {
+	if err := parseFlags(fs, out, reorderFlagsFirst(args, valueFlags)); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -166,6 +166,13 @@ func runQuotaSet(ctx context.Context, out io.Writer, args []string) error {
 	anyNumeric := set["rpm"] || set["tpm"] || set["daily-tokens"] || set["monthly-tokens"]
 	if !*clear && !anyNumeric {
 		return usagef("quota set: specify at least one of --rpm/--tpm/--daily-tokens/--monthly-tokens, or --clear")
+	}
+	// --clear and a numeric dimension are contradictory (clear reverts to the
+	// global defaults; a dimension sets an override). Rejecting the combination as a
+	// usage error is clearer than silently letting --clear win, and is consistent
+	// across the HTTP and local paths below.
+	if *clear && anyNumeric {
+		return usagef("quota set: --clear cannot be combined with --rpm/--tpm/--daily-tokens/--monthly-tokens")
 	}
 
 	if cf.isLocal() {

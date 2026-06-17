@@ -65,6 +65,28 @@ func TestKeyQuotaCLIFlow(t *testing.T) {
 	}
 }
 
+// TestQuotaSetClearWithNumericIsUsageError proves combining --clear with a numeric
+// dimension is rejected as a usage error (exit 2) rather than silently letting
+// --clear win. The guard fires during flag validation, before any HTTP/store
+// access, so it needs neither a server nor a token.
+func TestQuotaSetClearWithNumericIsUsageError(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	err := runQuotaCmd(context.Background(), &out, []string{"set", "k1", "--clear", "--rpm", "99"})
+	if err == nil {
+		t.Fatal("expected a usage error for --clear combined with --rpm")
+	}
+	if exitCode(err) != exitUsage {
+		t.Fatalf("exit code = %d, want %d", exitCode(err), exitUsage)
+	}
+	if !strings.Contains(err.Error(), "--clear cannot be combined") {
+		t.Fatalf("error should explain the conflict: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("no output expected on the usage-error path, got %q", out.String())
+	}
+}
+
 // TestKeyQuotaClear verifies --clear removes the per-key override.
 func TestKeyQuotaClear(t *testing.T) {
 	t.Parallel()

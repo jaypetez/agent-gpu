@@ -26,7 +26,7 @@ func runModelsCmd(ctx context.Context, out io.Writer, args []string) error {
 		return usagef("usage: agentgpu models list [--json|--openai]")
 	}
 	if isHelpArg(args[0]) {
-		return groupHelp(modelsUsage)
+		return groupHelp(out, modelsUsage)
 	}
 	switch args[0] {
 	case "list":
@@ -53,7 +53,7 @@ func runModelsList(ctx context.Context, out io.Writer, args []string) error {
 	asJSON := fs.Bool("json", false, "emit the raw /models JSON (digest + per-model worker availability)")
 	asOpenAI := fs.Bool("openai", false, "emit the OpenAI-canonical /v1/models JSON")
 	setUsage(fs, "Usage: agentgpu models list [--json|--openai]")
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseFlags(fs, out, args); err != nil {
 		return err
 	}
 	if *asJSON && *asOpenAI {

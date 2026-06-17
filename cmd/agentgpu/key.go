@@ -103,7 +103,7 @@ func runKeyCmd(ctx context.Context, out io.Writer, args []string) error {
 		return usagef("usage: agentgpu key <create|list|revoke|rotate|perms|quota> [args]")
 	}
 	if isHelpArg(args[0]) {
-		return groupHelp(keyUsage)
+		return groupHelp(out, keyUsage)
 	}
 
 	sub := args[0]
@@ -147,7 +147,7 @@ func runKeyCreate(ctx context.Context, out io.Writer, args []string) error {
 	fs.Var(&allow, "allow-model", "allow a model by name; repeatable")
 	fs.Var(&deny, "deny-model", "deny a model by name (deny wins); repeatable")
 	setUsage(fs, "Usage: agentgpu key create --name <name> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--local]")
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseFlags(fs, out, args); err != nil {
 		return err
 	}
 	if *name == "" {
@@ -218,7 +218,7 @@ func runKeyPerms(ctx context.Context, out io.Writer, args []string) error {
 	setUsage(fs, "Usage: agentgpu key perms <id> [--role r ...] [--allow-model m ...] [--deny-model m ...] [--local]")
 	valueFlags := clientValueFlags()
 	valueFlags["role"], valueFlags["allow-model"], valueFlags["deny-model"] = true, true, true
-	if err := parseFlags(fs, reorderFlagsFirst(args, valueFlags)); err != nil {
+	if err := parseFlags(fs, out, reorderFlagsFirst(args, valueFlags)); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -273,7 +273,7 @@ func runKeyList(ctx context.Context, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("key list", flag.ContinueOnError)
 	cf := registerClientFlags(fs, withLocal)
 	setUsage(fs, "Usage: agentgpu key list [--local]")
-	if err := parseFlags(fs, args); err != nil {
+	if err := parseFlags(fs, out, args); err != nil {
 		return err
 	}
 
@@ -335,7 +335,7 @@ func runKeyRevoke(ctx context.Context, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("key revoke", flag.ContinueOnError)
 	cf := registerClientFlags(fs, withLocal)
 	setUsage(fs, "Usage: agentgpu key revoke <id> [--local]")
-	if err := parseFlags(fs, reorderFlagsFirst(args, clientValueFlags())); err != nil {
+	if err := parseFlags(fs, out, reorderFlagsFirst(args, clientValueFlags())); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -376,7 +376,7 @@ func runKeyRotate(ctx context.Context, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("key rotate", flag.ContinueOnError)
 	cf := registerClientFlags(fs, withLocal)
 	setUsage(fs, "Usage: agentgpu key rotate <id> [--local]")
-	if err := parseFlags(fs, reorderFlagsFirst(args, clientValueFlags())); err != nil {
+	if err := parseFlags(fs, out, reorderFlagsFirst(args, clientValueFlags())); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {

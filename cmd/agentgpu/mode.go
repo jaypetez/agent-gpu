@@ -4,7 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
+	"io"
 
 	"github.com/jaypetez/agent-gpu/internal/apiclient"
 	"github.com/jaypetez/agent-gpu/internal/auth"
@@ -116,20 +116,23 @@ func (a *aliasValue) Set(v string) error {
 	return nil
 }
 
-// parseFlags parses args with fs, routing flag/help output and normalizing the
-// returned error so main can assign the right exit code:
+// parseFlags parses args with fs, routing flag/help output to out and normalizing
+// the returned error so main can assign the right exit code:
 //
-//   - help (-h/--help) prints fs's usage to stdout and returns flag.ErrHelp
+//   - help (-h/--help) prints fs's usage to out and returns flag.ErrHelp
 //     unchanged, which exitCode maps to a clean exit 0;
 //   - any other parse error (unknown flag, bad value) is wrapped as a usageError
 //     so it maps to exit 2.
 //
-// fs.Usage should already be set (via setUsage) before calling this.
-func parseFlags(fs *flag.FlagSet, args []string) error {
-	// Help output goes to stdout (it is requested, success); a genuine parse error
-	// also prints usage, which we likewise route to stdout for consistency since
-	// the wrapped error is printed to stderr by main.
-	fs.SetOutput(os.Stdout)
+// out is the command's own output writer (os.Stdout for a real invocation, a
+// buffer under test), so help text can be asserted without mutating the
+// process-global os.Stdout. fs.Usage should already be set (via setUsage) before
+// calling this.
+func parseFlags(fs *flag.FlagSet, out io.Writer, args []string) error {
+	// Help output goes to out (it is requested, a success); a genuine parse error
+	// also prints usage, which we likewise route to out for consistency since the
+	// wrapped error itself is printed to stderr by main.
+	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return err
@@ -169,9 +172,10 @@ func isHelpArg(s string) bool {
 }
 
 // groupHelp prints a group command's usage (e.g. for `agentgpu key --help`) to
-// stdout and returns flag.ErrHelp so the caller propagates a clean exit 0. summary
-// is the multi-line usage text for the group.
-func groupHelp(summary string) error {
-	fmt.Fprintln(os.Stdout, summary)
+// out and returns flag.ErrHelp so the caller propagates a clean exit 0. out is the
+// command's own writer (os.Stdout in production, a buffer under test); summary is
+// the multi-line usage text for the group.
+func groupHelp(out io.Writer, summary string) error {
+	fmt.Fprintln(out, summary)
 	return flag.ErrHelp
 }

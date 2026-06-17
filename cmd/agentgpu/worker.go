@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/jaypetez/agent-gpu/internal/config"
@@ -43,7 +44,8 @@ func runWorkerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	gpuType := fs.String("gpu-type", "", "manual GPU type override when detection is off/unavailable (or $AGENTGPU_GPU_TYPE)")
 	totalVRAM := fs.Uint64("total-vram", 0, "manual total VRAM in bytes when detection is off/unavailable (or $AGENTGPU_TOTAL_VRAM)")
 	setUsage(fs, "Usage: agentgpu worker start --server host:port [--id worker-id] [--models name,name] [flags]")
-	if err := parseFlags(fs, args[1:]); err != nil {
+	// No caller-injected writer here; route help to stdout like the server command.
+	if err := parseFlags(fs, os.Stdout, args[1:]); err != nil {
 		return err
 	}
 
