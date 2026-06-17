@@ -74,7 +74,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := types.Job{
-		ID:     newID("job-"),
+		ID:     jobIDFor(r),
 		Model:  req.Model,
 		Prompt: req.Prompt,
 	}
@@ -125,7 +125,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, key st
 
 	for chunk := range chunks {
 		if chunk.Err != nil {
-			s.log.Warn("completion stream failed mid-stream", "code", chunk.Err.Code, "err", chunk.Err.Message)
+			s.reqLog(r.Context()).Warn("completion stream failed mid-stream", "code", chunk.Err.Code, "err", chunk.Err.Message)
 			fr := "error"
 			writeSSEData(w, flusher, completionChunkResponse{
 				ID:      id,

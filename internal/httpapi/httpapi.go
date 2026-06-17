@@ -168,8 +168,11 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 
 // Handler returns the routed http.Handler for the API. Every route is wrapped
 // in the Bearer auth middleware, so an unauthenticated request never reaches a
-// handler (and never leaks the catalog). It is exported so tests can exercise
-// routing through net/http/httptest without binding a socket.
+// handler (and never leaks the catalog). The whole mux is then wrapped in the
+// correlation-id middleware (#23), which runs OUTERMOST — before auth — so even
+// an unauthenticated 401 carries a request_id and an X-Request-Id response
+// header. It is exported so tests can exercise routing through
+// net/http/httptest without binding a socket.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/models", s.authMiddleware(http.HandlerFunc(s.handleOpenAIModels)))
@@ -187,7 +190,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
 	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
 	s.registerAdminRoutes(mux)
-	return mux
+	// Correlation id is established outermost so every response — including
+	// unauthenticated 401s short-circuited by authMiddleware — gets a request_id
+	// and X-Request-Id header.
+	return s.requestIDMiddleware(mux)
 }
 
 // admin wraps an admin handler in the auth + admin-role gates. Every admin route

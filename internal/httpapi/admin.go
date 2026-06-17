@@ -299,7 +299,7 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 		DenyModels:  req.DenyModels,
 	})
 	if err != nil {
-		s.log.Error("admin create key failed", "err", err)
+		s.reqLog(r.Context()).Error("admin create key failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create key")
 		return
 	}
@@ -319,7 +319,7 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.auth.List(r.Context())
 	if err != nil {
-		s.log.Error("admin list keys failed", "err", err)
+		s.reqLog(r.Context()).Error("admin list keys failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list keys")
 		return
 	}
@@ -335,7 +335,7 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAdminGetKey(w http.ResponseWriter, r *http.Request) {
 	key, err := s.auth.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
-		s.writeAdminKeyError(w, err)
+		s.writeAdminKeyError(r, w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
@@ -346,7 +346,7 @@ func (s *Server) handleAdminGetKey(w http.ResponseWriter, r *http.Request) {
 // unknown.
 func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
 	if err := s.auth.Revoke(r.Context(), r.PathValue("id")); err != nil {
-		s.writeAdminKeyError(w, err)
+		s.writeAdminKeyError(r, w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -359,7 +359,7 @@ func (s *Server) handleAdminRotateKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	token, err := s.auth.Rotate(r.Context(), id)
 	if err != nil {
-		s.writeAdminKeyError(w, err)
+		s.writeAdminKeyError(r, w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, adminRotateKeyResponse{ID: id, Token: token})
@@ -379,7 +379,7 @@ func (s *Server) handleAdminSetPermissions(w http.ResponseWriter, r *http.Reques
 		DenyModels:  req.DenyModels,
 	})
 	if err != nil {
-		s.writeAdminKeyError(w, err)
+		s.writeAdminKeyError(r, w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
@@ -407,7 +407,7 @@ func (s *Server) handleAdminSetQuota(w http.ResponseWriter, r *http.Request) {
 	}
 	key, err := s.auth.SetLimits(r.Context(), r.PathValue("id"), limits)
 	if err != nil {
-		s.writeAdminKeyError(w, err)
+		s.writeAdminKeyError(r, w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
@@ -422,12 +422,12 @@ func (s *Server) handleAdminGetQuota(w http.ResponseWriter, r *http.Request) {
 	}
 	key, err := s.auth.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
-		s.writeAdminKeyError(w, err)
+		s.writeAdminKeyError(r, w, err)
 		return
 	}
 	snap, err := s.quota.UsageForKey(r.Context(), key)
 	if err != nil {
-		s.log.Error("admin quota usage failed", "key_id", key.ID, "err", err)
+		s.reqLog(r.Context()).Error("admin quota usage failed", "key_id", key.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not read usage")
 		return
 	}
@@ -488,7 +488,7 @@ func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusNotFound, "not_found", "worker not found")
 			return
 		}
-		s.log.Error("admin drain worker failed", "err", err)
+		s.reqLog(r.Context()).Error("admin drain worker failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not drain worker")
 		return
 	}
@@ -517,13 +517,14 @@ func deref(p *uint64) uint64 {
 
 // writeAdminKeyError maps an auth/store error from a key operation to its HTTP
 // status: store.ErrNotFound is 404 (unknown key id); anything else is a server
-// fault (500) logged with the underlying cause. The message never echoes the
-// key id or any secret.
-func (s *Server) writeAdminKeyError(w http.ResponseWriter, err error) {
+// fault (500) logged with the underlying cause via the request-scoped logger (so
+// the line carries request_id). The message never echoes the key id or any
+// secret.
+func (s *Server) writeAdminKeyError(r *http.Request, w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "key not found")
 		return
 	}
-	s.log.Error("admin key operation failed", "err", err)
+	s.reqLog(r.Context()).Error("admin key operation failed", "err", err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
 }

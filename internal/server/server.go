@@ -1108,7 +1108,7 @@ func (s *Server) placeItem(ctx context.Context, item queue.Item) {
 		// drain, or go stale while the job is queued, so re-read it per placement try.
 		preferred := s.affinityFor(ctx, item.Job, item.Key)
 		if w, ok := s.pickWorker(item.Job.Model, preferred); ok {
-			s.log.Info("placing queued job", "key_id", item.Key, "model", item.Job.Model,
+			s.log.Info("placing queued job", "key_id", item.Key, "job_id", item.Job.ID, "model", item.Job.Model,
 				"priority", int(item.Priority), "worker", w.id)
 			// Dispatch and forward the result to the original caller's waiter. A
 			// fresh context bounds the dispatch to the loop's lifetime (cancelled
@@ -1519,11 +1519,11 @@ func (s *Server) submit(ctx context.Context, job types.Job, keyID string, prio q
 		if errors.Is(err, queue.ErrClosed) {
 			return types.JobResult{}, ErrShuttingDown
 		}
-		s.log.Warn("job rejected: queue full", "key_id", keyID, "model", job.Model,
+		s.log.Warn("job rejected: queue full", "key_id", keyID, "job_id", job.ID, "model", job.Model,
 			"priority", int(prio), "reason", "queue_full")
 		return types.JobResult{}, err
 	}
-	s.log.Info("job queued: no worker available", "key_id", keyID, "model", job.Model,
+	s.log.Info("job queued: no worker available", "key_id", keyID, "job_id", job.ID, "model", job.Model,
 		"priority", int(prio), "reason", "no_runnable_worker")
 	// A worker may appear concurrently; nudge the placement loop in case the
 	// capacity signal that would have woken it landed before we enqueued.

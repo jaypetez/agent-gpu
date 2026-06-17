@@ -183,7 +183,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := types.Job{
-		ID:       newID("job-"),
+		ID:       jobIDFor(r),
 		Model:    req.Model,
 		Messages: toDomainMessages(req.Messages),
 		Tools:    toDomainTools(req.Tools),
@@ -197,7 +197,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if mode == modeStateful {
 		hist, err := s.sessionMgr.History(r.Context(), sessionID, key.ID)
 		if err != nil {
-			s.writeSessionLookupError(w, err)
+			s.writeSessionLookupError(r, w, err)
 			return
 		}
 		// The reconstructed context is stored history followed by this turn's new
@@ -251,14 +251,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // lacks this one's context). The assistant reply is stored even when empty
 // (e.g. a pure tool_calls turn) so the conversation stays well-formed.
 func (s *Server) persistTurn(ctx context.Context, sessionID, ownerKeyID string, newMessages []chatMessage, output string, toolCalls []types.ToolCall) {
+	log := s.reqLog(ctx)
 	for _, m := range toDomainMessages(newMessages) {
 		if err := s.sessionMgr.AppendTurn(ctx, sessionID, ownerKeyID, m); err != nil {
-			s.log.Warn("session append (request turn) failed", "session", sessionID, "err", err)
+			log.Warn("session append (request turn) failed", "session", sessionID, "err", err)
 		}
 	}
 	assistant := types.Message{Role: "assistant", Content: output, ToolCalls: toolCalls}
 	if err := s.sessionMgr.AppendTurn(ctx, sessionID, ownerKeyID, assistant); err != nil {
-		s.log.Warn("session append (assistant turn) failed", "session", sessionID, "err", err)
+		log.Warn("session append (assistant turn) failed", "session", sessionID, "err", err)
 	}
 }
 
@@ -312,7 +313,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 			// Mid-stream failure: emit a terminal error frame then [DONE] so the
 			// client's stream parser ends cleanly rather than hanging. Do NOT persist
 			// a partial turn for a failed stream.
-			s.writeChatErrorFrame(w, flusher, id, created, model, chunk.Err)
+			s.writeChatErrorFrame(r, w, flusher, id, created, model, chunk.Err)
 			failed = true
 			break
 		}
@@ -363,8 +364,8 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 // "error" so a client streaming the response observes a clean termination on an
 // upstream failure (after headers are already sent, a JSON error is no longer
 // an option). The actual error code is logged server-side.
-func (s *Server) writeChatErrorFrame(w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, jerr *types.JobError) {
-	s.log.Warn("chat stream failed mid-stream", "code", jerr.Code, "err", jerr.Message)
+func (s *Server) writeChatErrorFrame(r *http.Request, w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, jerr *types.JobError) {
+	s.reqLog(r.Context()).Warn("chat stream failed mid-stream", "code", jerr.Code, "err", jerr.Message)
 	fr := "error"
 	writeSSEData(w, flusher, chatChunkResponse{
 		ID:      id,

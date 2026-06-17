@@ -69,7 +69,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	sess, err := s.sessionMgr.Create(r.Context(), key.ID, req.Model)
 	if err != nil {
-		s.log.Error("session create failed", "key_id", key.ID, "err", err)
+		s.reqLog(r.Context()).Error("session create failed", "key_id", key.ID, "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create session")
 		return
 	}
@@ -98,14 +98,14 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sess, err := s.sessionMgr.Get(r.Context(), id, key.ID)
 	if err != nil {
-		s.writeSessionLookupError(w, err)
+		s.writeSessionLookupError(r, w, err)
 		return
 	}
 	hist, err := s.sessionMgr.History(r.Context(), id, key.ID)
 	if err != nil {
 		// The session existed a moment ago; a not-found here means it was deleted
 		// or expired between the two reads — treat it the same as a missing session.
-		s.writeSessionLookupError(w, err)
+		s.writeSessionLookupError(r, w, err)
 		return
 	}
 
@@ -134,7 +134,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 
 	id := r.PathValue("id")
 	if err := s.sessionMgr.Delete(r.Context(), id, key.ID); err != nil {
-		s.writeSessionLookupError(w, err)
+		s.writeSessionLookupError(r, w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -155,12 +155,13 @@ func (s *Server) sessionsEnabled(w http.ResponseWriter) bool {
 // writeSessionLookupError maps a session lookup/mutation error to its HTTP
 // status. ErrSessionNotFound (missing, not-owned, or expired) is a uniform 404
 // so existence never leaks across owners; anything else is a server fault (500)
-// and is logged with the underlying cause.
-func (s *Server) writeSessionLookupError(w http.ResponseWriter, err error) {
+// and is logged with the underlying cause via the request-scoped logger (so the
+// line carries request_id).
+func (s *Server) writeSessionLookupError(r *http.Request, w http.ResponseWriter, err error) {
 	if errors.Is(err, session.ErrSessionNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
-	s.log.Error("session lookup failed", "err", err)
+	s.reqLog(r.Context()).Error("session lookup failed", "err", err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
 }
