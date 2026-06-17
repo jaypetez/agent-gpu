@@ -11,5 +11,25 @@ updates:
       - infra
       - chore
 
-  # TODO: add the application language ecosystem once chosen in #1
-  #       (e.g. gomod / cargo) and `docker` once Dockerfiles land in #17.
+  # Keep Go module dependencies up to date (routine version updates; security
+  # updates flow separately via the GitHub Advisory Database).
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+    labels:
+      - dependencies
+
+  # Keep the Dockerfile base images (the golang builder + distroless runtimes)
+  # current; digests stay pinned for the Scorecard pinned-dependencies check.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - infra
+      - chore
