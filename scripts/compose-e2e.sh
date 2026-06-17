@@ -92,13 +92,13 @@ parse_token() { printf '%s\n' "$1" | sed -n 's/^Token: //p'; }
 # /data volume but is not seen by the ALREADY-RUNNING server until it reloads.
 # We therefore create BOTH keys now and restart the server once (next step) so it
 # picks them up — which doubles as the persistence proof. See docs/docker.md.
-log "create admin + user keys (written to the /data volume)"
-admin_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-admin --role admin)"
+log "create admin + user keys with --local (written to the /data volume)"
+admin_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-admin --role admin --local)"
 printf '%s\n' "$admin_out"
 ADMIN_TOKEN="$(parse_token "$admin_out")"
 [ -n "$ADMIN_TOKEN" ] || fail "could not parse admin token from key create output"
 
-user_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-user --role user --allow-model "$MODEL")"
+user_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-user --role user --allow-model "$MODEL" --local)"
 printf '%s\n' "$user_out"
 USER_TOKEN="$(parse_token "$user_out")"
 [ -n "$USER_TOKEN" ] || fail "could not parse user token from key create output"

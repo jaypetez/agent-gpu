@@ -18,7 +18,7 @@ func TestKeyCreateWithPerms(t *testing.T) {
 	run := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		full := append(args, "--store", path)
+		full := append(args, "--local", "--store", path)
 		if err := runKeyCmd(ctx, &out, full); err != nil {
 			t.Fatalf("runKeyCmd %v: %v", args, err)
 		}
@@ -54,7 +54,7 @@ func TestKeyPermsSubcommand(t *testing.T) {
 	run := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		full := append(args, "--store", path)
+		full := append(args, "--local", "--store", path)
 		if err := runKeyCmd(ctx, &out, full); err != nil {
 			t.Fatalf("runKeyCmd %v: %v", args, err)
 		}
@@ -86,7 +86,7 @@ func TestKeyPermsSubcommand(t *testing.T) {
 func TestKeyPermsRequiresID(t *testing.T) {
 	t.Parallel()
 	var out bytes.Buffer
-	err := runKeyCmd(context.Background(), &out, []string{"perms", "--role", "user", "--store", filepath.Join(t.TempDir(), "k.json")})
+	err := runKeyCmd(context.Background(), &out, []string{"perms", "--role", "user", "--local", "--store", filepath.Join(t.TempDir(), "k.json")})
 	if err == nil {
 		t.Fatal("expected error when id omitted")
 	}

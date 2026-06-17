@@ -68,24 +68,85 @@ go install github.com/jaypetez/agent-gpu/cmd/agentgpu@latest
 
 ## Quickstart
 
-> Pre-1.0: commands below reflect the intended CLI surface ([tracked here](https://github.com/jaypetez/agent-gpu/issues/19)).
-
 ```bash
-# 1. Start the server
+# 1. Bootstrap the first admin key into the on-disk store BEFORE the server runs.
+#    --local writes the key file directly; the server loads it at boot.
+agentgpu key create --name bootstrap --role admin --local
+#    -> prints a one-time token; save it.
+
+# 2. Start the server (it reads the store written above).
 agentgpu server start
 
-# 2. Start a worker on a machine with Ollama installed
-agentgpu worker start --server http://SERVER_HOST:PORT
+# 3. Start a worker on a machine with Ollama installed (gRPC host:port).
+agentgpu worker start --server SERVER_HOST:50051
 
-# 3. Create an API key
-agentgpu key create --name my-agent
+# 4. Point the CLI at the running server and mint a user key over the admin API.
+export AGENTGPU_HTTP_ADDR=http://SERVER_HOST:8080
+export AGENTGPU_TOKEN=<the admin token from step 1>
+agentgpu key create --name my-agent --role user      # -> prints the user token
+agentgpu models list                                 # the permitted catalog
 
-# 4. Make a request (OpenAI-compatible)
-curl http://SERVER_HOST:PORT/v1/chat/completions \
-  -H "Authorization: Bearer $AGENTGPU_KEY" \
+# 5. Make a request (OpenAI-compatible) with the user token.
+curl http://SERVER_HOST:8080/v1/chat/completions \
+  -H "Authorization: Bearer $AGENTGPU_USER_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"llama3","messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+After step 4 the CLI manages the **running** server over its HTTP admin API, so
+`key revoke`, `quota set`, and permission changes take effect immediately (no
+restart). See [CLI](#cli) for the full command reference.
+
+### CLI
+
+`agentgpu` is a single binary with subcommands. `server start` and `worker start`
+run the long-lived processes; `key`, `quota`, and `models` are operator commands.
+
+By default the operator commands act against a **running server** over its public
+HTTP admin API, so changes are immediate. Configure the target with
+flag > environment > default:
+
+| Flag | Environment | Default | Purpose |
+| --- | --- | --- | --- |
+| `--server` / `--url` | `AGENTGPU_HTTP_ADDR` | `http://127.0.0.1:8080` | HTTP API base URL |
+| `--token` | `AGENTGPU_TOKEN` | _(none)_ | admin Bearer token |
+| `--store` | `AGENTGPU_STORE_PATH` | `~/.agentgpu/keys.json` | on-disk keys file (used with `--local`) |
+
+```bash
+# Keys (against a running server; needs an admin --token / $AGENTGPU_TOKEN)
+agentgpu key create --name app --role user [--allow-model m] [--deny-model m]
+agentgpu key list
+agentgpu key revoke <id>          # invalidates the key immediately
+agentgpu key rotate <id>          # new one-time token; old token stops working
+agentgpu key perms <id> --role user --allow-model llama3
+
+# Quotas (immediate, enforced updates)
+agentgpu quota set <id> --rpm 60 --tpm 1000 [--daily-tokens N] [--monthly-tokens N]
+agentgpu quota set <id> --clear   # revert to the global defaults
+agentgpu quota show <id>          # usage vs limits
+
+# Catalog
+agentgpu models list              # operator table (NAME, DIGEST, WORKERS)
+agentgpu models list --json       # raw /models JSON
+agentgpu models list --openai     # OpenAI-canonical /v1/models JSON
+```
+
+**Offline bootstrap.** Before any server is running there is no admin token to
+authenticate with, so mint the first admin key directly into the on-disk store
+with `--local` (as in step 1 above). `--local` works without a server or token;
+because the server only reads the store at boot, a `--local` change to an
+already-running server takes effect after a restart. Use the HTTP mode (a
+`--token`) to manage a live server. The `key` and `quota` commands accept
+`--local`; `models list` is HTTP-only (the catalog only exists on a running
+server).
+
+The created/rotated **token is printed exactly once** and is never stored or
+shown again; `key list` shows metadata only and never a secret.
+
+Commands return distinct exit codes so scripts can branch: `0` success
+(including `--help`), `1` general error, `2` usage error, `3` auth failure
+(401/403), `4` not found (404), `5` could not reach the server. Run
+`agentgpu <command> --help` for per-command flags.
 
 ### Run with Docker
 
