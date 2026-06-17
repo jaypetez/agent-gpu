@@ -207,3 +207,12 @@ Prefer extending an existing harness over writing a new one from scratch:
 
 A small shared helper to avoid copy-paste is fine; avoid risky cross-package refactors of the
 existing harness files.
+
+## Load and performance testing
+
+Functional correctness is covered here; **throughput and latency** are covered by the
+`agentgpu loadtest` harness — see [Load testing](load-testing.md). It drives the inference
+endpoints under configurable concurrency and reports throughput, latency percentiles
+(p50/p95/p99/p99.9), and a status-code breakdown, with a reproducible in-process baseline
+(`make loadtest`). CI runs it as a functional smoke (it asserts a run completes and produces
+sensible numbers), never as a performance gate.

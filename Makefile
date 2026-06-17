@@ -105,6 +105,10 @@ compose-clean: ## Stop the stack and REMOVE volumes (clean teardown)
 compose-e2e: ## Bring the stack up and run a full bootstrap + inference smoke test
 	AGENTGPU_MODEL=$(MODEL) COMPOSE="$(COMPOSE)" ./scripts/compose-e2e.sh
 
+.PHONY: loadtest
+loadtest: ## Run the reproducible in-process load-test baseline (no Ollama/GPU needed)
+	$(GO) run ./cmd/agentgpu loadtest --mode inproc --workers 2 --concurrency 16 --requests 2000 --endpoint chat
+
 .PHONY: help
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
