@@ -85,7 +85,7 @@ func TestChatCompletionStreamingThroughOllama(t *testing.T) {
 	t.Cleanup(gs.Stop)
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, discard, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, nil, discard, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	t.Cleanup(ts.Close)
 

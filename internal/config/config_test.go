@@ -60,6 +60,54 @@ func TestResolveServer(t *testing.T) {
 			t.Fatalf("HTTPListen = %q, want flag value", got.HTTPListen)
 		}
 	})
+	t.Run("metrics listen default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveServer(ServerConfig{}, env(nil))
+		if got.MetricsListen != DefaultMetricsListen {
+			t.Fatalf("MetricsListen = %q, want default %q", got.MetricsListen, DefaultMetricsListen)
+		}
+	})
+	t.Run("metrics listen env overrides default", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveServer(ServerConfig{}, env(map[string]string{EnvMetricsListen: "0.0.0.0:9100"}))
+		if got.MetricsListen != "0.0.0.0:9100" {
+			t.Fatalf("MetricsListen = %q, want env value", got.MetricsListen)
+		}
+	})
+	t.Run("metrics listen flag wins over env", func(t *testing.T) {
+		t.Parallel()
+		got := ResolveServer(ServerConfig{MetricsListen: "1.2.3.4:9"}, env(map[string]string{EnvMetricsListen: "0.0.0.0:9100"}))
+		if got.MetricsListen != "1.2.3.4:9" {
+			t.Fatalf("MetricsListen = %q, want flag value", got.MetricsListen)
+		}
+	})
+	t.Run("metrics listen disabled sentinel survives resolution", func(t *testing.T) {
+		t.Parallel()
+		// The cmd layer maps an explicit "off" to the sentinel; ResolveServer must
+		// not refill it from env/default, and MetricsListenAddr maps it back to "".
+		got := ResolveServer(ServerConfig{MetricsListen: MetricsListenDisabled}, env(map[string]string{EnvMetricsListen: "0.0.0.0:9100"}))
+		if got.MetricsListen != MetricsListenDisabled {
+			t.Fatalf("MetricsListen = %q, want the disable sentinel %q preserved", got.MetricsListen, MetricsListenDisabled)
+		}
+		if addr := MetricsListenAddr(got.MetricsListen); addr != "" {
+			t.Fatalf("MetricsListenAddr(sentinel) = %q, want empty (disabled)", addr)
+		}
+	})
+}
+
+// TestMetricsListenAddr covers the sentinel→address mapping the lifecycle layer
+// uses: the disable sentinel becomes empty (off); any other value passes through.
+func TestMetricsListenAddr(t *testing.T) {
+	t.Parallel()
+	if got := MetricsListenAddr(MetricsListenDisabled); got != "" {
+		t.Errorf("MetricsListenAddr(disabled) = %q, want empty", got)
+	}
+	if got := MetricsListenAddr("127.0.0.1:9090"); got != "127.0.0.1:9090" {
+		t.Errorf("MetricsListenAddr(addr) = %q, want passthrough", got)
+	}
+	if got := MetricsListenAddr(""); got != "" {
+		t.Errorf("MetricsListenAddr(empty) = %q, want empty", got)
+	}
 }
 
 func TestResolveHTTPAddr(t *testing.T) {

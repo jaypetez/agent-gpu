@@ -89,17 +89,22 @@ func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// incGlobalThrottled / incKeyThrottled bump the throttle counters under rlMu.
+// incGlobalThrottled / incKeyThrottled bump the throttle counters under rlMu and
+// the Prometheus throttled_total{scope} counter (#24). The Prometheus increment
+// is at the rejection site so it is a true monotonic counter, and is nil-safe so
+// a Server built without metrics is unaffected.
 func (s *Server) incGlobalThrottled() {
 	s.rlMu.Lock()
 	s.globalThrottled++
 	s.rlMu.Unlock()
+	s.metrics.IncThrottle("global")
 }
 
 func (s *Server) incKeyThrottled() {
 	s.rlMu.Lock()
 	s.keyThrottled++
 	s.rlMu.Unlock()
+	s.metrics.IncThrottle("key")
 }
 
 // quotaNow reads the engine clock so Retry-After is computed against the same

@@ -26,7 +26,7 @@ func newTestServer(t *testing.T) *httpapi.Server {
 	grpcSrv := server.New(server.WithLogger(discard), server.WithStore(st), server.WithAuthorizer(az))
 	authSvc := auth.NewService(st)
 	// Port 0 lets the kernel pick a free port so parallel runs don't collide.
-	return httpapi.NewServer(grpcSrv, authSvc, az, nil, discard, "127.0.0.1:0")
+	return httpapi.NewServer(grpcSrv, authSvc, az, nil, nil, discard, "127.0.0.1:0")
 }
 
 // TestShutdownBeforeListenAndServe proves that Shutdown is a clean no-op when

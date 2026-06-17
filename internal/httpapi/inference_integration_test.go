@@ -143,7 +143,7 @@ func newInferenceHarnessWith(t *testing.T, exec *scriptedExecutor, model string,
 	t.Cleanup(gs.Stop)
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, discard, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, nil, discard, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	t.Cleanup(ts.Close)
 
@@ -547,7 +547,7 @@ func TestChatCompletionForbiddenModel(t *testing.T) {
 	defer func() { _ = grpcSrv.Close() }()
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, discard, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, nil, nil, discard, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	defer ts.Close()
 

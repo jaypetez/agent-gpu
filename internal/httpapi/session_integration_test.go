@@ -170,7 +170,7 @@ func buildSessionHarness(t *testing.T, model string, execs []namedExecutor) sess
 	t.Cleanup(gs.Stop)
 
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, mgr, discard, "")
+	httpSrv := httpapi.NewServer(grpcSrv, authSvc, az, mgr, nil, discard, "")
 	ts := httptest.NewServer(httpSrv.Handler())
 	t.Cleanup(ts.Close)
 

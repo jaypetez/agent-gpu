@@ -65,6 +65,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db0
 # home entry here. Override any of these at `docker run` time with -e.
 ENV AGENTGPU_HTTP_LISTEN=0.0.0.0:8080 \
     AGENTGPU_SERVER_LISTEN=0.0.0.0:50051 \
+    AGENTGPU_METRICS_LISTEN=0.0.0.0:9090 \
     AGENTGPU_STORE_PATH=/data/keys.json \
     AGENTGPU_QUOTA_PATH=/data/quota.json \
     AGENTGPU_SESSION_PATH=/data/sessions.json \
@@ -79,8 +80,9 @@ COPY --from=builder --chown=65532:65532 /out/data /data
 USER 65532:65532
 WORKDIR /data
 VOLUME ["/data"]
-# 8080 = public OpenAI-compatible HTTP API; 50051 = gRPC control plane (workers).
-EXPOSE 8080 50051
+# 8080 = public OpenAI-compatible HTTP API; 50051 = gRPC control plane (workers);
+# 9090 = Prometheus /metrics (unauthenticated operational port — see docs/metrics.md).
+EXPOSE 8080 50051 9090
 
 ENTRYPOINT ["/agentgpu"]
 CMD ["server", "start"]

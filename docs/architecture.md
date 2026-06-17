@@ -283,8 +283,9 @@ The formal OpenAPI 3.1 spec for these endpoints lives at [`openapi.yaml`](../ope
 `GET /v1/admin/stats` (#10) is the operator-facing monitoring view: one consolidated JSON document
 combining three live snapshots, read on every request (no caching) so the numbers track the fleet in
 near-real-time. It is admin-gated like every other admin route (non-admin `403`, unauthenticated
-`401`) and exposes no secrets. The same accessors are the instrumentation seam the Prometheus
-`/metrics` endpoint (#24) will scrape.
+`401`) and exposes no secrets. The same accessors are the instrumentation the Prometheus `/metrics`
+endpoint (#24) scrapes at scrape time (see [metrics.md](metrics.md)); the admin stats JSON and the
+metrics exposition are two views over one source of truth.
 
 - **Queue depth** — `Server.QueueStats()` returns `queue.Stats{Total, ByPriority}`: the global pending
   count and a per-priority breakdown. A growing backlog (jobs submitted while no worker can run them)
@@ -302,8 +303,10 @@ near-real-time. It is admin-gated like every other admin route (non-admin `403`,
   deliberately **excluded** from the distribution. In the response: `wait_time.{count, sum_ms, max_ms,
   mean_ms, buckets[]}`, where `mean_ms = sum_ms / count` (`0` when `count == 0`).
 
-Prometheus export (a registry and a `/metrics` endpoint scraping these accessors) is **out of scope**
-here and deferred to #24; #10 provides the instrumentation and the JSON view over it.
+Prometheus export (a registry and a `/metrics` endpoint scraping these accessors) lands in #24: a
+custom collector reads `QueueStats`/`Fleet`/`WaitTimeStats`/`AffinityStats` at scrape time and the
+HTTP layer meters request count/latency, tokens, and throttles. See [metrics.md](metrics.md). #10
+provides the instrumentation and the JSON view over it.
 
 ## Capacity-aware scheduling
 
@@ -359,7 +362,8 @@ preference, not a hard pin**:
   session (first-turn or rebind). A bind error is logged and **never fails the inference turn**.
 - **Affinity metric.** `Server.AffinityStats()` exposes mutex-guarded `Hits`/`Misses`: a **hit** when a
   turn routes back to its bound worker, a **miss** when it rebinds to a different one. A session's first
-  turn (no prior binding) and any session-less job count neither. It is the metrics seam for #24.
+  turn (no prior binding) and any session-less job count neither. The Prometheus collector (#24)
+  exports it as `agentgpu_affinity_total{result}` (see [metrics.md](metrics.md)).
 
 ### Fit approximation (no model-size data yet)
 
@@ -407,8 +411,9 @@ events are logged via structured `slog` (`key_id`, `model`, `priority`, `reason`
   but the scheduler still uses the `FreeVRAM > 0` approximation rather than comparing against each
   model's actual VRAM footprint. Per-model VRAM-fit is future work; a CPU-only worker (free VRAM `0`)
   is therefore not chosen for a *not-yet-loaded* model, only for one it already has resident.
-- **Metrics export.** Queue depth and per-worker load become Prometheus metrics in #24; today they
-  are plain methods (`QueueStats`) and structured logs.
+- **Metrics export.** Queue depth and per-worker load are exported as Prometheus metrics by the #24
+  collector (`agentgpu_queue_depth`, `agentgpu_worker_gpu_utilization`, …) reading these same plain
+  methods (`QueueStats`/`Fleet`) at scrape time. See [metrics.md](metrics.md).
 
 ## Job queue
 
@@ -431,8 +436,8 @@ the dispatch path here.
   (returns `ctx.Err()`), or the queue is closed (returns `ErrClosed`) — the seam the scheduler loop
   parks on.
 - **Observable depth.** `Len()` returns the total pending count and `Stats()` returns the total plus
-  a per-priority breakdown. (Prometheus export is #24; the queue exposes plain methods, not a metrics
-  hook.)
+  a per-priority breakdown. (The queue exposes plain methods, not a metrics hook; the #24 collector
+  reads `Stats()` via `Server.QueueStats()` at scrape time — see [metrics.md](metrics.md).)
 - **Concurrency.** All state is guarded by a single mutex paired with a condition variable, so
   enqueue and dequeue are fully atomic: under concurrency no job is lost and none is dequeued twice.
   `Close()` wakes every blocked waiter and is idempotent.
@@ -735,8 +740,9 @@ quota engine's clock (deterministic under an injected clock in tests):
 ### Throttle metrics
 
 Throttling is counted on the HTTP server and exposed via `RateLimitStats() {GlobalThrottled,
-KeyThrottled}` (mutex-guarded counters, mirroring `server.AffinityStats` / `QueueStats`) — the seam
-the metrics epic (#24, Prometheus export) will read; no Prometheus export ships here. Each throttle
+KeyThrottled}` (mutex-guarded counters, mirroring `server.AffinityStats` / `QueueStats`). The #24
+Prometheus layer also increments `agentgpu_throttled_total{scope}` at the same rejection sites, so
+the throttle count is a true counter in the exposition (see [metrics.md](metrics.md)). Each throttle
 also logs a `slog` `Warn` carrying `scope` (`global`/`key`), `key_id`, and `retry_after` — never a
 secret or token.
 
@@ -956,9 +962,11 @@ the lever if verbose logging is ever added.
 
 ### Metrics
 
-Metrics export is **out of scope** here (#24). Queue depth, affinity hit/miss, time-in-queue, and
-throttle counts are exposed today as plain accessor methods (`QueueStats`, `AffinityStats`,
-`WaitTimeStats`, `RateLimitStats`) and structured logs; #24 turns them into Prometheus metrics.
+Metrics export is **out of scope** for this logging epic (#23) and lives in #24. Queue depth,
+affinity hit/miss, time-in-queue, and throttle counts are exposed as plain accessor methods
+(`QueueStats`, `AffinityStats`, `WaitTimeStats`, `RateLimitStats`); the #24 Prometheus layer turns
+them into a scrapeable `/metrics` exposition (request count/latency, tokens, GPU/VRAM/uptime per
+worker, queue depth, throttles) on a dedicated listener. See [metrics.md](metrics.md).
 
 ## State
 

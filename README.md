@@ -190,6 +190,7 @@ container itself) — use the Ollama service name or `host.docker.internal`. See
 
 - [Architecture](docs/architecture.md)
 - [Running with Docker](docs/docker.md)
+- [Metrics (Prometheus)](docs/metrics.md)
 - [Testing](docs/testing.md) · [Load testing](docs/load-testing.md)
 - [Releasing](docs/releasing.md)
 - [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Changelog](CHANGELOG.md)
