@@ -206,10 +206,11 @@ parser ends cleanly rather than hanging.
 ### Out of scope / seams
 
 The formal OpenAPI 3.1 spec (#14) lives at [`openapi.yaml`](../openapi.yaml) (validated and rendered
-in CI by the `openapi` job); the typed `code`s, the `usage` object, and the unplumbed inference
-parameters are the seams it documents. Per-key quota is enforced (and `429`-mapped) because
-`SubmitAuthorizedJob*` reserves against it, and the inference routes are fronted by the global rate
-limiter with `Retry-After` on every `429` (see [Rate limiting](#rate-limiting)).
+in CI by the `openapi` job; the human-readable [API Reference](api-reference.md) is generated from
+it); the typed `code`s, the `usage` object, and the unplumbed inference parameters are the seams it
+documents. Per-key quota is enforced (and `429`-mapped) because `SubmitAuthorizedJob*` reserves
+against it, and the inference routes are fronted by the global rate limiter with `Retry-After` on
+every `429` (see [Rate limiting](#rate-limiting)).
 
 ## Admin API
 

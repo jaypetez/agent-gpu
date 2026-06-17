@@ -1,0 +1,72 @@
+name: Pages
+
+# Publishes the human-readable API reference to GitHub Pages. The reference is the
+# Redoc render of the OpenAPI 3.1 spec (openapi.yaml) — the SAME artifact the
+# `openapi` job in ci.yml builds and `make openapi-docs` produces locally — so the
+# hosted reference regenerates from the spec on every push to main and never needs
+# a manual edit. It is rendered into _site/index.html so the Pages site root shows
+# the reference.
+#
+# This workflow only runs on push to main (and manual dispatch), so it does NOT run
+# in pull-request CI; the deploy is verifiable only after merge, once Pages is
+# enabled for the repository (Settings → Pages → Source: GitHub Actions).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege at the top level; the deploy job opts into the extra scopes the
+# Pages deployment needs.
+permissions:
+  contents: read
+
+# Allow only one concurrent Pages deployment; do not cancel an in-progress run so a
+# deploy always finishes cleanly.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write # deploy to GitHub Pages
+      id-token: write # OIDC token the deploy step verifies
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          # A Pages deploy needs network egress (artifact upload + deploy API), so
+          # audit rather than block here.
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Render OpenAPI docs (Redoc) into the site root
+        # Same pinned Redocly image as ci.yml's `openapi` job and `make openapi-docs`,
+        # so the hosted reference is byte-for-byte the locally rendered one. Output is
+        # _site/index.html so the Pages root serves the reference.
+        uses: docker://redocly/cli:2.33.2@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
+        env:
+          REDOCLY_TELEMETRY: "off"
+        with:
+          args: build-docs openapi.yaml -o _site/index.html
+
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

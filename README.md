@@ -195,7 +195,7 @@ container itself) — use the Ollama service name or `host.docker.internal`. See
 - [Releasing](docs/releasing.md)
 - [Contributing](CONTRIBUTING.md) · [Support](SUPPORT.md) · [Changelog](CHANGELOG.md)
 - Developer Guide — see [#26](https://github.com/jaypetez/agent-gpu/issues/26)
-- API Reference — see [#27](https://github.com/jaypetez/agent-gpu/issues/27)
+- [API Reference](docs/api-reference.md)
 
 ## Project status
 
