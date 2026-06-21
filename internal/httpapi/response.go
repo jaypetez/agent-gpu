@@ -50,9 +50,7 @@ func openAIErrorType(status int) string {
 		http.StatusUnprocessableEntity:
 		return "invalid_request_error"
 	}
-	if status >= 500 {
-		return "server_error"
-	}
+	// Everything else (notably 5xx and any unmapped status) is a server fault.
 	return "server_error"
 }
 
