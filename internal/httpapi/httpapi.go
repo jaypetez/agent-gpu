@@ -137,6 +137,14 @@ type Server struct {
 	// before/after projection omits SecretHash/Salt; see admin_audit.go).
 	auditLog *audit.MemoryStore
 
+	// config is the runtime settings/config holder backing GET/PUT
+	// /v1/admin/config (#92): the current tunable values plus the injected appliers
+	// that push a PUT change into the live subsystems. It is nil-safe — when no
+	// runtime config is wired (WithRuntimeConfig not supplied) the config endpoints
+	// return 503, mirroring how the session endpoints gate on a nil manager — and is
+	// set in NewServer when the option is supplied. These settings carry no secrets.
+	config *runtimeConfig
+
 	// idempotency caches the response of an admin WRITE keyed by its
 	// Idempotency-Key header so a duplicate request within the TTL replays the
 	// prior response instead of re-running the mutation (#90). It is constructed
@@ -308,6 +316,11 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /v1/admin/workers/{id}/drain", s.requireScopeWrite(authz.ScopeWorkersWrite, s.handleAdminDrainWorker))
 	mux.Handle("GET /v1/admin/stats", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminStats))
 	mux.Handle("GET /v1/admin/audit", s.requireScope(authz.ScopeAuditRead, s.handleAdminAudit))
+	// Settings/config management (#92): the effective resolved settings (config:read)
+	// and a partial live hot-reload update (config:write, which additionally layers
+	// idempotency + audit via requireScopeWrite).
+	mux.Handle("GET /v1/admin/config", s.requireScope(authz.ScopeConfigRead, s.handleAdminGetConfig))
+	mux.Handle("PUT /v1/admin/config", s.requireScopeWrite(authz.ScopeConfigWrite, s.handleAdminPutConfig))
 }
 
 // ListenAndServe binds s.listen and serves until the listener is closed or

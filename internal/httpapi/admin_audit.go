@@ -93,6 +93,7 @@ const (
 	auditOpKeyPermissions = "key.permissions"
 	auditOpKeyQuota       = "key.quota"
 	auditOpWorkerDrain    = "worker.drain"
+	auditOpConfigUpdate   = "config.update"
 )
 
 // handleAdminAudit serves GET /v1/admin/audit (#91): the queryable read seam over

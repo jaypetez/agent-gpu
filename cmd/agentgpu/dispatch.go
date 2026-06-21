@@ -26,9 +26,10 @@ func dispatch(args []string) error {
 	// ReplaceAttr and JSON-by-default encoding live in newLoggerHandle so they
 	// apply uniformly to every subsystem that takes this logger. The handle also
 	// carries the dynamic level var and the in-memory log ring (#90 foundation for
-	// the log-stream/level admin endpoints in #92/#99); they are live in-process
-	// here (every record is buffered) even though no HTTP endpoint reads them yet.
-	// A file sink (if any) is closed on the way out so its buffer is flushed.
+	// the log-stream/level admin endpoints): the server command threads the handle
+	// to the admin config endpoint, which flips the level at runtime via
+	// logHandle.SetLevel (#92); the in-memory ring awaits the log-stream endpoint
+	// (#99). A file sink (if any) is closed on the way out so its buffer is flushed.
 	lh, err := newLoggerHandle(config.ResolveLog(config.LogConfig{}, nil))
 	if err != nil {
 		return err
@@ -39,7 +40,10 @@ func dispatch(args []string) error {
 
 	switch args[0] {
 	case "server":
-		return runServerCmd(ctx, logger, args[1:])
+		// The server passes the whole log handle (not just the logger) so the admin
+		// config endpoint (#92) can flip the dynamic log level at runtime via
+		// logHandle.SetLevel — the seam #90 wired here at the single logging site.
+		return runServerCmd(ctx, lh, args[1:])
 	case "worker":
 		return runWorkerCmd(ctx, logger, args[1:])
 	case "key":
