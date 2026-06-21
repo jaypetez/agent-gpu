@@ -917,6 +917,72 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/gpus:
+    get:
+      operationId: adminGetGPUs
+      summary: Get fleet GPU capacity inventory
+      description: |
+        Returns an aggregated, read-only GPU/fleet capacity inventory derived live from the worker
+        heartbeat snapshot — it performs **no new GPU probing** and reuses the same per-worker
+        capacity fields the worker endpoints expose. The response has three sections: `fleet` (the
+        roll-up: worker count, summed total/free VRAM in bytes, and the mean/max of the coarse 0-100
+        per-worker load), `by_type` (workers grouped by their reported GPU type, with per-type worker
+        count and summed VRAM, sorted by `gpu_type`), and `workers` (the per-worker heatmap cells,
+        sorted by `id`). Both orderings are deterministic so the response is stable across calls over
+        the same snapshot.
+
+        Note that the control plane tracks GPU capacity only at the aggregate per-worker level, so a
+        heatmap "cell" is one **worker** (not one physical GPU) and `gpu_type` is the worker's reported
+        string (e.g. `2x NVIDIA GeForce RTX 4090`, or `cpu` for a GPU-less worker) grouped as-is. An
+        empty fleet yields zero aggregates and empty arrays with a `200`. Contains no secrets. Requires
+        the `workers:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The aggregated GPU/fleet capacity inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminGPUsResponse"
+              example:
+                fleet:
+                  worker_count: 2
+                  total_vram: 51539607552
+                  free_vram: 32212254720
+                  mean_load: 36
+                  max_load: 60
+                by_type:
+                  - gpu_type: 2x NVIDIA GeForce RTX 4090
+                    worker_count: 1
+                    total_vram: 51539607552
+                    free_vram: 30064771072
+                  - gpu_type: cpu
+                    worker_count: 1
+                    total_vram: 0
+                    free_vram: 0
+                workers:
+                  - id: worker-a
+                    gpu_type: 2x NVIDIA GeForce RTX 4090
+                    total_vram: 51539607552
+                    free_vram: 30064771072
+                    load: 60
+                    status: online
+                    active_jobs: 3
+                  - id: worker-b
+                    gpu_type: cpu
+                    total_vram: 0
+                    free_vram: 0
+                    load: 12
+                    status: online
+                    active_jobs: 0
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /v1/admin/stats:
     get:
       operationId: adminGetStats
@@ -2863,3 +2929,151 @@ components:
           format: int64
           minimum: 0
           description: The cumulative count of recorded waits less than or equal to `le_ms`.
+
+    AdminGPUsResponse:
+      type: object
+      description: |
+        The aggregated, read-only GPU/fleet capacity inventory returned by `GET /v1/admin/gpus`,
+        derived live from the heartbeat snapshot (no probing). Contains no secrets. All arrays are
+        present (empty, never null) for an empty fleet.
+      required:
+        - fleet
+        - by_type
+        - workers
+      properties:
+        fleet:
+          $ref: "#/components/schemas/AdminGPUFleet"
+        by_type:
+          type: array
+          description: Workers grouped by their reported GPU type, sorted by `gpu_type`.
+          items:
+            $ref: "#/components/schemas/AdminGPUByType"
+        workers:
+          type: array
+          description: |
+            The per-worker heatmap cells, sorted by `id`. A cell is one worker (not one physical
+            GPU): the control plane tracks GPU capacity only at the aggregate per-worker level.
+          items:
+            $ref: "#/components/schemas/AdminGPUCell"
+
+    AdminGPUFleet:
+      type: object
+      description: |
+        The fleet roll-up section: worker count, summed total/free VRAM (bytes) across the fleet, and
+        the load distribution (mean/max of the coarse 0-100 per-worker load).
+      required:
+        - worker_count
+        - total_vram
+        - free_vram
+        - mean_load
+        - max_load
+      properties:
+        worker_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of workers in the snapshot.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed total VRAM across all workers, in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed free VRAM across all workers, in bytes.
+        mean_load:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+          description: The mean coarse 0-100 load over the workers (0 when the fleet is empty).
+        max_load:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+          description: The single busiest worker's coarse 0-100 load (0 when the fleet is empty).
+
+    AdminGPUByType:
+      type: object
+      description: |
+        One by-GPU-type row: every worker reporting the same GPU type string folded into a worker
+        count and summed total/free VRAM for that type. The type string is the worker's reported value
+        verbatim (e.g. `cpu` for a GPU-less worker); it is not parsed into per-device counts.
+      required:
+        - gpu_type
+        - worker_count
+        - total_vram
+        - free_vram
+      properties:
+        gpu_type:
+          type: string
+          description: The reported GPU type string shared by the grouped workers.
+        worker_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of workers reporting this GPU type.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed total VRAM of the workers of this type, in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed free VRAM of the workers of this type, in bytes.
+
+    AdminGPUCell:
+      type: object
+      description: |
+        One heatmap cell: a single worker's capacity and utilization. A cell is per worker (not per
+        physical GPU) because the fleet snapshot tracks GPU capacity only at the aggregate per-worker
+        level.
+      required:
+        - id
+        - gpu_type
+        - total_vram
+        - free_vram
+        - load
+        - status
+        - active_jobs
+      properties:
+        id:
+          type: string
+          description: The worker id.
+        gpu_type:
+          type: string
+          description: The worker's reported GPU type.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The worker's total VRAM, in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The worker's free VRAM, in bytes.
+        load:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+          description: A coarse 0-100 utilization value.
+        status:
+          type: string
+          description: The worker's lifecycle state.
+          enum:
+            - online
+            - draining
+            - stale
+            - unknown
+        active_jobs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of jobs the worker is currently running.

@@ -224,6 +224,54 @@ type WorkerDetail struct {
 	UptimeSeconds int64    `json:"uptime_seconds,omitempty"`
 }
 
+// FleetCapacity is the GET /v1/admin/gpus response: an aggregated, read-only GPU
+// capacity inventory derived from the fleet heartbeat snapshot (no probing). It
+// mirrors httpapi.adminGPUsResponse. Fleet is the roll-up across all workers,
+// ByType groups workers by their reported GPU type, and Workers is the per-worker
+// (not per-device) heatmap cells. The slices are never nil (empty for an empty
+// fleet).
+type FleetCapacity struct {
+	Fleet   FleetCapacitySummary `json:"fleet"`
+	ByType  []GPUTypeCapacity    `json:"by_type"`
+	Workers []GPUWorkerCell      `json:"workers"`
+}
+
+// FleetCapacitySummary is the fleet roll-up section of FleetCapacity: worker
+// count, summed total/free VRAM (bytes), and the mean/max coarse 0-100 load over
+// the fleet. Mirrors httpapi.adminGPUFleet. Mean/Max are 0 for an empty fleet.
+type FleetCapacitySummary struct {
+	WorkerCount int    `json:"worker_count"`
+	TotalVRAM   uint64 `json:"total_vram"`
+	FreeVRAM    uint64 `json:"free_vram"`
+	MeanLoad    uint32 `json:"mean_load"`
+	MaxLoad     uint32 `json:"max_load"`
+}
+
+// GPUTypeCapacity is one by-GPU-type row of FleetCapacity: the reported GPU type
+// string, how many workers report it, and the summed total/free VRAM for that
+// type. Mirrors httpapi.adminGPUByType. The type string is the worker's reported
+// value verbatim (e.g. "cpu" for a GPU-less worker); it is not parsed for device
+// counts.
+type GPUTypeCapacity struct {
+	GPUType     string `json:"gpu_type"`
+	WorkerCount int    `json:"worker_count"`
+	TotalVRAM   uint64 `json:"total_vram"`
+	FreeVRAM    uint64 `json:"free_vram"`
+}
+
+// GPUWorkerCell is one heatmap cell of FleetCapacity: a single worker's
+// capacity/utilization (per worker, not per physical GPU). Mirrors
+// httpapi.adminGPUCell.
+type GPUWorkerCell struct {
+	ID         string `json:"id"`
+	GPUType    string `json:"gpu_type"`
+	TotalVRAM  uint64 `json:"total_vram"`
+	FreeVRAM   uint64 `json:"free_vram"`
+	Load       uint32 `json:"load"`
+	Status     string `json:"status"`
+	ActiveJobs uint32 `json:"active_jobs"`
+}
+
 // AuditEntry is one record of the admin audit log (GET /v1/admin/audit): who did
 // it (Actor key id), what (Op), to which resource (Target), the redacted
 // before/after metadata projection of the affected object, the request
@@ -441,6 +489,17 @@ func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
 func (c *Client) WorkerDetail(ctx context.Context, id string) (WorkerDetail, error) {
 	var out WorkerDetail
 	err := c.do(ctx, http.MethodGet, "/v1/admin/workers/"+url.PathEscape(id), nil, &out)
+	return out, err
+}
+
+// FleetCapacity returns the aggregated GPU/fleet capacity inventory (GET
+// /v1/admin/gpus): the fleet roll-up (worker count, summed total/free VRAM,
+// mean/max load), the by-GPU-type grouping, and the per-worker heatmap cells. It
+// is a live read over the heartbeat snapshot — no GPU probing — so it reflects the
+// fleet as of the call.
+func (c *Client) FleetCapacity(ctx context.Context) (FleetCapacity, error) {
+	var out FleetCapacity
+	err := c.do(ctx, http.MethodGet, "/v1/admin/gpus", nil, &out)
 	return out, err
 }
 

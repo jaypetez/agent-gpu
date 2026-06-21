@@ -327,6 +327,11 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /v1/admin/keys/{id}/quota", s.requireScope(authz.ScopeKeysRead, s.handleAdminGetQuota))
 	mux.Handle("GET /v1/admin/workers", s.requireScope(authz.ScopeWorkersRead, s.handleAdminListWorkers))
 	mux.Handle("GET /v1/admin/workers/{id}", s.requireScope(authz.ScopeWorkersRead, s.handleAdminGetWorker))
+	// Aggregated GPU/fleet capacity inventory (#94): a read-only roll-up over the
+	// same heartbeat capacity fields the worker endpoints expose (no new probing).
+	// Gated to workers:read — it is fleet capacity data, the same resource as the
+	// worker list.
+	mux.Handle("GET /v1/admin/gpus", s.requireScope(authz.ScopeWorkersRead, s.handleAdminGPUs))
 	mux.Handle("POST /v1/admin/workers/{id}/drain", s.requireScopeWrite(authz.ScopeWorkersWrite, s.handleAdminDrainWorker))
 	// Per-worker model management (#93): pull a model onto a worker / unload one
 	// from it. Gated to models:write (not workers:write) — they act on the model

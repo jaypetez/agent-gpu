@@ -102,6 +102,7 @@ func allAdminRoutes() []adminRoute {
 		{http.MethodGet, "/v1/admin/keys/abc/quota", ""},
 		{http.MethodGet, "/v1/admin/workers", ""},
 		{http.MethodGet, "/v1/admin/workers/abc", ""},
+		{http.MethodGet, "/v1/admin/gpus", ""},
 		{http.MethodPost, "/v1/admin/workers/abc/drain", ""},
 		{http.MethodPost, "/v1/admin/workers/abc/models", `{"model":"llama3"}`},
 		{http.MethodDelete, "/v1/admin/workers/abc/models/llama3", ""},
