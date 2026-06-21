@@ -184,11 +184,12 @@ func TestOpenAPISpecMatchesRegisteredRoutes(t *testing.T) {
 	registered := deriveRoutes(t, root)
 	documented := documentedRoutes(t, root)
 
-	// The project currently exposes exactly 29 public HTTP routes (28 + the
-	// dashboard telemetry GET /v1/admin/telemetry added in #98). Pin the count so an
-	// accidental over- or under-registration (or a parser regression that silently
-	// drops routes) is caught even if both sides happen to agree.
-	const wantRoutes = 29
+	// The project currently exposes exactly 31 public HTTP routes (29 + the log
+	// query GET /v1/admin/logs and its SSE live-tail GET /v1/admin/logs/stream added
+	// in #99). Pin the count so an accidental over- or under-registration (or a
+	// parser regression that silently drops routes) is caught even if both sides
+	// happen to agree.
+	const wantRoutes = 31
 	if len(registered) != wantRoutes {
 		t.Errorf("parsed %d registered routes from httpapi.go, want %d:\n%s",
 			len(registered), wantRoutes, formatRoutes(registered))

@@ -67,13 +67,35 @@ func (r *logRing) append(rec logRecord) {
 }
 
 // Snapshot returns a copy of the buffered records, oldest first. It is the read
-// seam a later admin endpoint (#92/#99) uses; here it backs the unit tests.
+// seam the admin log query endpoint (#99) uses; here it backs the unit tests.
 func (r *logRing) Snapshot() []logRecord {
 	if r.cap == 0 {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.snapshotLocked()
+}
+
+// SnapshotCount returns the buffered records (oldest first) AND the monotonic
+// total-appended count in ONE locked read, so the two are mutually consistent: the
+// records are exactly the newest min(count, cap) ever appended at the instant of
+// the call. The live-tail stream (#99) needs this atomicity — computing "new since
+// my cursor" from a SEPARATE Snapshot and Count call would race a concurrent
+// append (the snapshot and the count could reflect different totals), which would
+// duplicate or skip lines at the page boundary. Snapshot and Count remain
+// available for callers that need only one. Safe for concurrent use.
+func (r *logRing) SnapshotCount() ([]logRecord, uint64) {
+	if r.cap == 0 {
+		return nil, 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapshotLocked(), uint64(r.count)
+}
+
+// snapshotLocked copies the buffered records oldest-first. The caller must hold mu.
+func (r *logRing) snapshotLocked() []logRecord {
 	n := r.next
 	out := make([]logRecord, 0, r.cap)
 	if r.full {
@@ -98,6 +120,23 @@ func (r *logRing) Len() int {
 		return r.cap
 	}
 	return r.next
+}
+
+// Count returns the total number of records ever appended to the ring — a
+// monotonically increasing counter that never resets, NOT the (capped) number
+// currently buffered (that is Len). It is the cursor the live-tail stream
+// endpoint (#99) tracks: by remembering a prior Count and re-reading it each
+// poll, the stream learns how many new records arrived (and, when the delta
+// exceeds the buffer capacity, that some scrolled off). A disabled ring (zero
+// capacity) never appends, so its Count is always 0. Safe for concurrent use
+// (read under the same mutex append takes).
+func (r *logRing) Count() uint64 {
+	if r.cap == 0 {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return uint64(r.count)
 }
 
 // ringHandler is a slog.Handler that forwards every record to a wrapped terminal
