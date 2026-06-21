@@ -44,6 +44,25 @@ type APIKey struct {
 	// RevokedAt, when non-nil, marks the key as revoked; revoked keys never
 	// authenticate.
 	RevokedAt *time.Time
+	// Owner is an optional free-form label identifying the human or service that
+	// owns the key (e.g. an email or service name). It is descriptive metadata
+	// only — it does NOT grant identity or permissions (org/multi-tenancy is out
+	// of scope); the authorization layer ignores it. An empty string means unset.
+	Owner string
+	// Team is an optional free-form label grouping the key under a team or
+	// project. Like Owner it is descriptive metadata only and grants nothing. An
+	// empty string means unset.
+	Team string
+	// ExpiresAt, when non-nil, is the time after which the key no longer
+	// authenticates (a time-to-live). Authentication of an expired key fails with
+	// the same ErrUnauthenticated as a revoked/unknown key (no enumeration). A nil
+	// pointer means the key never expires — the pre-existing behavior.
+	ExpiresAt *time.Time
+	// CreatedBy is the opaque id of the actor (an admin key id) that created this
+	// key, captured for provenance/audit. An empty string means the creator was
+	// not recorded (e.g. a key minted outside the admin API), preserving the
+	// pre-existing behavior.
+	CreatedBy string
 	// Roles are the built-in role names granted to this key (e.g. "admin",
 	// "user", "read-only"). The authorization engine (#3) interprets them; the
 	// store only persists them.
@@ -88,6 +107,12 @@ type Limits struct {
 
 // Revoked reports whether the key has been revoked.
 func (k APIKey) Revoked() bool { return k.RevokedAt != nil }
+
+// Expired reports whether the key has a TTL (ExpiresAt) that has passed as of
+// now. A key with no ExpiresAt never expires. The auth engine treats an expired
+// key exactly like a revoked one — it fails authentication with
+// ErrUnauthenticated — so callers cannot distinguish the two (no enumeration).
+func (k APIKey) Expired(now time.Time) bool { return k.ExpiresAt != nil && now.After(*k.ExpiresAt) }
 
 // LogValue implements slog.LogValuer so that logging an APIKey (or a struct
 // embedding one) can NEVER leak secret material (#23). It returns a group of
@@ -135,7 +160,8 @@ func NewMemory() *Memory {
 }
 
 // cloneAPIKey returns a deep copy so that callers and the store never share
-// mutable backing arrays (the secret-hash/salt slices, the revoked pointer).
+// mutable backing arrays (the secret-hash/salt slices, the revoked/expiry
+// pointers).
 func cloneAPIKey(k APIKey) APIKey {
 	out := k
 	if k.SecretHash != nil {
@@ -147,6 +173,10 @@ func cloneAPIKey(k APIKey) APIKey {
 	if k.RevokedAt != nil {
 		t := *k.RevokedAt
 		out.RevokedAt = &t
+	}
+	if k.ExpiresAt != nil {
+		t := *k.ExpiresAt
+		out.ExpiresAt = &t
 	}
 	if k.Roles != nil {
 		out.Roles = append([]string(nil), k.Roles...)

@@ -120,10 +120,20 @@ func (s *Service) CreateWithPermissions(ctx context.Context, name string, perms 
 		SecretHash:  hash,
 		Salt:        salt,
 		CreatedAt:   s.now().UTC(),
+		Owner:       perms.Owner,
+		Team:        perms.Team,
+		CreatedBy:   perms.CreatedBy,
 		Roles:       perms.Roles,
 		AdminScopes: perms.AdminScopes,
 		AllowModels: perms.AllowModels,
 		DenyModels:  perms.DenyModels,
+	}
+	// Normalize the TTL to UTC and copy it so the caller and the store never share
+	// the pointer (matching the store's own deep-copy discipline). A nil ExpiresAt
+	// leaves the key non-expiring — the pre-existing behavior.
+	if perms.ExpiresAt != nil {
+		exp := perms.ExpiresAt.UTC()
+		rec.ExpiresAt = &exp
 	}
 	if err := s.store.PutAPIKey(ctx, rec); err != nil {
 		return "", store.APIKey{}, fmt.Errorf("auth: persist key: %w", err)
@@ -166,12 +176,32 @@ func (s *Service) Revoke(ctx context.Context, id string) error {
 }
 
 // Permissions are the role, admin-scope, and per-model allow/deny lists set on a
-// key. They are interpreted by internal/authz; this package only persists them.
+// key, plus optional descriptive metadata (Owner/Team labels), an optional TTL
+// (ExpiresAt), and the creating actor (CreatedBy). The lists and roles are
+// interpreted by internal/authz; the metadata/TTL/creator fields are persisted
+// as-is. Owner/Team grant no identity or access (org/multi-tenancy is out of
+// scope); ExpiresAt is enforced at authentication time (an expired key fails
+// like a revoked one). All new fields are optional — a zero Permissions creates
+// a key with today's behavior (no labels, no expiry, no recorded creator).
+//
+// Note: SetPermissions deliberately replaces only the role/scope/model lists and
+// does NOT touch Owner/Team/ExpiresAt/CreatedBy, so a permissions update never
+// silently clears a key's labels, TTL, or provenance.
 type Permissions struct {
 	Roles       []string
 	AdminScopes []string
 	AllowModels []string
 	DenyModels  []string
+	// Owner is an optional free-form owner label (descriptive only).
+	Owner string
+	// Team is an optional free-form team label (descriptive only).
+	Team string
+	// ExpiresAt, when non-nil, sets the key's TTL: after this instant the key
+	// fails authentication with ErrUnauthenticated. Nil means never expires.
+	ExpiresAt *time.Time
+	// CreatedBy is the opaque id of the actor creating the key, recorded for
+	// provenance. Empty means the creator is not recorded.
+	CreatedBy string
 }
 
 // SetPermissions replaces a key's roles, admin scopes, and allow/deny lists with
@@ -260,10 +290,10 @@ func (s *Service) Rotate(ctx context.Context, id string) (token string, err erro
 }
 
 // Authenticate parses a token, looks up the key by its (plaintext) id,
-// constant-time compares the salted hash, rejects revoked keys, and on success
-// atomically bumps UsageCount and LastUsedAt. It returns the same
-// ErrUnauthenticated for unknown-id, wrong-secret, malformed, and revoked
-// inputs so callers cannot enumerate keys.
+// constant-time compares the salted hash, rejects revoked and expired keys, and
+// on success atomically bumps UsageCount and LastUsedAt. It returns the same
+// ErrUnauthenticated for unknown-id, wrong-secret, malformed, revoked, and
+// expired inputs so callers cannot enumerate keys.
 func (s *Service) Authenticate(ctx context.Context, token string) (store.APIKey, error) {
 	id, secret, ok := parseToken(token)
 	if !ok {
@@ -287,6 +317,13 @@ func (s *Service) Authenticate(ctx context.Context, token string) (store.APIKey,
 		return store.APIKey{}, ErrUnauthenticated
 	}
 	if rec.Revoked() {
+		return store.APIKey{}, ErrUnauthenticated
+	}
+	// An expired key (TTL passed) fails exactly like a revoked one, with the same
+	// ErrUnauthenticated, so an expired key is indistinguishable from a
+	// revoked/unknown/wrong-secret one (no enumeration). Checked after the secret
+	// compare so timing/behavior matches the other post-compare rejections.
+	if rec.Expired(s.now()) {
 		return store.APIKey{}, ErrUnauthenticated
 	}
 
