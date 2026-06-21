@@ -218,6 +218,151 @@ func TestUsageTracking(t *testing.T) {
 	}
 }
 
+// TestExpiredKeyRejected covers #96 AC1: a key whose TTL (ExpiresAt) has passed
+// fails authentication with ErrUnauthenticated (the same sentinel as
+// revoked/unknown — no enumeration), while a not-yet-expired key authenticates.
+// A controllable clock drives the expiry decision so there are no wall-clock
+// sleeps.
+func TestExpiredKeyRejected(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMemory()
+	t.Cleanup(func() { _ = st.Close() })
+
+	// A clock the test advances explicitly. Both Create (CreatedAt) and
+	// Authenticate (the Expired check) read it via s.now().
+	now := time.Unix(1_000, 0).UTC()
+	svc := NewService(st, WithClock(func() time.Time { return now }))
+
+	// Mint a key that expires at t=2000 (1000 seconds in the "future").
+	expiry := time.Unix(2_000, 0).UTC()
+	token, key, err := svc.CreateWithPermissions(ctx, "ttl", Permissions{ExpiresAt: &expiry})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if key.ExpiresAt == nil || !key.ExpiresAt.Equal(expiry) {
+		t.Fatalf("created key ExpiresAt = %v, want %v", key.ExpiresAt, expiry)
+	}
+
+	// Before expiry: authenticates normally.
+	if _, err := svc.Authenticate(ctx, token); err != nil {
+		t.Fatalf("pre-expiry authenticate: want success, got %v", err)
+	}
+
+	// Exactly at the expiry instant the key is NOT yet expired (Expired uses a
+	// strict After), so it still authenticates.
+	now = expiry
+	if _, err := svc.Authenticate(ctx, token); err != nil {
+		t.Fatalf("at-expiry authenticate: want success (boundary is inclusive), got %v", err)
+	}
+
+	// One second past expiry: authentication fails with the shared sentinel.
+	now = expiry.Add(time.Second)
+	if _, err := svc.Authenticate(ctx, token); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("post-expiry authenticate: want ErrUnauthenticated, got %v", err)
+	}
+}
+
+// TestNonExpiringKeyAlwaysAuthenticates covers #96 AC1/AC3 backward-compat: a key
+// created without an ExpiresAt (nil TTL) never expires — it still authenticates
+// far in the "future" — proving a key without the new field behaves exactly as
+// before.
+func TestNonExpiringKeyAlwaysAuthenticates(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMemory()
+	t.Cleanup(func() { _ = st.Close() })
+
+	now := time.Unix(1_000, 0).UTC()
+	svc := NewService(st, WithClock(func() time.Time { return now }))
+
+	token, key, err := svc.Create(ctx, "no-ttl")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if key.ExpiresAt != nil {
+		t.Fatalf("key created without a TTL should have nil ExpiresAt, got %v", key.ExpiresAt)
+	}
+
+	// Advance the clock far past any plausible expiry — a nil-TTL key still works.
+	now = time.Unix(1_000_000_000, 0).UTC()
+	if _, err := svc.Authenticate(ctx, token); err != nil {
+		t.Fatalf("non-expiring key should always authenticate, got %v", err)
+	}
+}
+
+// TestCreateWithExpiryRoundTrips covers #96 AC1/AC3: Owner/Team/ExpiresAt/
+// CreatedBy supplied at creation are persisted and survive a fresh read from the
+// store, and the ExpiresAt pointer is copied (not shared) so mutating the caller's
+// time does not corrupt the stored record.
+func TestCreateWithExpiryRoundTrips(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	svc := newTestService(t)
+
+	expiry := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	_, key, err := svc.CreateWithPermissions(ctx, "rich", Permissions{
+		Owner:     "alice@example.com",
+		Team:      "platform",
+		ExpiresAt: &expiry,
+		CreatedBy: "admin_key_1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	got, err := svc.store.GetAPIKey(ctx, key.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Owner != "alice@example.com" || got.Team != "platform" || got.CreatedBy != "admin_key_1" {
+		t.Fatalf("metadata not persisted: owner=%q team=%q created_by=%q", got.Owner, got.Team, got.CreatedBy)
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(expiry) {
+		t.Fatalf("expires_at = %v, want %v", got.ExpiresAt, expiry)
+	}
+
+	// Mutating the local expiry variable must not affect the stored value (the
+	// service normalized + copied the pointer).
+	expiry = expiry.Add(24 * time.Hour)
+	again, _ := svc.store.GetAPIKey(ctx, key.ID)
+	if again.ExpiresAt.Equal(expiry) {
+		t.Fatal("stored ExpiresAt aliases the caller's pointer (was mutated)")
+	}
+}
+
+// TestSetPermissionsPreservesEnrichment covers #96 AC3: a permissions update
+// (which replaces only roles/scopes/model lists) must NOT clear a key's
+// Owner/Team/ExpiresAt/CreatedBy.
+func TestSetPermissionsPreservesEnrichment(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	svc := newTestService(t)
+
+	expiry := time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC)
+	_, key, err := svc.CreateWithPermissions(ctx, "rich", Permissions{
+		Roles:     []string{"user"},
+		Owner:     "bob",
+		Team:      "infra",
+		ExpiresAt: &expiry,
+		CreatedBy: "admin_key_2",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	updated, err := svc.SetPermissions(ctx, key.ID, Permissions{Roles: []string{"read-only"}})
+	if err != nil {
+		t.Fatalf("set permissions: %v", err)
+	}
+	if updated.Owner != "bob" || updated.Team != "infra" || updated.CreatedBy != "admin_key_2" {
+		t.Errorf("enrichment lost after SetPermissions: %+v", updated)
+	}
+	if updated.ExpiresAt == nil || !updated.ExpiresAt.Equal(expiry) {
+		t.Errorf("expiry lost after SetPermissions: %v", updated.ExpiresAt)
+	}
+}
+
 // TestConcurrentRotateAuth covers AC5: concurrent rotate + authenticate never
 // races or corrupts state, and authentication always succeeds with whatever the
 // current valid token is.

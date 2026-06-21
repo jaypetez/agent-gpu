@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
@@ -294,6 +296,206 @@ func TestAdminKeyLifecycle(t *testing.T) {
 	revoked, _ := authSvc.Get(context.Background(), id)
 	if !revoked.Revoked() {
 		t.Errorf("key not revoked after DELETE")
+	}
+}
+
+// TestAdminCreateKeyEnrichment proves #96 AC2/AC3: creating a key with
+// owner/team/expires_at round-trips those fields into both the create response
+// and the GET key view, and created_by is set to the creating admin key's id
+// (the actor on the authenticated request context). SecretHash/Salt never leak.
+func TestAdminCreateKeyEnrichment(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	adminToken := mustKey(t, authSvc, adminPerms())
+	// The actor id is the admin key's id (the token is agpu_<id>_<secret>).
+	adminID := strings.Split(adminToken, "_")[1]
+
+	expiry := time.Now().Add(24 * time.Hour).Unix()
+	body := `{"name":"svc","owner":"alice@example.com","team":"platform","expires_at":` +
+		strconv.FormatInt(expiry, 10) + `}`
+	rec := req(t, s, http.MethodPost, "/v1/admin/keys", adminToken, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	assertNoSecret(t, rec.Body.String())
+
+	var created struct {
+		ID        string `json:"id"`
+		Owner     string `json:"owner"`
+		Team      string `json:"team"`
+		CreatedBy string `json:"created_by"`
+		ExpiresAt *int64 `json:"expires_at"`
+	}
+	decode(t, rec, &created)
+	if created.Owner != "alice@example.com" || created.Team != "platform" {
+		t.Errorf("create response labels = owner=%q team=%q", created.Owner, created.Team)
+	}
+	if created.CreatedBy != adminID {
+		t.Errorf("create response created_by = %q, want %q (the admin key id)", created.CreatedBy, adminID)
+	}
+	if created.ExpiresAt == nil || *created.ExpiresAt != expiry {
+		t.Errorf("create response expires_at = %v, want %d", created.ExpiresAt, expiry)
+	}
+
+	// The GET view surfaces the same enrichment fields.
+	rec = req(t, s, http.MethodGet, "/v1/admin/keys/"+created.ID, adminToken, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200", rec.Code)
+	}
+	assertNoSecret(t, rec.Body.String())
+	var view struct {
+		Owner     string `json:"owner"`
+		Team      string `json:"team"`
+		CreatedBy string `json:"created_by"`
+		ExpiresAt *int64 `json:"expires_at"`
+	}
+	decode(t, rec, &view)
+	if view.Owner != "alice@example.com" || view.Team != "platform" || view.CreatedBy != adminID {
+		t.Errorf("key view enrichment wrong: %+v", view)
+	}
+	if view.ExpiresAt == nil || *view.ExpiresAt != expiry {
+		t.Errorf("key view expires_at = %v, want %d", view.ExpiresAt, expiry)
+	}
+}
+
+// TestAdminCreateKeyBackwardCompat proves #96 AC3: a key created WITHOUT the new
+// fields renders exactly as before — the enrichment keys are omitted entirely
+// from both the create response and the GET view (so existing clients see no
+// change).
+func TestAdminCreateKeyBackwardCompat(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	adminToken := mustKey(t, authSvc, adminPerms())
+
+	rec := req(t, s, http.MethodPost, "/v1/admin/keys", adminToken, `{"name":"plain"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201", rec.Code)
+	}
+	var created map[string]any
+	decode(t, rec, &created)
+	id, _ := created["id"].(string)
+	for _, k := range []string{"owner", "team", "expires_at"} {
+		if _, present := created[k]; present {
+			t.Errorf("create response should omit %q when unset: %v", k, created)
+		}
+	}
+
+	rec = req(t, s, http.MethodGet, "/v1/admin/keys/"+id, adminToken, "")
+	var view map[string]any
+	decode(t, rec, &view)
+	// owner/team/expires_at are caller-supplied: omitted when not provided.
+	for _, k := range []string{"owner", "team", "expires_at"} {
+		if _, present := view[k]; present {
+			t.Errorf("key view should omit %q when unset: %v", k, view)
+		}
+	}
+	// created_by reflects the authenticated creating actor, so it IS present here
+	// (the admin key id). A key minted outside the admin API has no actor and would
+	// omit it — covered by the store/auth backward-compat tests.
+	if _, present := view["created_by"]; !present {
+		t.Errorf("key view should record created_by (the creating actor): %v", view)
+	}
+}
+
+// TestAdminCreateKeyRejectsBadExpiry proves #96: a non-positive or already-past
+// expires_at is rejected with 400 (invalid_request_error) and no key is created.
+func TestAdminCreateKeyRejectsBadExpiry(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	adminToken := mustKey(t, authSvc, adminPerms())
+
+	cases := map[string]string{
+		"past":     strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10),
+		"zero":     "0",
+		"negative": "-5",
+	}
+	for name, ts := range cases {
+		t.Run(name, func(t *testing.T) {
+			body := `{"name":"x","expires_at":` + ts + `}`
+			rec := req(t, s, http.MethodPost, "/v1/admin/keys", adminToken, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for %s expiry", rec.Code, name)
+			}
+			if code := errorCode(t, rec); code != "invalid_request_error" {
+				t.Errorf("error code = %q, want invalid_request_error", code)
+			}
+		})
+	}
+
+	// No key was created by any of the rejected requests.
+	keys, err := authSvc.List(context.Background())
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, k := range keys {
+		if k.Name == "x" {
+			t.Fatalf("a key was created despite a rejected expiry: %+v", k)
+		}
+	}
+}
+
+// TestAdminExpiredKeyFailsAuth proves #96 AC1 end-to-end through the router: a key
+// minted with an ExpiresAt in the past (via the auth service's controllable
+// clock) cannot authenticate against an admin endpoint — it gets 401, the same as
+// any other auth failure (no enumeration).
+func TestAdminExpiredKeyFailsAuth(t *testing.T) {
+	st := store.NewMemory()
+	// A clock pinned in the past at key creation; "now" (real wall clock at
+	// request time) is far later, so the key is already expired when used.
+	createTime := time.Unix(1_000, 0).UTC()
+	authSvc := auth.NewService(st, auth.WithClock(func() time.Time { return createTime }))
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := &Server{
+		fleet: &fakeFleet{},
+		auth:  authSvc,
+		authz: authz.NewAuthorizer(authz.WithLogger(discard)),
+		quota: quota.NewEngine(quota.NewMemoryCounterStore()),
+		log:   discard,
+	}
+
+	// Mint an admin key that expires one second after createTime — long before the
+	// real clock the Authenticate path will compare against (createTime is fixed,
+	// but the key's expiry is in the absolute past relative to time.Now()).
+	expiry := time.Unix(1_001, 0).UTC()
+	token, _, err := authSvc.CreateWithPermissions(context.Background(), "expired-admin", auth.Permissions{
+		Roles:     []string{authz.RoleAdmin},
+		ExpiresAt: &expiry,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Advance the service clock past the expiry, then use the key: 401.
+	createTime = time.Unix(2_000, 0).UTC()
+	rec := req(t, s, http.MethodGet, "/v1/admin/keys", token, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expired key status = %d, want 401", rec.Code)
+	}
+}
+
+// TestAuditCapturesEnrichment proves #96: the create audit entry includes the
+// owner/team/created_by/expires_at metadata (none of it secret).
+func TestAuditCapturesEnrichment(t *testing.T) {
+	s, authSvc, auditLog := adminTestServerWithAudit(t, &fakeFleet{})
+	adminToken := mustKey(t, authSvc, adminPerms())
+	adminID := strings.Split(adminToken, "_")[1]
+
+	expiry := time.Now().Add(48 * time.Hour).Unix()
+	body := `{"name":"svc","owner":"carol","team":"research","expires_at":` +
+		strconv.FormatInt(expiry, 10) + `}`
+	rec := req(t, s, http.MethodPost, "/v1/admin/keys", adminToken, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d", rec.Code)
+	}
+
+	entries := auditLog.List(audit.Filter{Op: auditOpKeyCreate}, 0)
+	if len(entries) != 1 {
+		t.Fatalf("want 1 create entry, got %d", len(entries))
+	}
+	after := entries[0].After
+	if after["owner"] != "carol" || after["team"] != "research" || after["created_by"] != adminID {
+		t.Errorf("audit after missing enrichment: %+v", after)
+	}
+	// expires_at is recorded as the unix seconds int64.
+	if got, ok := after["expires_at"].(int64); !ok || got != expiry {
+		t.Errorf("audit after expires_at = %v (type %T), want %d", after["expires_at"], after["expires_at"], expiry)
 	}
 }
 

@@ -44,10 +44,14 @@ import (
 // adminKeyView is the metadata-only projection of a store.APIKey returned by the
 // admin API. It deliberately omits SecretHash and Salt so a secret can never be
 // serialized. Revoked is a convenience boolean; LastUsed is omitted (0) when the
-// key has never authenticated.
+// key has never authenticated. The enrichment fields (Owner/Team/ExpiresAt/
+// CreatedBy, #96) are omitted when unset so a key created without them renders
+// exactly as before.
 type adminKeyView struct {
 	ID          string      `json:"id"`
 	Name        string      `json:"name"`
+	Owner       string      `json:"owner,omitempty"`
+	Team        string      `json:"team,omitempty"`
 	Roles       []string    `json:"roles"`
 	AdminScopes []string    `json:"admin_scopes"`
 	AllowModels []string    `json:"allow_models"`
@@ -55,7 +59,9 @@ type adminKeyView struct {
 	Revoked     bool        `json:"revoked"`
 	UsageCount  uint64      `json:"usage_count"`
 	Created     int64       `json:"created"`
+	CreatedBy   string      `json:"created_by,omitempty"`
 	LastUsed    int64       `json:"last_used,omitempty"`
+	ExpiresAt   *int64      `json:"expires_at,omitempty"`
 	Limits      *limitsView `json:"limits,omitempty"`
 }
 
@@ -74,6 +80,8 @@ func newAdminKeyView(k store.APIKey) adminKeyView {
 	v := adminKeyView{
 		ID:          k.ID,
 		Name:        k.Name,
+		Owner:       k.Owner,
+		Team:        k.Team,
 		Roles:       orEmpty(k.Roles),
 		AdminScopes: orEmpty(k.AdminScopes),
 		AllowModels: orEmpty(k.AllowModels),
@@ -81,9 +89,14 @@ func newAdminKeyView(k store.APIKey) adminKeyView {
 		Revoked:     k.Revoked(),
 		UsageCount:  k.UsageCount,
 		Created:     k.CreatedAt.Unix(),
+		CreatedBy:   k.CreatedBy,
 	}
 	if !k.LastUsedAt.IsZero() {
 		v.LastUsed = k.LastUsedAt.Unix()
+	}
+	if k.ExpiresAt != nil {
+		exp := k.ExpiresAt.Unix()
+		v.ExpiresAt = &exp
 	}
 	if k.Limits != nil {
 		v.Limits = &limitsView{
@@ -111,12 +124,16 @@ func orEmpty(xs []string) []string {
 type adminCreateKeyResponse struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Token       string   `json:"token"`
 	Roles       []string `json:"roles"`
 	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Created     int64    `json:"created"`
+	CreatedBy   string   `json:"created_by,omitempty"`
+	ExpiresAt   *int64   `json:"expires_at,omitempty"`
 }
 
 // adminRotateKeyResponse is the POST /v1/admin/keys/{id}/rotate response: the key
@@ -326,12 +343,21 @@ type adminQuotaUsageResponse struct {
 // permissions. Roles are validated against the known vocabulary (authz.ValidRole,
 // #95) and AdminScopes grants the fine-grained management scopes (#90); an unknown
 // role or scope is rejected with 400 (no key is created).
+//
+// Owner/Team are optional free-form labels (descriptive metadata only — they
+// grant nothing). ExpiresAt is an optional TTL as unix seconds: after it the key
+// fails authentication. It must be in the future; a past or zero ExpiresAt is
+// rejected with 400 (a key born already-expired is almost certainly a mistake).
+// Omit it for a non-expiring key — the pre-existing behavior (#96).
 type adminCreateKeyRequest struct {
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Roles       []string `json:"roles"`
 	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
+	ExpiresAt   *int64   `json:"expires_at,omitempty"`
 }
 
 // adminPermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body. It is
@@ -389,11 +415,30 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	if !validateScopes(w, req.AdminScopes) {
 		return
 	}
+	// An optional TTL is validated up front: it must be a positive unix timestamp
+	// strictly in the future. A non-positive or already-past value is rejected
+	// with 400 (and no key is created) rather than silently minting a key that can
+	// never authenticate. An omitted expires_at leaves the key non-expiring.
+	expiresAt, ok := parseExpiresAt(w, req.ExpiresAt)
+	if !ok {
+		return
+	}
+	// Record the creating actor (the authenticated admin key's id) for provenance.
+	// Empty when the handler is invoked outside the auth middleware (some unit
+	// tests), preserving the pre-existing behavior of an unattributed key.
+	actor := ""
+	if k, ok := keyFromContext(r.Context()); ok {
+		actor = k.ID
+	}
 	token, key, err := s.auth.CreateWithPermissions(r.Context(), req.Name, auth.Permissions{
 		Roles:       req.Roles,
 		AdminScopes: req.AdminScopes,
 		AllowModels: req.AllowModels,
 		DenyModels:  req.DenyModels,
+		Owner:       req.Owner,
+		Team:        req.Team,
+		ExpiresAt:   expiresAt,
+		CreatedBy:   actor,
 	})
 	if err != nil {
 		s.recordAudit(r, auditOpKeyCreate, "", audit.OutcomeFailure, nil, nil)
@@ -404,16 +449,41 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	// Audit the create: there is no Before (the key did not exist); the After is
 	// the redacted projection of the new key. The one-time token is NEVER recorded.
 	s.recordAudit(r, auditOpKeyCreate, key.ID, audit.OutcomeSuccess, nil, auditKeyValues(key))
-	writeJSON(w, http.StatusCreated, adminCreateKeyResponse{
+	resp := adminCreateKeyResponse{
 		ID:          key.ID,
 		Name:        key.Name,
+		Owner:       key.Owner,
+		Team:        key.Team,
 		Token:       token,
 		Roles:       orEmpty(key.Roles),
 		AdminScopes: orEmpty(key.AdminScopes),
 		AllowModels: orEmpty(key.AllowModels),
 		DenyModels:  orEmpty(key.DenyModels),
 		Created:     key.CreatedAt.Unix(),
-	})
+		CreatedBy:   key.CreatedBy,
+	}
+	if key.ExpiresAt != nil {
+		exp := key.ExpiresAt.Unix()
+		resp.ExpiresAt = &exp
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// parseExpiresAt validates the optional create-key TTL. A nil pointer (omitted
+// field) means "no expiry" and yields (nil, true). A present value must be a
+// positive unix-seconds timestamp strictly in the future; otherwise it writes a
+// 400 and returns ok=false so the handler aborts before any key is minted. On
+// success it returns the corresponding UTC *time.Time.
+func parseExpiresAt(w http.ResponseWriter, expiresAt *int64) (*time.Time, bool) {
+	if expiresAt == nil {
+		return nil, true
+	}
+	if *expiresAt <= 0 || !time.Unix(*expiresAt, 0).After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "expires_at must be a unix timestamp in the future")
+		return nil, false
+	}
+	t := time.Unix(*expiresAt, 0).UTC()
+	return &t, true
 }
 
 // handleAdminListKeys serves GET /v1/admin/keys. It returns metadata for every

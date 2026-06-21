@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMemoryCRUD(t *testing.T) {
@@ -130,6 +131,68 @@ func TestLimitsDeepCopied(t *testing.T) {
 	again, _ := s.GetAPIKey(ctx, "k1")
 	if again.Limits.RPM != 10 {
 		t.Fatalf("GetAPIKey returned aliased Limits: %+v", again.Limits)
+	}
+}
+
+// TestExpired verifies the Expired helper: a key with no ExpiresAt never expires;
+// a key with one expires strictly after that instant (the boundary is inclusive,
+// mirroring Revoked's semantics).
+func TestExpired(t *testing.T) {
+	t.Parallel()
+	at := time.Unix(2_000, 0).UTC()
+
+	never := APIKey{ID: "k"}
+	if never.Expired(time.Unix(9_999_999, 0)) {
+		t.Error("a key with nil ExpiresAt should never be Expired")
+	}
+
+	k := APIKey{ID: "k", ExpiresAt: &at}
+	if k.Expired(at.Add(-time.Second)) {
+		t.Error("key not yet expired one second before ExpiresAt")
+	}
+	if k.Expired(at) {
+		t.Error("key should not be expired exactly at ExpiresAt (strict After)")
+	}
+	if !k.Expired(at.Add(time.Second)) {
+		t.Error("key should be expired one second after ExpiresAt")
+	}
+}
+
+// TestExpiresAtDeepCopied verifies the ExpiresAt pointer is deep-copied by
+// cloneAPIKey, so a caller mutating its copy cannot corrupt stored state (the
+// same guarantee TestLimitsDeepCopied makes for Limits and the RevokedAt pointer).
+func TestExpiresAtDeepCopied(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := NewMemory()
+	t.Cleanup(func() { _ = s.Close() })
+
+	exp := time.Unix(2_000, 0).UTC()
+	key := APIKey{ID: "k1", Owner: "alice", Team: "platform", CreatedBy: "admin1", ExpiresAt: &exp}
+	if err := s.PutAPIKey(ctx, key); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	got, err := s.GetAPIKey(ctx, "k1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// The plain string labels round-trip.
+	if got.Owner != "alice" || got.Team != "platform" || got.CreatedBy != "admin1" {
+		t.Fatalf("labels not round-tripped: %+v", got)
+	}
+	if got.ExpiresAt == nil || !got.ExpiresAt.Equal(exp) {
+		t.Fatalf("ExpiresAt not round-tripped: %v", got.ExpiresAt)
+	}
+	if got.ExpiresAt == &exp {
+		t.Fatal("GetAPIKey returned the caller's ExpiresAt pointer (aliased)")
+	}
+
+	// Mutating the returned copy must not affect a subsequent read.
+	*got.ExpiresAt = exp.Add(time.Hour)
+	again, _ := s.GetAPIKey(ctx, "k1")
+	if !again.ExpiresAt.Equal(exp) {
+		t.Fatalf("GetAPIKey returned aliased ExpiresAt: %v", again.ExpiresAt)
 	}
 }
 

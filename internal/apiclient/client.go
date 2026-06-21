@@ -124,6 +124,8 @@ func New(baseURL, token string, opts ...Option) *Client {
 type KeyView struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Roles       []string `json:"roles"`
 	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
@@ -131,8 +133,12 @@ type KeyView struct {
 	Revoked     bool     `json:"revoked"`
 	UsageCount  uint64   `json:"usage_count"`
 	Created     int64    `json:"created"`
+	CreatedBy   string   `json:"created_by,omitempty"`
 	LastUsed    int64    `json:"last_used,omitempty"`
-	Limits      *Limits  `json:"limits,omitempty"`
+	// ExpiresAt is the key's TTL as unix epoch seconds, or nil when the key never
+	// expires. An expired key fails authentication (#96).
+	ExpiresAt *int64  `json:"expires_at,omitempty"`
+	Limits    *Limits `json:"limits,omitempty"`
 }
 
 // Limits mirrors httpapi.limitsView / store.Limits: a per-key quota override. A
@@ -150,12 +156,18 @@ type Limits struct {
 type CreateKeyResponse struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Token       string   `json:"token"`
 	Roles       []string `json:"roles"`
 	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Created     int64    `json:"created"`
+	CreatedBy   string   `json:"created_by,omitempty"`
+	// ExpiresAt is the key's TTL as unix epoch seconds, echoed back when one was
+	// requested; nil for a non-expiring key.
+	ExpiresAt *int64 `json:"expires_at,omitempty"`
 }
 
 // RotateKeyResponse is the POST /v1/admin/keys/{id}/rotate response: the key id
@@ -348,13 +360,18 @@ type listEnvelope[T any] struct {
 const maxPageSize = 200
 
 // CreateKeyRequest is the POST /v1/admin/keys body. Mirrors
-// httpapi.adminCreateKeyRequest.
+// httpapi.adminCreateKeyRequest. Owner/Team are optional descriptive labels;
+// ExpiresAt is an optional TTL as unix epoch seconds (must be in the future) —
+// omit it for a non-expiring key (#96).
 type CreateKeyRequest struct {
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Roles       []string `json:"roles,omitempty"`
 	AdminScopes []string `json:"admin_scopes,omitempty"`
 	AllowModels []string `json:"allow_models,omitempty"`
 	DenyModels  []string `json:"deny_models,omitempty"`
+	ExpiresAt   *int64   `json:"expires_at,omitempty"`
 }
 
 // PermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body — a full

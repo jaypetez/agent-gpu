@@ -80,6 +80,81 @@ func TestCreateKey(t *testing.T) {
 	}
 }
 
+// TestCreateKeyEnrichment proves #96 (client side): the new owner/team/expires_at
+// request fields are sent on the wire, and owner/team/created_by/expires_at in the
+// response decode into CreateKeyResponse.
+func TestCreateKeyEnrichment(t *testing.T) {
+	t.Parallel()
+	var cap capture
+	srv := httptest.NewServer(recordingHandler(&cap, http.StatusCreated,
+		`{"id":"abc","name":"app","owner":"alice","team":"platform","token":"agpu_abc_secret","roles":[],"allow_models":[],"deny_models":[],"created":100,"created_by":"admin1","expires_at":2000}`))
+	defer srv.Close()
+
+	exp := int64(2000)
+	resp, err := newTestClient(t, srv).CreateKey(context.Background(), CreateKeyRequest{
+		Name:      "app",
+		Owner:     "alice",
+		Team:      "platform",
+		ExpiresAt: &exp,
+	})
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	if resp.Owner != "alice" || resp.Team != "platform" || resp.CreatedBy != "admin1" {
+		t.Errorf("response enrichment wrong: %+v", resp)
+	}
+	if resp.ExpiresAt == nil || *resp.ExpiresAt != 2000 {
+		t.Errorf("response expires_at = %v, want 2000", resp.ExpiresAt)
+	}
+	// The request carried the new fields.
+	if cap.body["owner"] != "alice" || cap.body["team"] != "platform" {
+		t.Errorf("request body labels missing: %v", cap.body)
+	}
+	if got, _ := cap.body["expires_at"].(float64); int64(got) != 2000 {
+		t.Errorf("request body expires_at = %v, want 2000", cap.body["expires_at"])
+	}
+}
+
+// TestCreateKeyOmitsUnsetEnrichment proves #96 backward-compat (client side): a
+// request without owner/team/expires_at omits them from the wire body entirely.
+func TestCreateKeyOmitsUnsetEnrichment(t *testing.T) {
+	t.Parallel()
+	var cap capture
+	srv := httptest.NewServer(recordingHandler(&cap, http.StatusCreated,
+		`{"id":"abc","name":"app","token":"agpu_abc_secret","roles":[],"allow_models":[],"deny_models":[],"created":100}`))
+	defer srv.Close()
+
+	if _, err := newTestClient(t, srv).CreateKey(context.Background(), CreateKeyRequest{Name: "app"}); err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	for _, k := range []string{"owner", "team", "expires_at"} {
+		if _, present := cap.body[k]; present {
+			t.Errorf("request body should omit %q when unset: %v", k, cap.body)
+		}
+	}
+}
+
+// TestGetKeyDecodesEnrichment proves #96 (client side): owner/team/created_by/
+// expires_at on a GET key view decode into KeyView.
+func TestGetKeyDecodesEnrichment(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"abc","name":"app","owner":"bob","team":"infra","roles":[],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":7,"created":10,"created_by":"admin2","expires_at":3000}`)
+	}))
+	defer srv.Close()
+
+	key, err := newTestClient(t, srv).GetKey(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if key.Owner != "bob" || key.Team != "infra" || key.CreatedBy != "admin2" {
+		t.Errorf("key view enrichment wrong: %+v", key)
+	}
+	if key.ExpiresAt == nil || *key.ExpiresAt != 3000 {
+		t.Errorf("key view expires_at = %v, want 3000", key.ExpiresAt)
+	}
+}
+
 func TestListKeys(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

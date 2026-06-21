@@ -2159,6 +2159,12 @@ components:
         name:
           type: string
           description: A human-readable label.
+        owner:
+          type: string
+          description: Optional free-form owner label (descriptive metadata only; grants no identity or access). Omitted when unset.
+        team:
+          type: string
+          description: Optional free-form team/project label (descriptive metadata only; grants no access). Omitted when unset.
         roles:
           type: array
           items:
@@ -2190,10 +2196,17 @@ components:
           type: integer
           format: int64
           description: Unix epoch seconds when the key was created.
+        created_by:
+          type: string
+          description: Opaque id of the actor (admin key) that created this key. Omitted when the creator was not recorded.
         last_used:
           type: [integer, "null"]
           format: int64
           description: Unix epoch seconds of the most recent successful authentication. Omitted if never used.
+        expires_at:
+          type: [integer, "null"]
+          format: int64
+          description: Unix epoch seconds after which the key no longer authenticates (TTL). Omitted/null when the key never expires.
         limits:
           oneOf:
             - $ref: "#/components/schemas/Limits"
@@ -2225,6 +2238,12 @@ components:
         name:
           type: string
           description: A human-readable label for the new key.
+        owner:
+          type: string
+          description: Optional free-form owner label (descriptive metadata only; grants no identity or access).
+        team:
+          type: string
+          description: Optional free-form team/project label (descriptive metadata only; grants no access).
         roles:
           type: [array, "null"]
           description: The roles to grant the new key.
@@ -2245,6 +2264,13 @@ components:
           description: The per-key deny-list of model names.
           items:
             type: string
+        expires_at:
+          type: [integer, "null"]
+          format: int64
+          description: >-
+            Optional TTL as unix epoch seconds, after which the key no longer authenticates. Must be in
+            the future; a non-positive or already-past value is rejected with 400. Omit for a
+            non-expiring key.
 
     AdminCreateKeyResponse:
       type: object
@@ -2266,6 +2292,12 @@ components:
           description: The opaque public key id.
         name:
           type: string
+        owner:
+          type: string
+          description: The owner label, echoed back when one was supplied. Omitted when unset.
+        team:
+          type: string
+          description: The team/project label, echoed back when one was supplied. Omitted when unset.
         token:
           type: string
           description: The one-time plaintext token (`agpu_<keyid>_<secret>`). Shown once; not recoverable.
@@ -2289,6 +2321,13 @@ components:
           type: integer
           format: int64
           description: Unix epoch seconds when the key was created.
+        created_by:
+          type: string
+          description: Opaque id of the actor (admin key) that created this key. Omitted when not recorded.
+        expires_at:
+          type: [integer, "null"]
+          format: int64
+          description: The key's TTL as unix epoch seconds, echoed back when one was requested. Omitted/null for a non-expiring key.
 
     AdminRotateKeyResponse:
       type: object

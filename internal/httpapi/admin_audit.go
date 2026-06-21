@@ -64,6 +64,20 @@ func auditKeyValues(k store.APIKey) audit.RedactedValues {
 		"deny_models":  orEmpty(k.DenyModels),
 		"revoked":      k.Revoked(),
 	}
+	// Enrichment metadata (#96) is included only when set, so a key without it
+	// produces the same audit snapshot as before. None of these is secret.
+	if k.Owner != "" {
+		v["owner"] = k.Owner
+	}
+	if k.Team != "" {
+		v["team"] = k.Team
+	}
+	if k.CreatedBy != "" {
+		v["created_by"] = k.CreatedBy
+	}
+	if k.ExpiresAt != nil {
+		v["expires_at"] = k.ExpiresAt.Unix()
+	}
 	if k.Limits != nil {
 		v["limits"] = map[string]uint64{
 			"rpm":            k.Limits.RPM,
