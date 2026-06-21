@@ -96,6 +96,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Build + vet + test the example client (nested module)
+        # examples/go-client is its own stdlib-only module, excluded from the
+        # root `./...`, so it would otherwise never be exercised in CI and could
+        # silently rot against an API change. `make examples` builds, vets, and
+        # tests it with the same toolchain resolved above.
+        run: make examples
+
       - name: Test (race + coverage)
         # Race detector and coverage in one pass. covermode=atomic is required
         # under -race. The profile feeds the gate and report steps below.

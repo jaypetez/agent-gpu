@@ -59,6 +59,10 @@ key), `2` when the requested model is not available to your key (it prints the
 models that are), and `3` when the API call itself fails (auth, quota, server
 error). On a `429`/`503` with a `Retry-After` header it prints how long to wait.
 
+> If you script on these exit codes, run the built binary — `go run .` does not
+> propagate the program's exit code (it reports `exit status N` and itself
+> exits `1`).
+
 ## Tests
 
 The client is covered by table-free unit tests that drive it against an

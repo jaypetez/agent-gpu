@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"syscall"
 )
 
 // signalContext returns a context that is cancelled on SIGINT (Ctrl-C) or
@@ -13,5 +14,5 @@ import (
 // aborted via the context, the partial output already printed is kept, and the
 // process exits with the conventional interrupt code.
 func signalContext(parent context.Context) (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(parent, os.Interrupt)
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 }
