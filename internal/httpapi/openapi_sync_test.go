@@ -106,13 +106,15 @@ func deriveRoutes(t *testing.T, root string) map[route]bool {
 
 // splitPattern normalizes a ServeMux pattern into (METHOD, path). A pattern with
 // a leading method token ("POST /v1/sessions") splits on the space; a pattern
-// without one ("/v1/models") is resolved through noMethodRoutes.
+// without one ("/v1/models") is resolved through noMethodRoutes. The path is run
+// through normalizePath so a multi-segment wildcard ("{model...}") matches the
+// single-brace OpenAPI form ("{model}").
 func splitPattern(t *testing.T, pattern string) (method, path string) {
 	t.Helper()
 	if i := strings.IndexByte(pattern, ' '); i >= 0 {
 		tok := pattern[:i]
 		if httpMethods[tok] {
-			return tok, pattern[i+1:]
+			return tok, normalizePath(pattern[i+1:])
 		}
 		t.Fatalf("pattern %q has a leading token %q that is not an HTTP method", pattern, tok)
 	}
@@ -121,7 +123,19 @@ func splitPattern(t *testing.T, pattern string) (method, path string) {
 		t.Fatalf("route %q is registered without a method token and is not pinned in noMethodRoutes; "+
 			"add its verb there (and document it in openapi.yaml)", pattern)
 	}
-	return m, pattern
+	return m, normalizePath(pattern)
+}
+
+// trailingWildcardRe matches Go 1.22's multi-segment wildcard form "{name...}",
+// which the OpenAPI spec writes as a plain "{name}" path parameter.
+var trailingWildcardRe = regexp.MustCompile(`\{([^}]+)\.\.\.\}`)
+
+// normalizePath rewrites a Go ServeMux path so it matches how the same operation
+// is written in openapi.yaml: a multi-segment wildcard "{name...}" (used so a
+// path parameter can contain slashes/colons, e.g. /v1/models/{model...}) is
+// reduced to the single-brace "{name}" the spec declares.
+func normalizePath(path string) string {
+	return trailingWildcardRe.ReplaceAllString(path, "{$1}")
 }
 
 // specDoc is the minimal slice of the OpenAPI document the sync check needs: the
@@ -170,10 +184,10 @@ func TestOpenAPISpecMatchesRegisteredRoutes(t *testing.T) {
 	registered := deriveRoutes(t, root)
 	documented := documentedRoutes(t, root)
 
-	// The project currently exposes exactly 18 public HTTP routes. Pin the count
+	// The project currently exposes exactly 19 public HTTP routes. Pin the count
 	// so an accidental over- or under-registration (or a parser regression that
 	// silently drops routes) is caught even if both sides happen to agree.
-	const wantRoutes = 18
+	const wantRoutes = 19
 	if len(registered) != wantRoutes {
 		t.Errorf("parsed %d registered routes from httpapi.go, want %d:\n%s",
 			len(registered), wantRoutes, formatRoutes(registered))

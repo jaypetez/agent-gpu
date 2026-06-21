@@ -110,6 +110,14 @@ func (r *statusRecorder) Flush() {
 // other interface-probing helper can reach the original writer's capabilities.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
+// responseStarted reports whether a status line / body has already been written.
+// recoverMiddleware uses it (through the responseStarter interface) to decide
+// whether a panic recovered mid-request can still be turned into a 500 JSON
+// envelope: once the response has started (e.g. a streaming SSE handler that
+// panicked after the first frame) only logging is possible, since the status line
+// is already on the wire.
+func (r *statusRecorder) responseStarted() bool { return r.wroteHeader }
+
 // recordTokens meters one completed inference's tokens against
 // tokens_generated_total{model,kind} (#24). It mirrors usageFrom's accounting so
 // the metric agrees with the usage object the client sees: when the backend

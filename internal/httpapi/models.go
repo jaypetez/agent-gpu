@@ -97,6 +97,8 @@ type openAIModel struct {
 // stable openAICreated sentinel.
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		// Advertise the permitted method on the 405 (RFC 7231 §6.5.5).
+		w.Header().Set("Allow", http.MethodGet)
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
@@ -120,6 +122,40 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, openAIModelList{Object: "list", Data: data})
 }
 
+// handleOpenAIModelRetrieve serves GET /v1/models/{model}, OpenAI's
+// retrieve-model endpoint. It returns the single model object in the OpenAI shape
+// IFF the model is visible to the key (present on an Online worker AND the key may
+// run inference against it), reusing the same per-key catalog as the list
+// endpoint so visibility is identical. A model that is unknown or hidden from the
+// key returns 404 model_not_found — the same response for "does not exist" and
+// "not permitted to see", so the endpoint never reveals the existence of a model
+// the key cannot use. The {model...} wildcard captures namespaced/colon tags
+// whole. The method is pinned by the route pattern (GET), so the mux returns 405
+// with an Allow header for other verbs before this handler runs.
+func (s *Server) handleOpenAIModelRetrieve(w http.ResponseWriter, r *http.Request) {
+	key, ok := keyFromContext(r.Context())
+	if !ok {
+		// Unreachable behind authMiddleware; defended so a future misroute fails
+		// closed rather than confirming a model's existence to an unauthenticated
+		// caller.
+		writeError(w, http.StatusUnauthorized, "unauthorized", "missing api key")
+		return
+	}
+	name := r.PathValue("model")
+	for _, m := range s.catalog(r.Context(), key) {
+		if m.Name == name {
+			writeJSON(w, http.StatusOK, openAIModel{
+				ID:      m.Name,
+				Object:  "model",
+				Created: openAICreated,
+				OwnedBy: "agent-gpu",
+			})
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "model_not_found", "model not found")
+}
+
 // ---- richer internal /models ----
 
 type modelList struct {
@@ -138,6 +174,8 @@ type modelEntry struct {
 // per-key permission filter and determinism as /v1/models.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
+		// Advertise the permitted method on the 405 (RFC 7231 §6.5.5).
+		w.Header().Set("Allow", http.MethodGet)
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}

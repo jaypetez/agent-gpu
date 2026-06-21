@@ -188,6 +188,12 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/v1/models", s.authMiddleware(http.HandlerFunc(s.handleOpenAIModels)))
+	// OpenAI's retrieve-model endpoint. The {model...} multi-segment wildcard so a
+	// namespaced tag (library/x:tag) or a colon tag (qwen2:0.5b) is captured whole
+	// via r.PathValue("model"). The bare-path registration above is more specific
+	// for "/v1/models" exactly, so it still wins for the list endpoint; this route
+	// only matches "/v1/models/<something>".
+	mux.Handle("GET /v1/models/{model...}", s.authMiddleware(http.HandlerFunc(s.handleOpenAIModelRetrieve)))
 	mux.Handle("/models", s.authMiddleware(http.HandlerFunc(s.handleModels)))
 	// The inference surface is the only one fronted by the global rate limiter:
 	// rateLimitMiddleware runs INSIDE authMiddleware (so the authenticated key is
@@ -202,12 +208,18 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
 	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
 	s.registerAdminRoutes(mux)
+	// Middleware order (outermost first): metrics → requestID → recover → mux.
 	// Correlation id is established before auth so every response — including
 	// unauthenticated 401s short-circuited by authMiddleware — gets a request_id
 	// and X-Request-Id header. The metrics middleware wraps it OUTERMOST so it
 	// times the whole handler chain and records the final status of even a
-	// short-circuited response (#24); it is a no-op when metrics are disabled.
-	return s.metricsMiddleware(s.requestIDMiddleware(mux))
+	// short-circuited response (#24); it is a no-op when metrics are disabled, and
+	// it installs the statusRecorder the recover middleware reads to learn whether a
+	// response has already started. The recover middleware sits INSIDE requestID
+	// (so a recovered panic logs with the request_id) but OUTSIDE the mux and the
+	// per-route middleware (so it covers every handler), turning a handler panic
+	// into a clean 500 rather than a dropped connection.
+	return s.metricsMiddleware(s.requestIDMiddleware(s.recoverMiddleware(mux)))
 }
 
 // admin wraps an admin handler in the auth + admin-role gates. Every admin route

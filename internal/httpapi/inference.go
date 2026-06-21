@@ -92,6 +92,7 @@ func finishReasonOrStop(r string) string {
 //   - authz.ErrForbidden                            → 403
 //   - quota.ErrQuotaExceeded                        → 429
 //   - queue.ErrQueueFull / server.ErrShuttingDown   → 503
+//   - server.ErrModelUnavailable                    → 503
 //   - types.ErrInvalidJob                           → 400
 //   - anything else                                 → 500
 //
@@ -108,6 +109,8 @@ func statusForError(err error) (status int, code, msg string) {
 		return http.StatusTooManyRequests, "rate_limit_exceeded", "quota exceeded"
 	case errors.Is(err, queue.ErrQueueFull):
 		return http.StatusServiceUnavailable, "unavailable", "no capacity available"
+	case errors.Is(err, server.ErrModelUnavailable):
+		return http.StatusServiceUnavailable, "unavailable", "no worker available for the requested model"
 	case errors.Is(err, server.ErrShuttingDown):
 		return http.StatusServiceUnavailable, "unavailable", "server shutting down"
 	case errors.Is(err, types.ErrInvalidJob):
@@ -175,6 +178,9 @@ func (s *Server) annotatePerKey429(w http.ResponseWriter, r *http.Request) {
 // error) on a wrong method or a malformed body so the caller can simply return.
 func decodePost(w http.ResponseWriter, r *http.Request, v any) bool {
 	if r.Method != http.MethodPost {
+		// Advertise the permitted method per RFC 7231 §6.5.5 so a client (and the
+		// generic HTTP tooling around it) learns the right verb from the 405 itself.
+		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return false
 	}
