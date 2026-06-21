@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/store"
@@ -92,3 +94,65 @@ const (
 	auditOpKeyQuota       = "key.quota"
 	auditOpWorkerDrain    = "worker.drain"
 )
+
+// handleAdminAudit serves GET /v1/admin/audit (#91): the queryable read seam over
+// the append-only audit log built in #90. It returns the recorded entries —
+// newest first — in the shared cursor-paginated list envelope
+// ({"data":[...],"pagination":{...}}), narrowed by the optional filters:
+//
+//   - actor   — the actor key id that performed the operation
+//   - op      — the operation name (e.g. "key.create", "worker.drain")
+//   - target  — the resource id the operation acted on
+//   - since   — unix-seconds lower bound, inclusive (entries at or after it)
+//   - until   — unix-seconds upper bound, exclusive (entries strictly before it)
+//
+// Non-empty filters are ANDed (audit.Filter). The since/until bounds are unix
+// seconds to match the timestamp convention used elsewhere in the admin API
+// (the quota reset timestamps); an absent or unparseable bound is treated as
+// unbounded on that side rather than erroring, so a stale or hand-edited query
+// degrades to "wider window" instead of a 400. The handler is gated to the
+// audit:read scope (s.requireScope), so a key lacking it gets 403 and an
+// unauthenticated request 401 before this runs.
+//
+// Entries are already redacted by the store (the before/after snapshots carry
+// only safe metadata fields — never SecretHash/Salt; see admin_audit.go), so
+// they are passed straight through: audit.Entry's JSON tags are the wire shape.
+// When no audit store is wired (nil-safe, mirroring recordAudit) the endpoint
+// returns a well-formed empty page rather than failing.
+func (s *Server) handleAdminAudit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	filter := audit.Filter{
+		Actor:  q.Get("actor"),
+		Op:     q.Get("op"),
+		Target: q.Get("target"),
+		Since:  parseUnixSeconds(q.Get("since")),
+		Until:  parseUnixSeconds(q.Get("until")),
+	}
+
+	var entries []audit.Entry
+	if s.auditLog != nil {
+		// List already returns newest-first and filtered; an uncapped read (limit 0)
+		// hands the full matching set to the shared paginator, which slices the page.
+		entries = s.auditLog.List(filter, 0)
+	}
+
+	limit, offset := parsePageParams(r)
+	writeList(w, entries, limit, offset)
+}
+
+// parseUnixSeconds parses a unix-seconds timestamp query parameter into a UTC
+// time.Time, returning the zero time (an unbounded time filter) for an absent or
+// unparseable value. Keeping the "garbage → unbounded" rule local to the audit
+// handler matches the graceful-degradation discipline of the cursor parser (a
+// bad token restarts pagination rather than erroring) — a malformed date widens
+// the window instead of failing the request.
+func parseUnixSeconds(v string) time.Time {
+	if v == "" {
+		return time.Time{}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(n, 0).UTC()
+}

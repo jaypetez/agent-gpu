@@ -7,7 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"testing"
+	"time"
 )
 
 // newTestClient returns a Client pointed at srv with a fixed token. The httptest
@@ -267,6 +270,112 @@ func TestListWorkers(t *testing.T) {
 	}
 	if len(workers) != 1 || workers[0].ID != "w1" {
 		t.Fatalf("unexpected workers: %+v", workers)
+	}
+}
+
+// TestListAudit proves the client decodes the typed audit entries from the
+// shared list envelope and sends the request to the audit endpoint with the
+// maximum page size.
+func TestListAudit(t *testing.T) {
+	t.Parallel()
+	var cap capture
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.method = r.Method
+		cap.path = r.URL.Path
+		_, _ = io.WriteString(w, `{"data":[`+
+			`{"time":"2026-01-02T03:04:45Z","actor":"key_a","op":"key.quota","target":"key_y","request_id":"r4","outcome":"success"},`+
+			`{"time":"2026-01-02T03:04:15Z","actor":"key_a","op":"key.create","target":"key_x","after":{"id":"key_x"},"request_id":"r1","outcome":"success"}`+
+			`],"pagination":{"next_cursor":null,"has_more":false}}`)
+	}))
+	defer srv.Close()
+
+	entries, err := newTestClient(t, srv).ListAudit(context.Background(), AuditFilter{})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	// Newest first, with the typed projection decoded.
+	if entries[0].Op != "key.quota" || entries[0].Actor != "key_a" || entries[0].Outcome != "success" {
+		t.Errorf("entry[0] wrong: %+v", entries[0])
+	}
+	if entries[1].Op != "key.create" || entries[1].After["id"] != "key_x" || entries[1].RequestID != "r1" {
+		t.Errorf("entry[1] wrong: %+v", entries[1])
+	}
+	if entries[0].Time.IsZero() {
+		t.Errorf("entry[0] time did not decode")
+	}
+	if cap.method != http.MethodGet || cap.path != "/v1/admin/audit" {
+		t.Fatalf("sent %s %s, want GET /v1/admin/audit", cap.method, cap.path)
+	}
+}
+
+// TestListAuditSendsFilter proves the filter fields (string fields and the time
+// bounds as unix seconds) are encoded as query parameters, and that the page
+// limit is preserved alongside them.
+func TestListAuditSendsFilter(t *testing.T) {
+	t.Parallel()
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_, _ = io.WriteString(w, `{"data":[],"pagination":{"next_cursor":null,"has_more":false}}`)
+	}))
+	defer srv.Close()
+
+	since := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	until := since.Add(time.Hour)
+	_, err := newTestClient(t, srv).ListAudit(context.Background(), AuditFilter{
+		Actor:  "key_a",
+		Op:     "key.create",
+		Target: "key_x",
+		Since:  since,
+		Until:  until,
+	})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if gotQuery.Get("actor") != "key_a" || gotQuery.Get("op") != "key.create" || gotQuery.Get("target") != "key_x" {
+		t.Errorf("string filters not sent: %v", gotQuery)
+	}
+	if gotQuery.Get("since") != strconv.FormatInt(since.Unix(), 10) {
+		t.Errorf("since = %q, want %d", gotQuery.Get("since"), since.Unix())
+	}
+	if gotQuery.Get("until") != strconv.FormatInt(until.Unix(), 10) {
+		t.Errorf("until = %q, want %d", gotQuery.Get("until"), until.Unix())
+	}
+	if gotQuery.Get("limit") != strconv.Itoa(maxPageSize) {
+		t.Errorf("limit = %q, want %d", gotQuery.Get("limit"), maxPageSize)
+	}
+}
+
+// TestListAuditFollowsCursor proves the client walks multiple pages of audit
+// entries while carrying the filter on every request.
+func TestListAuditFollowsCursor(t *testing.T) {
+	t.Parallel()
+	var sawActorEachPage = true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("actor") != "key_a" {
+			sawActorEachPage = false
+		}
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = io.WriteString(w, `{"data":[{"op":"key.create"}],"pagination":{"next_cursor":"MQ","has_more":true}}`)
+		default:
+			_, _ = io.WriteString(w, `{"data":[{"op":"key.revoke"}],"pagination":{"next_cursor":null,"has_more":false}}`)
+		}
+	}))
+	defer srv.Close()
+
+	entries, err := newTestClient(t, srv).ListAudit(context.Background(), AuditFilter{Actor: "key_a"})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 2 || entries[0].Op != "key.create" || entries[1].Op != "key.revoke" {
+		t.Fatalf("cursor follow assembled wrong list: %+v", entries)
+	}
+	if !sawActorEachPage {
+		t.Errorf("filter actor was not carried on every paged request")
 	}
 }
 

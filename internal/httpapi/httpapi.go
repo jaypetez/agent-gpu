@@ -307,6 +307,7 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /v1/admin/workers", s.requireScope(authz.ScopeWorkersRead, s.handleAdminListWorkers))
 	mux.Handle("POST /v1/admin/workers/{id}/drain", s.requireScopeWrite(authz.ScopeWorkersWrite, s.handleAdminDrainWorker))
 	mux.Handle("GET /v1/admin/stats", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminStats))
+	mux.Handle("GET /v1/admin/audit", s.requireScope(authz.ScopeAuditRead, s.handleAdminAudit))
 }
 
 // ListenAndServe binds s.listen and serves until the listener is closed or

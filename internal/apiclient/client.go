@@ -204,6 +204,43 @@ type Worker struct {
 	LastSeen   int64    `json:"last_seen"`
 }
 
+// AuditEntry is one record of the admin audit log (GET /v1/admin/audit): who did
+// it (Actor key id), what (Op), to which resource (Target), the redacted
+// before/after metadata projection of the affected object, the request
+// correlation id, and the outcome. It mirrors httpapi/audit.Entry field-for-field
+// and, like the server-side record, NEVER carries secret material (the
+// before/after maps hold only safe metadata fields). Time is RFC3339; Before and
+// After are absent for operations with no prior/posterior object.
+type AuditEntry struct {
+	Time      time.Time      `json:"time"`
+	Actor     string         `json:"actor"`
+	Op        string         `json:"op"`
+	Target    string         `json:"target"`
+	Before    map[string]any `json:"before,omitempty"`
+	After     map[string]any `json:"after,omitempty"`
+	RequestID string         `json:"request_id"`
+	Outcome   string         `json:"outcome"`
+}
+
+// AuditFilter narrows a ListAudit query. Every field is optional; a zero
+// AuditFilter requests the whole log. Non-empty string fields and non-zero time
+// bounds are ANDed by the server, matching httpapi/audit.Filter: Since is
+// inclusive, Until exclusive (a half-open window). The time bounds are sent as
+// unix seconds (the admin API's timestamp convention); a zero time omits that
+// bound.
+type AuditFilter struct {
+	// Actor, if non-empty, matches entries by exactly this actor key id.
+	Actor string
+	// Op, if non-empty, matches entries with exactly this operation name.
+	Op string
+	// Target, if non-empty, matches entries acting on exactly this resource id.
+	Target string
+	// Since, if non-zero, excludes entries recorded before it (inclusive bound).
+	Since time.Time
+	// Until, if non-zero, excludes entries recorded at or after it (exclusive bound).
+	Until time.Time
+}
+
 // listEnvelope is the shared cursor-paginated list response shape every admin
 // list endpoint returns ({"data":[...],"pagination":{...}}). It mirrors
 // httpapi.listEnvelope. The client follows next_cursor to assemble the full list.
@@ -364,6 +401,60 @@ func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
 		}
 		cursor = *out.Pagination.NextCursor
 	}
+}
+
+// ListAudit returns the admin audit-log entries matching filter (GET
+// /v1/admin/audit), newest first. Like ListKeys/ListWorkers the server returns
+// the cursor-paginated list envelope; this method requests the maximum page size
+// and follows the next_cursor until exhausted, so the caller sees the full
+// matching set. The filter's string fields and (as unix seconds) its time bounds
+// are sent as query parameters; the entries never carry secret material.
+func (c *Client) ListAudit(ctx context.Context, filter AuditFilter) ([]AuditEntry, error) {
+	base := auditQuery(filter)
+	var all []AuditEntry
+	cursor := ""
+	for {
+		var out listEnvelope[AuditEntry]
+		path := "/v1/admin/audit?limit=" + strconv.Itoa(maxPageSize) + base
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
+	}
+}
+
+// auditQuery renders an AuditFilter into the query-string suffix (each piece
+// prefixed with "&", to follow the leading "?limit=") for ListAudit. Empty string
+// fields and zero time bounds are omitted; the time bounds are encoded as unix
+// seconds to match the server's parsing.
+func auditQuery(f AuditFilter) string {
+	q := url.Values{}
+	if f.Actor != "" {
+		q.Set("actor", f.Actor)
+	}
+	if f.Op != "" {
+		q.Set("op", f.Op)
+	}
+	if f.Target != "" {
+		q.Set("target", f.Target)
+	}
+	if !f.Since.IsZero() {
+		q.Set("since", strconv.FormatInt(f.Since.Unix(), 10))
+	}
+	if !f.Until.IsZero() {
+		q.Set("until", strconv.FormatInt(f.Until.Unix(), 10))
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "&" + q.Encode()
 }
 
 // Get performs a raw authenticated GET against path and decodes the JSON body
