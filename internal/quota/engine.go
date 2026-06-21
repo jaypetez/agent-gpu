@@ -3,6 +3,7 @@ package quota
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/store"
@@ -15,12 +16,25 @@ import (
 // Limit resolution: a key's per-key Limits override the engine's global
 // defaults wholesale (a non-nil APIKey.Limits is used as-is; nil falls back to
 // defaults). Within the effective limits, a zero field means unlimited.
+//
+// The defaults and global limits are runtime-tunable (#92): SetDefaults and
+// SetGlobalLimits replace them live, with no restart, and every read of either
+// goes through limitMu so the live change is observed atomically by concurrent
+// request handlers. The CounterStore (which serializes the counter math) is a
+// separate concurrency domain; limitMu guards only the limit *values*, so a
+// limit update never contends with the counter hot path.
 type Engine struct {
-	cs       CounterStore
+	cs  CounterStore
+	now func() time.Time
+	log *slog.Logger
+
+	// limitMu guards defaults and global, the two runtime-tunable limit sets
+	// (#92). It is a small dedicated RWMutex separate from the CounterStore's
+	// serialization so a hot-path read of the limits is a cheap RLock and a
+	// SetDefaults/SetGlobalLimits never blocks counter reservations.
+	limitMu  sync.RWMutex
 	defaults Limits
 	global   Limits
-	now      func() time.Time
-	log      *slog.Logger
 }
 
 // globalKeyID is the reserved CounterStore key the server-wide (global) limiter
@@ -66,6 +80,47 @@ func WithGlobalLimits(rpm, tpm uint64) Option {
 	return func(e *Engine) { e.global = Limits{RPM: rpm, TPM: tpm} }
 }
 
+// SetDefaults replaces the per-key default limits at runtime (#92), applied to
+// keys whose own Limits are nil. It takes effect immediately for every
+// subsequent request — there is no restart — because effectiveLimits reads the
+// defaults under limitMu. It is safe for concurrent use.
+func (e *Engine) SetDefaults(d Limits) {
+	e.limitMu.Lock()
+	defer e.limitMu.Unlock()
+	e.defaults = d
+}
+
+// SetGlobalLimits replaces the server-wide (global) RPM/TPM limits at runtime
+// (#92). rpm caps total requests-per-minute across the whole fleet; tpm caps
+// total tokens-per-minute; a zero value for either dimension means UNLIMITED for
+// that dimension (turning global limiting off for it). It takes effect
+// immediately for every subsequent request — there is no restart — because
+// CheckAndReserveGlobal/RecordGlobalTokens read the global limits under limitMu.
+// It is safe for concurrent use.
+func (e *Engine) SetGlobalLimits(rpm, tpm uint64) {
+	e.limitMu.Lock()
+	defer e.limitMu.Unlock()
+	e.global = Limits{RPM: rpm, TPM: tpm}
+}
+
+// Defaults returns the current per-key default limits (#92), read under limitMu
+// so it reflects any live SetDefaults. It backs the admin config GET projection
+// and the runtime-config setter tests.
+func (e *Engine) Defaults() Limits {
+	e.limitMu.RLock()
+	defer e.limitMu.RUnlock()
+	return e.defaults
+}
+
+// GlobalLimits returns the current server-wide (global) limits (#92), read under
+// limitMu so it reflects any live SetGlobalLimits. It backs the admin config GET
+// projection and the runtime-config setter tests.
+func (e *Engine) GlobalLimits() Limits {
+	e.limitMu.RLock()
+	defer e.limitMu.RUnlock()
+	return e.global
+}
+
 // NewEngine constructs an Engine over cs. Without WithClock it uses time.Now;
 // without WithLogger it audits to slog.Default(); without WithDefaults all
 // dimensions are unlimited.
@@ -82,11 +137,14 @@ func NewEngine(cs CounterStore, opts ...Option) *Engine {
 }
 
 // effectiveLimits returns the limits applied to key: its own Limits if set,
-// else the engine defaults.
+// else the engine defaults. The defaults are read under limitMu so a live
+// SetDefaults (#92) is observed atomically.
 func (e *Engine) effectiveLimits(key store.APIKey) Limits {
 	if key.Limits != nil {
 		return *key.Limits
 	}
+	e.limitMu.RLock()
+	defer e.limitMu.RUnlock()
 	return e.defaults
 }
 
@@ -171,7 +229,9 @@ func (e *Engine) CheckAndReserve(ctx context.Context, key store.APIKey) error {
 // real key's counters, so an allowed request is still independently subject to
 // its per-key CheckAndReserve.
 func (e *Engine) CheckAndReserveGlobal(ctx context.Context) error {
+	e.limitMu.RLock()
 	lim := e.global
+	e.limitMu.RUnlock()
 	if lim.RPM == 0 && lim.TPM == 0 {
 		return nil // global limiting disabled: byte-identical to the pre-#6 path.
 	}
@@ -258,7 +318,10 @@ func (e *Engine) RecordGlobalTokens(ctx context.Context, n uint64) {
 	if n == 0 {
 		return
 	}
-	if e.global.RPM == 0 && e.global.TPM == 0 {
+	e.limitMu.RLock()
+	g := e.global
+	e.limitMu.RUnlock()
+	if g.RPM == 0 && g.TPM == 0 {
 		return // global limiting disabled: never touch the store (zero overhead).
 	}
 	now := e.now().UTC()

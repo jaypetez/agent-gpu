@@ -901,6 +901,78 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/config:
+    get:
+      operationId: adminGetConfig
+      summary: Get the effective server settings
+      description: |
+        Returns the effective resolved server settings: the runtime-tunable values under `settings`
+        and the boot-only values under `read_only` (also enumerated by key in `read_only_fields`).
+        Boot-only settings — the listen addresses, the quota/session checkpoint paths, and the log
+        format/output — can only be changed by restarting the server with a new flag/env value; the
+        runtime-tunable values can be changed live via `PUT /v1/admin/config`. The settings carry no
+        secrets. Requires the `config:read` scope (the `admin` role grants it). Returns `503` when the
+        runtime-config subsystem is not enabled.
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The effective resolved settings (runtime-tunable plus boot-only read-only).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    put:
+      operationId: adminUpdateConfig
+      summary: Update server settings live (hot-reload)
+      description: |
+        Applies a **partial** update to the runtime-tunable settings, taking effect **live with no
+        restart**. Only fields present in the body change; omitted fields are left untouched. The
+        update is validated in full BEFORE anything is applied — an out-of-range or wrong-typed value,
+        a boot-only field (the listen addresses, checkpoint paths, or log format/output), or an unknown
+        field is rejected with `400` and **nothing** is changed. Durations are Go duration strings
+        (e.g. `"30m"`, `"45s"`); session TTL, model-warm-max, and heartbeat-timeout must be positive;
+        the log level is one of `debug`/`info`/`warn`/`error`; the session overflow policy is `trim` or
+        `reject`. Each change is audited and checkpointed, so it survives a restart (a persisted change
+        wins over the boot flags for that field). Requires the `config:write` scope (the `admin` role
+        grants it). Supports the `Idempotency-Key` header. Returns `503` when the runtime-config
+        subsystem is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminConfigUpdateRequest"
+            example:
+              log_level: debug
+              session_ttl: 1h0m0s
+              quota_global_rpm: 600
+      responses:
+        "200":
+          description: The effective resolved settings after the update.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -2071,6 +2143,224 @@ components:
           type: integer
           format: int64
           description: Unix epoch seconds when the month window next resets.
+
+    AdminConfigSettings:
+      type: object
+      description: |
+        The runtime-tunable server settings (#92). Every field here can be changed live via
+        `PUT /v1/admin/config` with no restart. Durations are Go duration strings (e.g. `30m0s`).
+        Quota/session limits of `0` mean "unlimited" for that dimension.
+      required:
+        - log_level
+        - quota_default_rpm
+        - quota_default_tpm
+        - quota_default_daily_tokens
+        - quota_default_monthly_tokens
+        - quota_global_rpm
+        - quota_global_tpm
+        - session_ttl
+        - session_max_turns
+        - session_max_bytes
+        - session_max_context_tokens
+        - session_max_sessions_per_key
+        - session_overflow_policy
+        - model_warm_max
+        - heartbeat_timeout
+      properties:
+        log_level:
+          type: string
+          description: Minimum structured-log level emitted.
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        quota_default_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default requests-per-minute (0 = unlimited).
+        quota_default_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default tokens-per-minute (0 = unlimited).
+        quota_default_daily_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default daily token budget (0 = unlimited).
+        quota_default_monthly_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default monthly token budget (0 = unlimited).
+        quota_global_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Server-wide requests-per-minute cap across the whole fleet (0 = unlimited).
+        quota_global_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Server-wide tokens-per-minute cap across the whole fleet (0 = unlimited).
+        session_ttl:
+          type: string
+          description: Per-session idle timeout as a Go duration string (must be positive).
+        session_max_turns:
+          type: integer
+          minimum: 0
+          description: Per-session conversation turn cap (0 = unbounded).
+        session_max_bytes:
+          type: integer
+          minimum: 0
+          description: Per-session cumulative-content byte cap (0 = unbounded).
+        session_max_context_tokens:
+          type: integer
+          minimum: 0
+          description: Per-session cumulative context-token cap (0 = unbounded).
+        session_max_sessions_per_key:
+          type: integer
+          minimum: 0
+          description: Concurrent active sessions a single owner key may hold (0 = unlimited).
+        session_overflow_policy:
+          type: string
+          description: Over-cap history behavior.
+          enum:
+            - trim
+            - reject
+        model_warm_max:
+          type: string
+          description: Max model-warmth keep_alive window for session-bound jobs, as a Go duration string (must be positive).
+        heartbeat_timeout:
+          type: string
+          description: Window a worker may go without a heartbeat before eviction, as a Go duration string (must be positive).
+
+    AdminConfigReadOnly:
+      type: object
+      description: |
+        The boot-only server settings (#92), surfaced read-only. These can only be changed by
+        restarting the server with a new flag/env value; `PUT /v1/admin/config` rejects any attempt
+        to change them with `400`.
+      required:
+        - server_listen
+        - server_http_listen
+        - server_metrics_listen
+        - quota_path
+        - session_path
+        - log_format
+        - log_output
+      properties:
+        server_listen:
+          type: string
+          description: The gRPC control-plane listen address.
+        server_http_listen:
+          type: string
+          description: The public HTTP API listen address.
+        server_metrics_listen:
+          type: string
+          description: The Prometheus metrics listen address (empty when disabled).
+        quota_path:
+          type: string
+          description: The quota counter checkpoint file path.
+        session_path:
+          type: string
+          description: The session+history checkpoint file path.
+        log_format:
+          type: string
+          description: The structured-log encoding (json or text).
+        log_output:
+          type: string
+          description: The structured-log sink (stderr, stdout, or a file path).
+
+    AdminConfigResponse:
+      type: object
+      description: |
+        The effective resolved server settings (#92): the runtime-tunable values, the boot-only
+        values flagged read-only, and the explicit list of boot-only field keys.
+      required:
+        - settings
+        - read_only
+        - read_only_fields
+      properties:
+        settings:
+          $ref: "#/components/schemas/AdminConfigSettings"
+        read_only:
+          $ref: "#/components/schemas/AdminConfigReadOnly"
+        read_only_fields:
+          type: array
+          description: The boot-only field keys, which `PUT /v1/admin/config` rejects.
+          items:
+            type: string
+
+    AdminConfigUpdateRequest:
+      type: object
+      description: |
+        A partial update of the runtime-tunable settings (#92). Every field is optional; only the
+        fields present are changed. The whole update is validated before anything is applied — an
+        invalid value, a boot-only field, or an unknown field is rejected with `400` and nothing is
+        changed. Durations are Go duration strings; session TTL, model-warm-max, and heartbeat-timeout
+        must be positive.
+      additionalProperties: false
+      properties:
+        log_level:
+          type: string
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        quota_default_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_default_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_default_daily_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_default_monthly_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_global_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_global_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+        session_ttl:
+          type: string
+          description: A Go duration string (must be positive), e.g. "30m".
+        session_max_turns:
+          type: integer
+          minimum: 0
+        session_max_bytes:
+          type: integer
+          minimum: 0
+        session_max_context_tokens:
+          type: integer
+          minimum: 0
+        session_max_sessions_per_key:
+          type: integer
+          minimum: 0
+        session_overflow_policy:
+          type: string
+          enum:
+            - trim
+            - reject
+        model_warm_max:
+          type: string
+          description: A Go duration string (must be positive), e.g. "1h".
+        heartbeat_timeout:
+          type: string
+          description: A Go duration string (must be positive), e.g. "45s".
 
     AdminWorkerView:
       type: object

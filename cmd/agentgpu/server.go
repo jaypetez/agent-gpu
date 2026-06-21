@@ -50,7 +50,7 @@ const auditLogCapacity = 100_000
 // the gRPC server.
 const httpShutdownTimeout = 10 * time.Second
 
-func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error {
+func runServerCmd(ctx context.Context, lh *logHandle, args []string) error {
 	if len(args) < 1 || args[0] != "start" {
 		return usagef("usage: agentgpu server start [--listen host:port]")
 	}
@@ -112,7 +112,11 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		MaxSessionsPerKey: *maxSessionsPerKey,
 		OverflowPolicy:    *sessionOverflow,
 	}, nil, nil)
-	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout)
+	// The log config is resolved here too (flag > env > default, idempotent with the
+	// resolution in dispatch) so the admin config endpoint (#92) can report the
+	// effective level/format/output and hot-reload the level.
+	lcfg := config.ResolveLog(config.LogConfig{}, nil)
+	return serveControlPlane(ctx, lh, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout, lcfg)
 }
 
 // metricsListenOff reports whether the operator explicitly turned the metrics
@@ -142,7 +146,8 @@ func metricsListenOff(fs *flag.FlagSet, flagValue string) bool {
 // serveControlPlane starts the gRPC control-plane server and blocks until ctx
 // is cancelled (SIGINT/SIGTERM), then shuts down gracefully, checkpointing the
 // quota counters on the way out.
-func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, scfg config.SessionConfig, heartbeatTimeout time.Duration) error {
+func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, scfg config.SessionConfig, heartbeatTimeout time.Duration, lcfg config.LogConfig) error {
+	logger := lh.Logger
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.Listen, err)
@@ -289,13 +294,60 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		return fmt.Errorf("load audit checkpoint: %w", err)
 	}
 
+	// Runtime settings/config (#92): the effective resolved tunable values seed the
+	// admin config holder, the boot-only values are surfaced read-only, and the
+	// appliers wire each tunable field to the matching thread-safe subsystem setter
+	// so a PUT /v1/admin/config takes effect live with no restart. The log-level
+	// applier flips the dynamic level via the log handle threaded down from dispatch;
+	// the session-caps applier replaces the history store's caps and the manager's
+	// per-key cap as a unit, parsing the overflow policy (an unrecognized value is
+	// rejected so a bad PUT is a 400, not a silent trim fallback).
+	configInitial := httpapi.ConfigSettings{
+		LogLevel:                  lcfg.Level,
+		QuotaDefaultRPM:           qcfg.DefaultRPM,
+		QuotaDefaultTPM:           qcfg.DefaultTPM,
+		QuotaDefaultDailyTokens:   qcfg.DefaultDailyTokens,
+		QuotaDefaultMonthlyTokens: qcfg.DefaultMonthlyTokens,
+		QuotaGlobalRPM:            qcfg.GlobalRPM,
+		QuotaGlobalTPM:            qcfg.GlobalTPM,
+		SessionTTL:                scfg.TTL.String(),
+		SessionMaxTurns:           scfg.MaxTurns,
+		SessionMaxBytes:           scfg.MaxBytes,
+		SessionMaxContextTokens:   scfg.MaxContextTokens,
+		SessionMaxSessionsPerKey:  scfg.MaxSessionsPerKey,
+		SessionOverflowPolicy:     overflow.String(),
+		ModelWarmMax:              scfg.ModelWarmMax.String(),
+		HeartbeatTimeout:          heartbeatTimeout.String(),
+	}
+	configBoot := httpapi.ConfigReadOnly{
+		ServerListen:        cfg.Listen,
+		ServerHTTPListen:    cfg.HTTPListen,
+		ServerMetricsListen: metricsAddr,
+		QuotaPath:           qcfg.Path,
+		SessionPath:         sessPath,
+		LogFormat:           lcfg.Format,
+		LogOutput:           lcfg.Output,
+	}
+	configAppliers := buildConfigAppliers(lh, eng, mgr, histStore, srv)
+	configPath := configCheckpointPath(qcfg.Path)
+
 	// Public HTTP API: authenticates Bearer tokens via the same key store and
 	// permission-filters the catalog with the shared authorizer above. The same
-	// Prometheus instrument is threaded in so the request path is metered, and the
-	// audit log records every admin write.
+	// Prometheus instrument is threaded in so the request path is metered, the
+	// audit log records every admin write, and the runtime-config holder backs the
+	// settings/config endpoints (#92).
 	authSvc := auth.NewService(st)
 	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen,
-		httpapi.WithAuditLog(auditLog))
+		httpapi.WithAuditLog(auditLog),
+		httpapi.WithRuntimeConfig(configInitial, configBoot, configAppliers, configPath))
+
+	// Re-apply any persisted PUT overrides on top of the freshly-resolved config, so
+	// an operator's prior config change survives this restart and wins over the boot
+	// flags for those tunable fields (#92). A missing file or a bad value is
+	// tolerated (the boot value stands), so a corrupted checkpoint cannot wedge startup.
+	if err := httpSrv.LoadConfigCheckpoint(configPath); err != nil {
+		return fmt.Errorf("load config checkpoint: %w", err)
+	}
 
 	// Metrics listener (#24): a second HTTP server serving only /metrics on a
 	// dedicated port, unauthenticated (it is an operational port, not the public
@@ -433,6 +485,16 @@ func sessionHistoryPath(sessionPath string) string {
 // an operator needs to relocate it.
 func auditCheckpointPath(quotaPath string) string {
 	return filepath.Join(filepath.Dir(quotaPath), "audit.json")
+}
+
+// configCheckpointPath derives the runtime-config override checkpoint path from
+// the quota checkpoint path: config.json alongside the other control-plane state
+// files (#92). The config overrides share the state directory and lifecycle with
+// quota/session/audit, so they need no separate flag; the file holds ONLY the
+// fields changed via PUT (an override map), re-applied on top of the resolved boot
+// config at startup so a prior PUT survives a restart.
+func configCheckpointPath(quotaPath string) string {
+	return filepath.Join(filepath.Dir(quotaPath), "config.json")
 }
 
 // sessionKeepSet returns the ids of the sessions currently in the store, used as
