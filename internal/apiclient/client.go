@@ -182,6 +182,29 @@ type QuotaUsage struct {
 	MonthResetsAt  int64 `json:"month_resets_at"`
 }
 
+// RolesCatalog is the GET /v1/admin/roles response: the assignable roles (each
+// with the inference actions and admin-scope grant it provides) plus the full
+// admin-scope vocabulary. It is the static metadata a permissions editor renders
+// its role/scope pickers against; it carries no per-key state. Mirrors
+// httpapi.adminRolesResponse. Both slices are present (never nil).
+type RolesCatalog struct {
+	Roles  []RoleInfo `json:"roles"`
+	Scopes []string   `json:"scopes"`
+}
+
+// RoleInfo describes one assignable role's grants for the editor UI: its name and
+// description, the inference actions it grants (as op strings "pull"/"load"/
+// "infer"), the breadth those actions apply to (ModelScope: "all" or
+// "allow-listed"), and whether it implicitly grants every admin scope (the admin
+// superuser). Mirrors httpapi.adminRoleView / authz.RoleInfo.
+type RoleInfo struct {
+	Name                 string   `json:"name"`
+	Description          string   `json:"description"`
+	InferenceActions     []string `json:"inference_actions"`
+	ModelScope           string   `json:"model_scope"`
+	GrantsAllAdminScopes bool     `json:"grants_all_admin_scopes"`
+}
+
 // Model is one entry of the richer GET /models catalog: the model name, its
 // digest, and the Online workers serving it. Mirrors httpapi.modelEntry.
 type Model struct {
@@ -445,6 +468,17 @@ func (c *Client) SetQuota(ctx context.Context, id string, req QuotaRequest) (Key
 func (c *Client) GetQuota(ctx context.Context, id string) (QuotaUsage, error) {
 	var out QuotaUsage
 	err := c.do(ctx, http.MethodGet, "/v1/admin/keys/"+id+"/quota", nil, &out)
+	return out, err
+}
+
+// ListRoles returns the assignable-role + admin-scope catalog (GET
+// /v1/admin/roles): each role with the inference actions and admin scopes it
+// grants, plus the full scope vocabulary. It is the static metadata a permissions
+// editor renders against so it need not reverse-engineer the server's
+// authorization rules. Requires the keys:read scope (the admin role grants it).
+func (c *Client) ListRoles(ctx context.Context) (RolesCatalog, error) {
+	var out RolesCatalog
+	err := c.do(ctx, http.MethodGet, "/v1/admin/roles", nil, &out)
 	return out, err
 }
 

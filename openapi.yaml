@@ -441,8 +441,10 @@ paths:
       description: |
         Mints a new API key with the requested roles, admin scopes, and per-model allow/deny lists,
         and returns its id together with the **one-time** plaintext token. The token is shown exactly
-        once and cannot be recovered afterward. Requires the `keys:write` scope (the `admin` role
-        grants it). Supports the `Idempotency-Key` header so a retry does not mint a duplicate key.
+        once and cannot be recovered afterward. An unknown role or admin scope is rejected with `400`
+        (no key is created); `GET /v1/admin/roles` enumerates the valid roles and scopes. Requires the
+        `keys:write` scope (the `admin` role grants it). Supports the `Idempotency-Key` header so a
+        retry does not mint a duplicate key.
       tags:
         - Admin
       parameters:
@@ -595,8 +597,10 @@ paths:
         Replaces the key's roles, admin scopes, and per-model allow/deny lists (a full replace, not a
         merge: an omitted or null list clears that dimension) and returns the updated metadata, or
         `404` if the id is unknown. The change takes effect immediately. Requires the `keys:write`
-        scope (the `admin` role grants it). An unknown admin scope is rejected with `400`. Supports
-        the `Idempotency-Key` header.
+        scope (the `admin` role grants it). An unknown role **or** an unknown admin scope is rejected
+        with `400`, and validation runs before any mutation so a rejected request leaves the key
+        unchanged; `GET /v1/admin/roles` enumerates the valid roles and scopes. Supports the
+        `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
@@ -754,6 +758,74 @@ paths:
           $ref: "#/components/responses/InternalError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/roles:
+    get:
+      operationId: adminListRoles
+      summary: List assignable roles and admin scopes
+      description: |
+        Returns the catalog a permissions editor renders its pickers against: the assignable roles —
+        each with the inference actions it grants (`pull`/`load`/`infer`), the breadth those actions
+        apply to (`model_scope`), and whether it implicitly grants every admin scope — plus the
+        complete admin-scope vocabulary. This is exactly what the authorization engine enforces, so a
+        GUI need not reverse-engineer the role rules. Roles are returned in privilege order
+        (`admin` → `user` → `read-only`); `scopes` is the sorted scope vocabulary (the same set
+        `PUT /v1/admin/keys/{id}/permissions` validates against). The document is static — it carries
+        no per-key state and no secrets. Requires the `keys:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The assignable-role catalog and the admin-scope vocabulary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminRolesResponse"
+              example:
+                roles:
+                  - name: admin
+                    description: "Superuser: every inference action on every model (ignoring allow/deny) and every admin scope."
+                    inference_actions:
+                      - pull
+                      - load
+                      - infer
+                    model_scope: all
+                    grants_all_admin_scopes: true
+                  - name: user
+                    description: Pull, load, and infer, but only on allow-listed models (deny-list wins).
+                    inference_actions:
+                      - pull
+                      - load
+                      - infer
+                    model_scope: allow-listed
+                    grants_all_admin_scopes: false
+                  - name: read-only
+                    description: Infer only (never pull or load), on allow-listed models (deny-list wins).
+                    inference_actions:
+                      - infer
+                    model_scope: allow-listed
+                    grants_all_admin_scopes: false
+                scopes:
+                  - audit:read
+                  - audit:write
+                  - config:read
+                  - config:write
+                  - keys:read
+                  - keys:write
+                  - logs:read
+                  - logs:write
+                  - models:read
+                  - models:write
+                  - telemetry:read
+                  - telemetry:write
+                  - workers:read
+                  - workers:write
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
 
   /v1/admin/workers:
     get:
@@ -3077,3 +3149,72 @@ components:
           format: int64
           minimum: 0
           description: The number of jobs the worker is currently running.
+
+    AdminRolesResponse:
+      type: object
+      description: |
+        The role/scope catalog returned by `GET /v1/admin/roles`: the assignable roles (each with the
+        inference actions and admin-scope grant it provides) and the complete admin-scope vocabulary,
+        so a permissions editor can render its pickers without reverse-engineering the authorization
+        rules. Static metadata — no per-key state, no secrets. Both arrays are always present.
+      required:
+        - roles
+        - scopes
+      properties:
+        roles:
+          type: array
+          description: The assignable roles, in privilege order (`admin` → `user` → `read-only`).
+          items:
+            $ref: "#/components/schemas/AdminRoleInfo"
+        scopes:
+          type: array
+          description: |
+            The complete admin-scope vocabulary (sorted), i.e. every scope a key may be granted and
+            the exact set the `admin` role implicitly holds.
+          items:
+            $ref: "#/components/schemas/AdminScope"
+
+    AdminRoleInfo:
+      type: object
+      description: |
+        One assignable role's grants: the inference actions it permits, the breadth of models those
+        actions apply to, and whether it implicitly grants every admin scope (the `admin` superuser).
+        It mirrors exactly what dispatch-time authorization enforces for the role.
+      required:
+        - name
+        - description
+        - inference_actions
+        - model_scope
+        - grants_all_admin_scopes
+      properties:
+        name:
+          $ref: "#/components/schemas/Role"
+        description:
+          type: string
+          description: A short human-readable summary of the role for the editor UI.
+        inference_actions:
+          type: array
+          description: |
+            The model actions the role grants, as the op strings the audit log uses, in
+            pull → load → infer order. `user` and `admin` grant all three; `read-only` grants only
+            `infer`.
+          items:
+            type: string
+            enum:
+              - pull
+              - load
+              - infer
+        model_scope:
+          type: string
+          description: |
+            The breadth the role's inference actions apply to: `all` (every model, ignoring the
+            allow/deny lists — only `admin`) or `allow-listed` (only the key's allow-listed models,
+            with the deny-list winning).
+          enum:
+            - all
+            - allow-listed
+        grants_all_admin_scopes:
+          type: boolean
+          description: |
+            Whether the role implicitly holds every admin scope (true only for the `admin` superuser;
+            other roles hold only the scopes explicitly granted on the key).
