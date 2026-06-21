@@ -63,6 +63,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/session"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
+	usagepkg "github.com/jaypetez/agent-gpu/internal/usage"
 )
 
 // fleetSource is the subset of *server.Server the HTTP layer needs: a
@@ -122,6 +123,15 @@ type Server struct {
 	// built without a quota engine, e.g. in some unit tests); the handler guards
 	// against nil.
 	quota *quota.Engine
+
+	// usageSeries backs the rolling historical token series in GET /v1/admin/usage
+	// (#97): a bounded per-key daily series captured by the snapshotter goroutine in
+	// cmd. It is nil-safe — when nil (WithUsageSeries not supplied, e.g. most unit
+	// tests) the usage endpoint still serves the live per-key snapshot rows but with
+	// empty series and no forecast, so the series is a pure enrichment. It is read
+	// only here; the snapshotter that feeds it lives in cmd, mirroring how the quota
+	// counters are checkpointed there.
+	usageSeries *usagepkg.Store
 
 	// sessionMgr backs the session CRUD endpoints and stateful chat mode (#36).
 	// When nil, sessions are disabled: the /v1/sessions endpoints return 501 and
@@ -197,6 +207,16 @@ type Option func(*Server)
 // unaffected.
 func WithAuditLog(a *audit.MemoryStore) Option {
 	return func(s *Server) { s.auditLog = a }
+}
+
+// WithUsageSeries wires the rolling per-key daily usage series (#97) that backs
+// the historical sparkline and exhaustion forecast in GET /v1/admin/usage. A nil
+// store leaves the series disabled: the usage endpoint still serves the live
+// per-key snapshot rows (with empty series and no forecast), so callers and tests
+// that do not wire it behave exactly as before. The same *usage.Store is fed by
+// the snapshotter goroutine in cmd.
+func WithUsageSeries(u *usagepkg.Store) Option {
+	return func(s *Server) { s.usageSeries = u }
 }
 
 // NewServer constructs an HTTP API Server. grpcSrv supplies the fleet snapshot,
@@ -347,6 +367,12 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /v1/admin/workers/{id}/models", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminPullModel))
 	mux.Handle("DELETE /v1/admin/workers/{id}/models/{model...}", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminUnloadModel))
 	mux.Handle("GET /v1/admin/stats", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminStats))
+	// Per-key usage vs limits + a rolling historical series and best-effort
+	// exhaustion forecast (#97). A read-only roll-up over the same quota snapshot the
+	// per-key quota endpoint exposes, enriched with the bounded daily series. Gated
+	// to telemetry:read — it is usage telemetry, the same resource as the stats
+	// endpoint. Supports ?format=csv for a flat CSV export of the per-key rows.
+	mux.Handle("GET /v1/admin/usage", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminUsage))
 	mux.Handle("GET /v1/admin/audit", s.requireScope(authz.ScopeAuditRead, s.handleAdminAudit))
 	// Settings/config management (#92): the effective resolved settings (config:read)
 	// and a partial live hot-reload update (config:write, which additionally layers

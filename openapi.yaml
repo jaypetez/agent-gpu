@@ -1110,6 +1110,106 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/usage:
+    get:
+      operationId: adminGetUsage
+      summary: Get per-key usage vs limits with history and forecast
+      description: |
+        Returns, for every key, its current consumption versus its effective limits — the same live
+        usage snapshot the per-key `GET /v1/admin/keys/{id}/quota` endpoint reports (requests this
+        minute, tokens this minute/today/this month, and the per-window reset times) — enriched with
+        a bounded rolling **daily token series** (for a sparkline, at most 7 points, oldest first) and
+        a best-effort **exhaustion forecast** (the projected instant each token budget is reached at
+        the recent daily burn rate). A top-level `summary` carries the **aggregate** (server-wide)
+        throttle counts: the rate limiter tracks throttling fleet-wide, not per key, so per-key
+        throttling is deliberately not fabricated.
+
+        The rows are cursor-paginated in the shared list envelope (`data` + `pagination`), sorted by
+        `key_id`. The optional `key_id`, `owner`, and `team` query parameters filter the rows by exact
+        match (ANDed; an empty filter matches all). Pass `format=csv` to download the same per-key rows
+        as a flat CSV export (`text/csv`) — the CSV is the **full** filtered set (an export, not a
+        paginated view) and omits the variable-length series and the fleet-wide summary.
+
+        The forecast is an **estimate** for dashboard rendering, not an enforcement input — the quota
+        engine alone decides admission; a forecast field is `null` when the budget is unlimited, usage
+        is not rising, or there is too little history to project a slope. The series is a pure
+        enrichment: when the historical-series subsystem is not wired the rows are still served with an
+        empty `series` and a null forecast. Contains no secrets. Requires the `telemetry:read` scope
+        (the `admin` role grants it). Returns `501` when the quota engine is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/UsageKeyID"
+        - $ref: "#/components/parameters/UsageOwner"
+        - $ref: "#/components/parameters/UsageTeam"
+        - $ref: "#/components/parameters/UsageFormat"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: |
+            The per-key usage rows (cursor-paginated) plus the fleet-wide throttle summary, or — when
+            `format=csv` — a flat CSV export of the per-key rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUsageResponse"
+              example:
+                summary:
+                  key_count: 2
+                  global_throttled: 4
+                  key_throttled: 1
+                data:
+                  - key_id: 0a1b2c3d4e5f6a7b
+                    name: batch-jobs
+                    owner: alice@example.com
+                    team: platform
+                    limits:
+                      rpm: 60
+                      tpm: 0
+                      daily_tokens: 1000000
+                      monthly_tokens: 0
+                    requests_this_minute: 3
+                    tokens_this_minute: 1200
+                    tokens_today: 640000
+                    tokens_this_month: 5120000
+                    minute_resets_at: 1718960460
+                    day_resets_at: 1719014400
+                    month_resets_at: 1719792000
+                    series:
+                      - day: 1718841600
+                        tokens: 420000
+                        requests: 2
+                      - day: 1718928000
+                        tokens: 640000
+                        requests: 3
+                    forecast:
+                      daily_exhaustion_at: 1718999100
+                      monthly_exhaustion_at: null
+                pagination:
+                  next_cursor: null
+                  has_more: false
+            text/csv:
+              schema:
+                type: string
+                description: |
+                  A flat CSV export with a header row and one row per key:
+                  `key_id,name,owner,team,rpm_limit,tpm_limit,daily_tokens_limit,monthly_tokens_limit,`
+                  `requests_this_minute,tokens_this_minute,tokens_today,tokens_this_month,`
+                  `daily_exhaustion_at,monthly_exhaustion_at`. Forecast columns are unix seconds or
+                  empty when there is no estimate.
+              example: |
+                key_id,name,owner,team,rpm_limit,tpm_limit,daily_tokens_limit,monthly_tokens_limit,requests_this_minute,tokens_this_minute,tokens_today,tokens_this_month,daily_exhaustion_at,monthly_exhaustion_at
+                0a1b2c3d4e5f6a7b,batch-jobs,alice@example.com,platform,60,0,1000000,0,3,1200,640000,5120000,1718999100,
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
   /v1/admin/audit:
     get:
       operationId: adminListAudit
@@ -1353,6 +1453,38 @@ components:
         type: integer
         format: int64
         minimum: 0
+    UsageKeyID:
+      name: key_id
+      in: query
+      required: false
+      description: Filter usage rows to exactly this key id. An empty value matches all keys.
+      schema:
+        type: string
+    UsageOwner:
+      name: owner
+      in: query
+      required: false
+      description: Filter usage rows to keys whose `owner` label matches exactly. An empty value matches all keys.
+      schema:
+        type: string
+    UsageTeam:
+      name: team
+      in: query
+      required: false
+      description: Filter usage rows to keys whose `team` label matches exactly. An empty value matches all keys.
+      schema:
+        type: string
+    UsageFormat:
+      name: format
+      in: query
+      required: false
+      description: |
+        The response format. The default (omitted) is the JSON envelope; `csv` returns a flat CSV
+        export of the per-key rows (`text/csv`), which is the full filtered set (not paginated).
+      schema:
+        type: string
+        enum:
+          - csv
 
   responses:
     Unauthorized:
@@ -3040,6 +3172,175 @@ components:
           format: int64
           minimum: 0
           description: The cumulative count of recorded waits less than or equal to `le_ms`.
+
+    AdminUsageResponse:
+      type: object
+      description: |
+        The per-key usage report returned by `GET /v1/admin/usage`: a fleet-wide throttle summary plus
+        the cursor-paginated per-key usage rows (in the shared list envelope shape). The summary sits
+        alongside the list so a dashboard reads the aggregate throttle counts once regardless of which
+        page it fetched. Contains no secrets.
+      required:
+        - summary
+        - data
+        - pagination
+      properties:
+        summary:
+          $ref: "#/components/schemas/AdminUsageSummary"
+        data:
+          type: array
+          description: The per-key usage rows for this page, sorted by `key_id`.
+          items:
+            $ref: "#/components/schemas/AdminUsageRow"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AdminUsageSummary:
+      type: object
+      description: |
+        The top-level, fleet-wide section of the usage report. The throttle counts are **aggregate**
+        (server-wide), sourced from the rate limiter — which does not attribute throttling to
+        individual keys — so they are reported once here and never per row.
+      required:
+        - key_count
+        - global_throttled
+        - key_throttled
+      properties:
+        key_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of keys matched by the active filters (the full result set, not just this page).
+        global_throttled:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of requests rejected by the server-wide (global) rate limiter.
+        key_throttled:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of per-key quota 429s observed across all keys.
+
+    AdminUsageRow:
+      type: object
+      description: |
+        One key's usage row: its identity and labels, the live quota snapshot (current usage versus
+        effective limits, the same fields as `AdminQuotaUsageResponse`), the rolling daily token series
+        (a sparkline; empty when there is no history or the series subsystem is disabled), and a
+        best-effort exhaustion forecast.
+      required:
+        - key_id
+        - name
+        - limits
+        - requests_this_minute
+        - tokens_this_minute
+        - tokens_today
+        - tokens_this_month
+        - minute_resets_at
+        - day_resets_at
+        - month_resets_at
+        - series
+        - forecast
+      properties:
+        key_id:
+          type: string
+          description: The key id this row describes.
+        name:
+          type: string
+          description: The key's human label.
+        owner:
+          type: string
+          description: The key's optional owner label, omitted when unset.
+        team:
+          type: string
+          description: The key's optional team label, omitted when unset.
+        limits:
+          $ref: "#/components/schemas/Limits"
+        requests_this_minute:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_this_minute:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_today:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_this_month:
+          type: integer
+          format: int64
+          minimum: 0
+        minute_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the minute window next resets.
+        day_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the day window next resets.
+        month_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the month window next resets.
+        series:
+          type: array
+          description: |
+            The rolling daily token series, oldest first (at most 7 points). Always present (an empty
+            array, never null) so a client can iterate without a nil guard.
+          items:
+            $ref: "#/components/schemas/AdminUsageSeriesPoint"
+        forecast:
+          $ref: "#/components/schemas/AdminUsageForecast"
+
+    AdminUsageSeriesPoint:
+      type: object
+      description: One daily point of a key's usage series.
+      required:
+        - day
+        - tokens
+        - requests
+      properties:
+        day:
+          type: integer
+          format: int64
+          description: Unix epoch seconds at the UTC-midnight start of the day this point covers.
+        tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative tokens the key consumed during this day.
+        requests:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The requests observed in the minute window at sample time — a coarse activity signal, not a
+            daily request total (the quota engine retains no daily request count).
+
+    AdminUsageForecast:
+      type: object
+      description: |
+        A best-effort projection of when a key exhausts its token budgets at the recent daily burn
+        rate. It is an **estimate** for rendering, not an enforcement input. A field is `null` when the
+        budget is unlimited, usage is not rising, or there is insufficient history to project a slope.
+      required:
+        - daily_exhaustion_at
+        - monthly_exhaustion_at
+      properties:
+        daily_exhaustion_at:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Projected unix epoch seconds the daily token budget is reached, or `null` when there is no
+            estimate. Because the daily budget resets each UTC midnight, this is only meaningful within
+            the current day.
+        monthly_exhaustion_at:
+          type: [integer, "null"]
+          format: int64
+          description: Projected unix epoch seconds the monthly token budget is reached, or `null` when there is no estimate.
 
     AdminGPUsResponse:
       type: object
