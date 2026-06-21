@@ -91,6 +91,12 @@ type fleetSource interface {
 	AdminUnloadModel(ctx context.Context, workerID, model string) error
 	QueueStats() queue.Stats
 	WaitTimeStats() server.WaitTimeStats
+	// AffinityStats is the session-affinity hit/miss/rebind snapshot the telemetry
+	// dashboard reports (#98). Added here alongside QueueStats/WaitTimeStats — the
+	// other in-process control-plane mirrors this layer already reads — so the
+	// telemetry handler stays unit-testable with the fake fleet. *server.Server
+	// satisfies it (AffinityStats).
+	AffinityStats() server.AffinityStats
 }
 
 // inferenceEngine is the subset of *server.Server the chat/completions handlers
@@ -152,6 +158,18 @@ type Server struct {
 	// OpenAPI route set is unaffected).
 	metrics *metrics.Metrics
 
+	// requestStats is the lock-free in-process request-rate/latency accumulator
+	// (#98): a read-side mirror of the Prometheus request_duration histogram,
+	// updated inline by metricsMiddleware (atomics only, never a mutex) and read on
+	// demand by GET /v1/admin/telemetry. It exists because the Prometheus collectors
+	// are write-only in-process — there is no read API over a CounterVec/HistogramVec
+	// — so the JSON dashboard reads this rather than scraping Gather(). NewServer sets
+	// it up front; requestStatsOnce lazily constructs it for a Server built via a
+	// struct literal (some unit tests) so the hot path never dereferences nil. See
+	// telemetry.go.
+	requestStats     *requestStats
+	requestStatsOnce sync.Once
+
 	// auditLog is the append-only admin audit trail (#90): every admin WRITE
 	// records one redacted entry (actor, op, target, before/after, request_id,
 	// outcome). It is nil-safe — a nil store makes the recording calls no-ops, so
@@ -185,6 +203,17 @@ type Server struct {
 	// writeSubmitError. They are the throttle-metrics seam for #24 (Prometheus).
 	globalThrottled uint64
 	keyThrottled    uint64
+
+	// startedAt is the wall-clock instant the Server was constructed (NewServer),
+	// used to compute uptime_seconds in the telemetry summary (#98) so the GUI can
+	// derive request rate from the monotonic requests.count. It is set once in
+	// NewServer and read-only thereafter; a struct-literal Server (some unit tests)
+	// leaves it zero, in which case uptimeSeconds reports 0.
+	startedAt time.Time
+	// nowFunc is the clock uptimeSeconds reads, defaulting to time.Now. It is
+	// injectable only so a unit test can make uptime deterministic; production never
+	// overrides it. A nil nowFunc means time.Now (uptimeSeconds guards).
+	nowFunc func() time.Time
 
 	// httpSrv is constructed in NewServer (not in ListenAndServe) so the pointer
 	// is non-nil and stable before any goroutine starts or any Shutdown call
@@ -231,16 +260,19 @@ func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authoriz
 		log = slog.Default()
 	}
 	s := &Server{
-		fleet:       grpcSrv,
-		engine:      grpcSrv,
-		auth:        authSvc,
-		authz:       az,
-		quota:       grpcSrv.Quota(),
-		sessionMgr:  mgr,
-		metrics:     m,
-		log:         log,
-		listen:      listen,
-		idempotency: newIdempotencyCache(defaultIdempotencyTTL, idempotencyCacheMax),
+		fleet:        grpcSrv,
+		engine:       grpcSrv,
+		auth:         authSvc,
+		authz:        az,
+		quota:        grpcSrv.Quota(),
+		sessionMgr:   mgr,
+		metrics:      m,
+		log:          log,
+		listen:       listen,
+		idempotency:  newIdempotencyCache(defaultIdempotencyTTL, idempotencyCacheMax),
+		requestStats: &requestStats{},
+		startedAt:    time.Now(),
+		nowFunc:      time.Now,
 	}
 	for _, o := range opts {
 		o(s)
@@ -367,6 +399,12 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /v1/admin/workers/{id}/models", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminPullModel))
 	mux.Handle("DELETE /v1/admin/workers/{id}/models/{model...}", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminUnloadModel))
 	mux.Handle("GET /v1/admin/stats", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminStats))
+	// Dashboard telemetry summary (#98): request rate/latency, throttles, fleet
+	// health by status, active sessions, and affinity hit/miss in ONE call. A
+	// read-only JSON facade over the SAME in-process collectors — it scrapes nothing
+	// from Prometheus and the /metrics listener is unchanged. Gated to telemetry:read
+	// (the same scope as the stats and usage endpoints) — it is monitoring telemetry.
+	mux.Handle("GET /v1/admin/telemetry", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminTelemetry))
 	// Per-key usage vs limits + a rolling historical series and best-effort
 	// exhaustion forecast (#97). A read-only roll-up over the same quota snapshot the
 	// per-key quota endpoint exposes, enriched with the bounded daily series. Gated
