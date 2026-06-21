@@ -121,8 +121,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Drop generated proto from the gate metric, then compute the func table.
-          grep -v 'proto/agentgpu/v1' coverage.out > coverage.gate.out
+          # Drop generated code from the gate metric, then compute the func table.
+          # Generated protobuf stubs (proto/agentgpu/v1) and generated templ render
+          # functions (*_templ.go, the admin console #100) are both 0%/low-covered
+          # by design — they are mechanical output, not hand-written logic — so they
+          # would unfairly drag the total. Exclude both so the ratchet reflects the
+          # coverage of code we actually author.
+          grep -v 'proto/agentgpu/v1' coverage.out | grep -v '_templ.go' > coverage.gate.out
           go tool cover -func=coverage.gate.out > coverage.func.txt
 
           total="$(awk '/^total:/ { gsub(/%/, "", $3); print $3 }' coverage.func.txt)"
@@ -204,6 +209,102 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           govulncheck ./...
+
+  ui:
+    name: ui
+    # The admin console (#100) commits generated artifacts — the templ Go
+    # (*_templ.go) and the Tailwind-built CSS (app.css) — so `go build` needs no
+    # Node. This job regenerates both from source and fails on any drift, the
+    # stricter check the proto flow lacks: a stale committed artifact (someone
+    # edited a .templ or the design tokens but forgot `make ui`) turns the build
+    # red here instead of silently shipping mismatched markup/styles.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Regenerate console artifacts (templ + Tailwind)
+        run: make ui
+
+      - name: Fail on drift in committed artifacts
+        # `go build` consumes the committed *_templ.go and app.css directly (no
+        # generation at build/release time — goreleaser cross-compiles with
+        # CGO_ENABLED=0 and no codegen step), so the committed artifacts MUST match
+        # their sources. Any diff means a regenerate-and-commit was missed.
+        run: git diff --exit-code -- internal/httpapi/webui
+
+  e2e:
+    name: e2e (console accessibility)
+    # End-to-end accessibility gate for the console (#100, AC6): build the binary,
+    # then drive the real login → dashboard flow headless under Chromium and assert
+    # WCAG AA with @axe-core/playwright. The build FAILS on any axe violation. A
+    # dashboard screenshot is uploaded as an artifact for visual review.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build the agentgpu binary (embedded console)
+        run: go build -o agentgpu ./cmd/agentgpu
+
+      - name: Install UI test deps
+        working-directory: ui
+        run: npm ci
+
+      - name: Install Playwright Chromium
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run console E2E (login → dashboard, axe AA)
+        working-directory: ui
+        env:
+          AGENTGPU_BIN: ${{ github.workspace }}/agentgpu
+        run: npm run test:e2e
+
+      - name: Upload console screenshots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: console-screenshots
+          path: ui/test-results/**
+          retention-days: 7
+          if-no-files-found: ignore
 
   docker:
     name: docker

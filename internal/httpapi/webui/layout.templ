@@ -1,0 +1,141 @@
+package webui
+
+// layout.templ — the console chrome: document head, topbar, role-gated sidebar,
+// and breadcrumbs. Every screen wraps its body in Shell(...). All styling comes
+// from token-derived utility classes in app.css (the committed Tailwind build);
+// no raw hex or arbitrary [...] values appear here (enforced by the token-lint
+// test). HTMX + Alpine are loaded from embedded, vendored assets — never a CDN.
+
+// Shell is the full-page frame. The body content is passed as children so each
+// screen supplies only its main panel. The asset path prefix is threaded through
+// so the same markup works for embedded assets (/admin/assets) and --ui-path dev.
+templ Shell(d ShellData) {
+	<!--
+	  agent-gpu admin console — a fleet-operations control plane.
+	  Server-rendered (templ) + HTMX + Alpine; embedded, CDN-free assets.
+	-->
+	<html lang="en" class="dark">
+		<head>
+		<meta charset="utf-8"/>
+		<meta name="viewport" content="width=device-width, initial-scale=1"/>
+		<meta name="color-scheme" content="dark"/>
+		<title>{ pageTitle(d.Title) }</title>
+		<link rel="icon" href={ d.AssetPath + "/img/favicon.svg" } type="image/svg+xml"/>
+		<link rel="stylesheet" href={ d.AssetPath + "/css/app.css" }/>
+		<script src={ d.AssetPath + "/js/htmx.min.js" } defer></script>
+		<script src={ d.AssetPath + "/js/alpine.min.js" } defer></script>
+	</head>
+	<body
+		class="min-h-screen bg-ground text-fg antialiased"
+		hx-headers={ csrfHeaderJSON(d.CSRFToken) }
+	>
+		<a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50 btn btn-primary">Skip to content</a>
+		<div class="flex min-h-screen">
+			@sidebar(d)
+			<div class="flex min-w-0 flex-1 flex-col">
+				@topbar(d)
+				<main id="main" class="flex-1 px-6 py-5" tabindex="-1">
+					@breadcrumbs(d.Crumbs)
+					{ children... }
+				</main>
+			</div>
+		</div>
+		<!-- Toast region: HTMX swaps notices in here; aria-live announces them. -->
+		<div
+			id="toasts"
+			class="pointer-events-none fixed bottom-4 right-4 z-50 flex flex-col gap-2"
+			aria-live="polite"
+			aria-atomic="false"
+		></div>
+		</body>
+	</html>
+}
+
+// topbar is the fixed application header: the product mark, a live indicator that
+// pulses while the dashboard polls (the single orchestrated motion), the signed-in
+// key id, and the logout control.
+templ topbar(d ShellData) {
+	<header class="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-surface px-6">
+		<div class="flex items-center gap-3">
+			<span class="font-mono text-sm font-semibold tracking-wide text-fg">agent-gpu</span>
+			<span class="text-fg-faint" aria-hidden="true">/</span>
+			<span class="text-sm text-fg-muted">console</span>
+		</div>
+		<div class="flex items-center gap-4">
+			if d.LiveStream {
+				<span class="flex items-center gap-2 text-xs text-fg-muted" title="Live telemetry connected">
+					<span class="live-dot" aria-hidden="true"></span>
+					<span class="font-mono uppercase tracking-wide">live</span>
+				</span>
+			}
+			<span class="hidden items-center gap-2 sm:flex">
+				<span class="text-xs text-fg-faint">key</span>
+				<span class="font-mono text-xs text-fg-muted" title={ "Signed in as key " + d.Viewer.KeyID }>{ shortID(d.Viewer.KeyID) }</span>
+			</span>
+			<form method="post" action={ templ.SafeURL(d.AssetPath + "/../logout") } class="contents">
+				@csrfField(d.CSRFToken)
+				<button type="submit" class="btn btn-ghost" title="Sign out and clear the session">
+					@iconLogout()
+					<span>Sign out</span>
+				</button>
+			</form>
+		</div>
+	</header>
+}
+
+// sidebar renders the role-gated information architecture. Only sections the
+// viewer holds the read-scope for are emitted (AC2/AC5): a non-admin operator
+// sees a strict subset, an admin sees all. The active section gets aria-current.
+templ sidebar(d ShellData) {
+	<nav class="hidden w-56 flex-none flex-col border-r border-line bg-surface md:flex" aria-label="Console sections">
+		<div class="flex h-14 items-center gap-2 border-b border-line px-4">
+			<span class="live-dot" aria-hidden="true"></span>
+			<span class="font-mono text-sm font-semibold text-fg">fleet control</span>
+		</div>
+		<ul class="flex flex-1 flex-col gap-1 p-3">
+			for _, n := range d.Nav {
+				if n.Visible {
+					<li>
+						<a
+							href={ templ.SafeURL(n.Href) }
+							class="nav-item"
+							if n.Section == d.Active {
+								aria-current="page"
+							}
+						>
+							@navIcon(n.Icon)
+							<span>{ n.Label }</span>
+						</a>
+					</li>
+				}
+			}
+		</ul>
+		<div class="border-t border-line p-3">
+			<p class="px-3 text-xs text-fg-faint">
+				Signed in as
+				<span class="font-mono text-fg-muted">{ roleLabel(d.Viewer) }</span>
+			</p>
+		</div>
+	</nav>
+}
+
+// breadcrumbs renders the trail under the topbar. The final crumb is the current
+// page (plain text); earlier crumbs link up. An empty trail renders nothing.
+templ breadcrumbs(crumbs []Crumb) {
+	if len(crumbs) > 0 {
+		<nav class="mb-5" aria-label="Breadcrumb">
+			<ol class="flex flex-wrap items-center gap-2 text-sm">
+				for i, c := range crumbs {
+					<li class="flex items-center gap-2">
+						if i < len(crumbs)-1 && c.Href != "" {
+							<a href={ templ.SafeURL(c.Href) } class="text-fg-muted hover:text-fg">{ c.Label }</a>
+							<span class="text-fg-faint" aria-hidden="true">/</span>
+						} else {
+							<span class="text-fg" aria-current="page">{ c.Label }</span>
+						}
+					</li>
+				}
+			</ol>
+		</nav>
+	}
+}

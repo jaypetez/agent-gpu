@@ -41,6 +41,15 @@ func keyFromContext(ctx context.Context) (store.APIKey, bool) {
 	return k, ok
 }
 
+// withKey returns a context carrying the authenticated API key under the same
+// unexported key keyFromContext reads. Both authMiddleware (Bearer) and the
+// console's uiAuth (session cookie) stash the resolved key through it, so a
+// downstream handler reads keyFromContext identically regardless of how the caller
+// authenticated.
+func withKey(ctx context.Context, key store.APIKey) context.Context {
+	return context.WithValue(ctx, apiKeyContextKey, key)
+}
+
 // requestIDFromContext returns the correlation id the requestID middleware
 // stashed on the request context, and whether one was present. Every route is
 // behind that middleware so a handler always finds one; it is the id echoed in
@@ -100,7 +109,12 @@ func (s *Server) withSessionLog(ctx context.Context, sessionID string) context.C
 // discovery requests against inference usage.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := bearerToken(r)
+		// tokenFromRequest accepts EITHER the console's HttpOnly session cookie OR
+		// the Authorization: Bearer header, so the same admin API authenticates a
+		// browser session and an API client without change (#100, AC2). API clients
+		// are unaffected: with no cookie present this falls straight through to the
+		// Bearer header exactly as before.
+		token, ok := tokenFromRequest(r)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed bearer token")
 			return
@@ -119,8 +133,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusInternalServerError, "internal_error", "authentication failed")
 			return
 		}
-		ctx := context.WithValue(r.Context(), apiKeyContextKey, key)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(withKey(r.Context(), key)))
 	})
 }
 

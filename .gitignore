@@ -42,3 +42,14 @@ coverage.html
 # and the GitHub Pages publish workflow)
 /openapi.html
 /_site/
+
+# Admin console (#100) dev/test toolchain (Node is dev/test/CI-only; never a
+# runtime dep). The generated *_templ.go and the built app.css ARE committed (so
+# `go build` needs no Node) and are deliberately NOT ignored.
+node_modules/
+npm-debug.log*
+ui/test-results/
+ui/playwright-report/
+ui/blob-report/
+ui/.playwright/
+.tailwindcss-cache
