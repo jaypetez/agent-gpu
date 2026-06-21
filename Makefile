@@ -73,6 +73,10 @@ cover-html: cover ## Render the coverage profile to coverage.html and open it
 vet: ## Run go vet
 	$(GO) vet ./...
 
+.PHONY: examples
+examples: ## Build + vet the nested stdlib example client (examples/go-client is its own module, excluded from the root build)
+	cd examples/go-client && $(GO) build ./... && $(GO) vet ./... && $(GO) test ./...
+
 .PHONY: tidy
 tidy: ## Tidy go.mod/go.sum
 	$(GO) mod tidy
