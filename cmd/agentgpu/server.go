@@ -367,6 +367,9 @@ func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConf
 	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen,
 		httpapi.WithAuditLog(auditLog),
 		httpapi.WithUsageSeries(usageStore),
+		// Live log query + SSE tail (#99): read the in-memory ring (#90) through a
+		// thin cmd-side adapter so the HTTP layer never depends on the logging setup.
+		httpapi.WithLogSource(newLogRingSource(lh.Ring)),
 		httpapi.WithRuntimeConfig(configInitial, configBoot, configAppliers, configPath))
 
 	// Re-apply any persisted PUT overrides on top of the freshly-resolved config, so

@@ -113,6 +113,8 @@ func allAdminRoutes() []adminRoute {
 		{http.MethodGet, "/v1/admin/telemetry", ""},
 		{http.MethodGet, "/v1/admin/usage", ""},
 		{http.MethodGet, "/v1/admin/audit", ""},
+		{http.MethodGet, "/v1/admin/logs", ""},
+		{http.MethodGet, "/v1/admin/logs/stream", ""},
 	}
 }
 

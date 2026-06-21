@@ -186,6 +186,23 @@ type Server struct {
 	// set in NewServer when the option is supplied. These settings carry no secrets.
 	config *runtimeConfig
 
+	// logs is the read seam over the in-memory log ring (#90) backing GET
+	// /v1/admin/logs and its SSE live-tail (#99). It is an interface so this layer
+	// does not depend on cmd's concrete ring (the adapter lives in cmd, mirroring
+	// the config-applier injection in #92); the ring's records are already redacted
+	// at capture, so the source hands back redacted LogRecords this layer never
+	// re-inspects for secrets. It is nil-safe — when no log source is wired
+	// (WithLogSource not supplied, e.g. most unit tests) the log endpoints return
+	// 501, mirroring the nil-quota usage endpoint — and is set in NewServer when the
+	// option is supplied. Reads are concurrency-safe (the ring is mutex-guarded).
+	logs LogSource
+
+	// logStreamPoll overrides the live-tail poll interval (GET /v1/admin/logs/stream).
+	// It is zero in production (the handler then uses logStreamPollInterval); it is
+	// injectable only so a unit test can drive the tail fast and deterministically
+	// without a real-time sleep. See logStreamPollOrDefault.
+	logStreamPoll time.Duration
+
 	// idempotency caches the response of an admin WRITE keyed by its
 	// Idempotency-Key header so a duplicate request within the TTL replays the
 	// prior response instead of re-running the mutation (#90). It is constructed
@@ -246,6 +263,18 @@ func WithAuditLog(a *audit.MemoryStore) Option {
 // the snapshotter goroutine in cmd.
 func WithUsageSeries(u *usagepkg.Store) Option {
 	return func(s *Server) { s.usageSeries = u }
+}
+
+// WithLogSource wires the read seam over the in-memory log ring (#90) backing GET
+// /v1/admin/logs and its SSE live-tail (#99). A nil source (the option not
+// supplied, e.g. most unit tests) leaves log streaming disabled: the log
+// endpoints return 501, mirroring how the usage endpoint gates on a nil quota
+// engine. The concrete adapter over the ring lives in cmd (it maps the cmd-private
+// logRecord onto the exported LogRecord), so this package does not depend on the
+// logging setup — keeping the #90 ring untouched. The records the source returns
+// are already redacted at capture.
+func WithLogSource(src LogSource) Option {
+	return func(s *Server) { s.logs = src }
 }
 
 // NewServer constructs an HTTP API Server. grpcSrv supplies the fleet snapshot,
@@ -412,6 +441,13 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	// endpoint. Supports ?format=csv for a flat CSV export of the per-key rows.
 	mux.Handle("GET /v1/admin/usage", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminUsage))
 	mux.Handle("GET /v1/admin/audit", s.requireScope(authz.ScopeAuditRead, s.handleAdminAudit))
+	// Structured log query + live tail (#99): a filterable, cursor-paginated read of
+	// the in-memory log ring (#90) and an SSE live-tail of new matching lines. Both
+	// gated to logs:read; both 501 when no log source is wired (WithLogSource not
+	// supplied). The ring's records are already redacted at capture, so no secret
+	// reaches either endpoint. See admin_logs.go.
+	mux.Handle("GET /v1/admin/logs", s.requireScope(authz.ScopeLogsRead, s.handleAdminLogs))
+	mux.Handle("GET /v1/admin/logs/stream", s.requireScope(authz.ScopeLogsRead, s.handleAdminLogsStream))
 	// Settings/config management (#92): the effective resolved settings (config:read)
 	// and a partial live hot-reload update (config:write, which additionally layers
 	// idempotency + audit via requireScopeWrite).

@@ -839,6 +839,99 @@ func auditQuery(f AuditFilter) string {
 	return "&" + q.Encode()
 }
 
+// LogEntry is one structured log line from the admin log API (GET
+// /v1/admin/logs): when it was emitted (RFC3339, UTC), the slog level name
+// (DEBUG/INFO/WARN/ERROR), the human message, and the structured attributes as a
+// discrete map (request_id/session_id/worker land here when present). It mirrors
+// httpapi.logEntryView field-for-field. The attributes are already redacted by the
+// server at capture, so a secret-named field reads "[REDACTED]"; the entry never
+// carries secret material.
+type LogEntry struct {
+	Time    time.Time      `json:"time"`
+	Level   string         `json:"level"`
+	Message string         `json:"message"`
+	Attrs   map[string]any `json:"attrs"`
+}
+
+// LogFilter narrows a Logs query. Every field is optional; a zero LogFilter
+// requests the default view — which on the server side is warnings and errors only
+// (debug/info are excluded unless Level widens it). The server ANDs the set
+// fields; the time bounds are a half-open window (Since inclusive, Until
+// exclusive), sent as unix seconds. The SSE live-tail endpoint is not exposed by
+// this client (it is a long-lived stream); use the query form to poll.
+type LogFilter struct {
+	// Level, if non-empty, is the minimum level to return (debug|info|warn|error).
+	// Empty uses the server default (warn), so debug/info are excluded by default.
+	Level string
+	// RequestID, if non-empty, matches lines whose request_id attribute equals it.
+	RequestID string
+	// SessionID, if non-empty, matches lines whose session_id attribute equals it.
+	SessionID string
+	// Worker, if non-empty, matches lines whose worker attribute equals it.
+	Worker string
+	// Since, if non-zero, excludes lines emitted before it (inclusive bound).
+	Since time.Time
+	// Until, if non-zero, excludes lines emitted at or after it (exclusive bound).
+	Until time.Time
+}
+
+// Logs returns the admin log lines matching filter (GET /v1/admin/logs), newest
+// first. Like ListAudit the server returns the cursor-paginated list envelope;
+// this method requests the maximum page size and follows the next_cursor until
+// exhausted, so the caller sees the full matching set. The filter's fields and (as
+// unix seconds) its time bounds are sent as query parameters; the entries never
+// carry secret material (the server redacts at capture).
+func (c *Client) Logs(ctx context.Context, filter LogFilter) ([]LogEntry, error) {
+	base := logsQuery(filter)
+	var all []LogEntry
+	cursor := ""
+	for {
+		var out listEnvelope[LogEntry]
+		path := "/v1/admin/logs?limit=" + strconv.Itoa(maxPageSize) + base
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
+	}
+}
+
+// logsQuery renders a LogFilter into the query-string suffix (each piece prefixed
+// with "&", to follow the leading "?limit=") for Logs. Empty string fields and
+// zero time bounds are omitted; the time bounds are encoded as unix seconds to
+// match the server's parsing.
+func logsQuery(f LogFilter) string {
+	q := url.Values{}
+	if f.Level != "" {
+		q.Set("level", f.Level)
+	}
+	if f.RequestID != "" {
+		q.Set("request_id", f.RequestID)
+	}
+	if f.SessionID != "" {
+		q.Set("session_id", f.SessionID)
+	}
+	if f.Worker != "" {
+		q.Set("worker", f.Worker)
+	}
+	if !f.Since.IsZero() {
+		q.Set("since", strconv.FormatInt(f.Since.Unix(), 10))
+	}
+	if !f.Until.IsZero() {
+		q.Set("until", strconv.FormatInt(f.Until.Unix(), 10))
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "&" + q.Encode()
+}
+
 // ListUsage returns the per-key usage rows matching filter (GET /v1/admin/usage),
 // sorted by key id. Like ListKeys/ListAudit the server returns the cursor-
 // paginated list envelope; this method requests the maximum page size and follows

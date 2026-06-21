@@ -1338,6 +1338,104 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/logs:
+    get:
+      operationId: adminListLogs
+      summary: Query the structured log buffer
+      description: |
+        Returns a cursor-paginated page of recent structured log lines from the server's bounded
+        in-memory log ring — **newest first** — in the shared list envelope. Each line carries the
+        emit time, the level, the human message, and the structured fields as a discrete `attrs` map
+        (request id, session id, worker, and any other slog attributes) rather than embedded in the
+        message text. Every line was **redacted at capture** — a secret-named attribute reads
+        `[REDACTED]` — so the response never carries secret material. The buffer is fixed-capacity
+        (drop-oldest), so memory is bounded.
+
+        Filters are ANDed. `level` is the **minimum** level to return (`debug`/`info`/`warn`/`error`);
+        **when omitted it defaults to `warn`**, so the default view excludes debug/info noise. The
+        `request_id`, `session_id`, and `worker` parameters match the corresponding `attrs` field by
+        exact value (a line that lacks the attribute does not match). `since`/`until` bound the time
+        window (unix epoch seconds; `since` inclusive, `until` exclusive). An absent or unparseable
+        bound is treated as unbounded. Requires the `logs:read` scope (the `admin` role grants it).
+        Returns `501` when the log-buffer subsystem is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/LogLevel"
+        - $ref: "#/components/parameters/LogRequestID"
+        - $ref: "#/components/parameters/LogSessionID"
+        - $ref: "#/components/parameters/LogWorker"
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditUntil"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: A cursor-paginated page of log lines, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminLogListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/logs/stream:
+    get:
+      operationId: adminStreamLogs
+      summary: Live-tail the structured log buffer (SSE)
+      description: |
+        Opens a Server-Sent Events stream that live-tails new structured log lines as they are
+        emitted, applying the **same filters** as `GET /v1/admin/logs` (`level` defaulting to `warn`,
+        `request_id`, `session_id`, `worker`, and the `since`/`until` window). Each event is one
+        `data: <json>` frame whose payload is a single log entry (the same shape as a `data[]` row of
+        the query endpoint), delivered in chronological order. Periodic SSE comment frames keep the
+        connection alive through idle proxies.
+
+        **Tail semantics**: the stream begins at the buffer's current position and delivers only lines
+        emitted **after** the connection opens — it does not replay the existing buffer (fetch
+        `GET /v1/admin/logs` first if you want recent history). The stream position is the buffer's
+        monotonic record count, so a client that disconnects and **reconnects resumes tailing new
+        lines from that point without losing its place** — there is no server-held per-client cursor
+        to lose. The stream is infinite (no `[DONE]` sentinel); it ends cleanly when the client closes
+        the connection.
+
+        Lines are redacted at capture, so frames never carry secret material. Requires the `logs:read`
+        scope (the `admin` role grants it). Returns `501` when the log-buffer subsystem is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/LogLevel"
+        - $ref: "#/components/parameters/LogRequestID"
+        - $ref: "#/components/parameters/LogSessionID"
+        - $ref: "#/components/parameters/LogWorker"
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditUntil"
+      responses:
+        "200":
+          description: |
+            An SSE stream (`text/event-stream`) of log-entry `data:` frames, one per new matching log
+            line, terminated only by client disconnect.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  A sequence of SSE frames. Each data frame is `data: ` followed by a JSON `LogEntry`
+                  and a blank line; comment frames (`: keepalive`) are interleaved to keep the
+                  connection alive.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
   /v1/admin/config:
     get:
       operationId: adminGetConfig
@@ -1541,6 +1639,49 @@ components:
         type: integer
         format: int64
         minimum: 0
+    LogLevel:
+      name: level
+      in: query
+      required: false
+      description: |
+        The **minimum** log level to return; lines below it are excluded. One of `debug`, `info`,
+        `warn`, `error`. **Omitted, it defaults to `warn`** — so the default view excludes debug/info
+        noise. An unrecognized value falls back to the `warn` default.
+      schema:
+        type: string
+        enum:
+          - debug
+          - info
+          - warn
+          - error
+    LogRequestID:
+      name: request_id
+      in: query
+      required: false
+      description: |
+        Filter log lines to those whose `attrs.request_id` equals this value exactly (the
+        correlation id stamped on every HTTP-handler line). Lines without the attribute do not match.
+      schema:
+        type: string
+    LogSessionID:
+      name: session_id
+      in: query
+      required: false
+      description: |
+        Filter log lines to those whose `attrs.session_id` equals this value exactly (present on
+        session-aware lines). Lines without the attribute do not match.
+      schema:
+        type: string
+    LogWorker:
+      name: worker
+      in: query
+      required: false
+      description: |
+        Filter log lines to those whose `attrs.worker` equals this value exactly (present on
+        server-process lines about a worker, e.g. model pull/drain). Lines without the attribute do
+        not match.
+      schema:
+        type: string
     UsageKeyID:
       name: key_id
       in: query
@@ -3121,6 +3262,58 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AuditEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    LogEntry:
+      type: object
+      description: |
+        One structured log line from the in-memory log buffer: when it was emitted, the level, the
+        human message, and the structured fields as a discrete `attrs` map (never embedded in the
+        message text). The line was redacted at capture, so a secret-named attribute reads
+        `[REDACTED]`; the entry never carries secret material.
+      required:
+        - time
+        - level
+        - message
+        - attrs
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: When the line was emitted (RFC 3339, UTC).
+        level:
+          type: string
+          description: The log level name.
+          enum:
+            - DEBUG
+            - INFO
+            - WARN
+            - ERROR
+        message:
+          type: string
+          description: The human-readable log message (no structured fields embedded).
+        attrs:
+          type: object
+          description: |
+            The line's structured attributes as discrete key→value pairs (e.g. `request_id`,
+            `session_id`, `worker`). Always present (an empty object when the line had no attributes).
+            Secret-named attributes are redacted to `[REDACTED]`.
+          additionalProperties: true
+
+    AdminLogListResponse:
+      type: object
+      description: |
+        A cursor-paginated page of log lines (newest first) in the shared list envelope. `data` holds
+        the page of entries; `pagination` carries the cursor for the next page.
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
         pagination:
           $ref: "#/components/schemas/Pagination"
 
