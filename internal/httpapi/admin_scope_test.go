@@ -28,6 +28,7 @@ func TestScopedKeyMatrix(t *testing.T) {
 	workersReader := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeWorkersRead}})
 	workersWriter := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeWorkersWrite}})
 	telemetryReader := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeTelemetryRead}})
+	auditReader := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeAuditRead}})
 	adminToken := mustKey(t, authSvc, adminPerms())
 
 	// Create a target key so the {id} routes act on a real key.
@@ -57,6 +58,7 @@ func TestScopedKeyMatrix(t *testing.T) {
 		{http.MethodGet, "/v1/admin/workers", "", authz.ScopeWorkersRead},
 		{http.MethodPost, "/v1/admin/workers/w1/drain", "", authz.ScopeWorkersWrite},
 		{http.MethodGet, "/v1/admin/stats", "", authz.ScopeTelemetryRead},
+		{http.MethodGet, "/v1/admin/audit", "", authz.ScopeAuditRead},
 	}
 
 	holders := map[string]string{
@@ -65,6 +67,7 @@ func TestScopedKeyMatrix(t *testing.T) {
 		authz.ScopeWorkersRead:   workersReader,
 		authz.ScopeWorkersWrite:  workersWriter,
 		authz.ScopeTelemetryRead: telemetryReader,
+		authz.ScopeAuditRead:     auditReader,
 	}
 
 	for _, rt := range routes {

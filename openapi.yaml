@@ -861,6 +861,46 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/audit:
+    get:
+      operationId: adminListAudit
+      summary: Query the admin audit log
+      description: |
+        Returns a cursor-paginated page of admin audit-log entries — **newest first** — in the shared
+        list envelope. Every administrative write (key create/rotate/revoke, permission and quota
+        changes, worker drain) records one entry: the actor key id, the operation, the target
+        resource, the redacted before/after metadata projection of the affected object, the request
+        correlation id, and the outcome. Secrets are never recorded (the before/after snapshots carry
+        only safe metadata fields).
+
+        The optional `actor`, `op`, and `target` query parameters filter by exact match, and
+        `since`/`until` bound the time window (unix epoch seconds; `since` inclusive, `until`
+        exclusive). Non-empty filters are ANDed. An absent or unparseable bound is treated as
+        unbounded on that side. Requires the `audit:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/AuditActor"
+        - $ref: "#/components/parameters/AuditOp"
+        - $ref: "#/components/parameters/AuditTarget"
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditUntil"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: A cursor-paginated page of audit-log entries, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuditListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -938,6 +978,51 @@ components:
         start at the first page. A stale or invalid cursor restarts pagination at the first page.
       schema:
         type: string
+    AuditActor:
+      name: actor
+      in: query
+      required: false
+      description: Filter audit entries to those performed by exactly this actor (API key id).
+      schema:
+        type: string
+    AuditOp:
+      name: op
+      in: query
+      required: false
+      description: |
+        Filter audit entries to exactly this operation name (e.g. `key.create`, `key.revoke`,
+        `key.rotate`, `key.permissions`, `key.quota`, `worker.drain`).
+      schema:
+        type: string
+    AuditTarget:
+      name: target
+      in: query
+      required: false
+      description: Filter audit entries to those acting on exactly this resource id (a key id, a worker id).
+      schema:
+        type: string
+    AuditSince:
+      name: since
+      in: query
+      required: false
+      description: |
+        Lower bound on the audit window, as unix epoch seconds, **inclusive** — only entries recorded
+        at or after this instant are returned. An absent or unparseable value is unbounded.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    AuditUntil:
+      name: until
+      in: query
+      required: false
+      description: |
+        Upper bound on the audit window, as unix epoch seconds, **exclusive** — only entries recorded
+        strictly before this instant are returned. An absent or unparseable value is unbounded.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
 
   responses:
     Unauthorized:
@@ -2057,6 +2142,75 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AdminWorkerView"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AuditRedactedValues:
+      type: object
+      description: |
+        A before/after snapshot of an audited object: a map of only safe, non-sensitive metadata
+        fields (e.g. a key's id, name, roles, scopes, allow/deny lists, revoked flag). It NEVER
+        carries secret material — the stored secret hash and salt are never projected here.
+      additionalProperties: true
+
+    AuditEntry:
+      type: object
+      description: |
+        One immutable record of an administrative write: who did it (the actor key id), what they did
+        (the operation), the target resource, the redacted before/after projection of the affected
+        object, the request correlation id, and the outcome. Secrets are never recorded.
+      required:
+        - time
+        - actor
+        - op
+        - target
+        - request_id
+        - outcome
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: When the operation was recorded (RFC 3339, UTC).
+        actor:
+          type: string
+          description: The opaque id of the API key that performed the operation.
+        op:
+          type: string
+          description: |
+            The operation name, e.g. `key.create`, `key.revoke`, `key.rotate`, `key.permissions`,
+            `key.quota`, `worker.drain`.
+        target:
+          type: string
+          description: The id of the resource the operation acted on (a key id, a worker id), or empty if none.
+        before:
+          $ref: "#/components/schemas/AuditRedactedValues"
+          description: The redacted projection of the target before the change. Absent when there is no prior object.
+        after:
+          $ref: "#/components/schemas/AuditRedactedValues"
+          description: The redacted projection of the target after the change. Absent when there is no resulting object.
+        request_id:
+          type: string
+          description: The request correlation id (the `X-Request-Id` echoed to the client) tying the entry to its request.
+        outcome:
+          type: string
+          description: Whether the audited write succeeded or failed.
+          enum:
+            - success
+            - failure
+
+    AdminAuditListResponse:
+      type: object
+      description: |
+        A cursor-paginated page of audit-log entries (newest first) in the shared list envelope.
+        `data` holds the page of entries; `pagination` carries the cursor for the next page.
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
         pagination:
           $ref: "#/components/schemas/Pagination"
 
