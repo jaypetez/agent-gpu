@@ -254,3 +254,134 @@ func TestDefaultLogger(t *testing.T) {
 		t.Fatalf("admin should be allowed: %v", err)
 	}
 }
+
+// TestAllRoles proves the role enumeration describes exactly the three built-in
+// roles, in privilege order, with the inference actions, model scope, and
+// admin-scope grant each role's decide() behavior implies — the contract a
+// permissions editor GUI renders against.
+func TestAllRoles(t *testing.T) {
+	t.Parallel()
+	roles := AllRoles()
+	if len(roles) != 3 {
+		t.Fatalf("AllRoles len = %d, want 3", len(roles))
+	}
+
+	// Deterministic privilege order: admin → user → read-only.
+	if roles[0].Name != RoleAdmin || roles[1].Name != RoleUser || roles[2].Name != RoleReadOnly {
+		t.Fatalf("AllRoles order = [%s %s %s], want [admin user read-only]",
+			roles[0].Name, roles[1].Name, roles[2].Name)
+	}
+
+	byName := map[string]RoleInfo{}
+	for _, r := range roles {
+		byName[r.Name] = r
+		if r.Description == "" {
+			t.Errorf("role %q has empty description", r.Name)
+		}
+	}
+
+	// admin: pull/load/infer on ALL models, and every admin scope.
+	admin := byName[RoleAdmin]
+	if got, want := admin.InferenceActions, []string{"pull", "load", "infer"}; !equalStrings(got, want) {
+		t.Errorf("admin actions = %v, want %v", got, want)
+	}
+	if admin.ModelScope != ModelScopeAll {
+		t.Errorf("admin model_scope = %q, want %q", admin.ModelScope, ModelScopeAll)
+	}
+	if !admin.GrantsAllAdminScopes {
+		t.Error("admin should grant all admin scopes")
+	}
+
+	// user: pull/load/infer on allow-listed models, no implicit admin scopes.
+	user := byName[RoleUser]
+	if got, want := user.InferenceActions, []string{"pull", "load", "infer"}; !equalStrings(got, want) {
+		t.Errorf("user actions = %v, want %v", got, want)
+	}
+	if user.ModelScope != ModelScopeAllowListed {
+		t.Errorf("user model_scope = %q, want %q", user.ModelScope, ModelScopeAllowListed)
+	}
+	if user.GrantsAllAdminScopes {
+		t.Error("user should NOT grant all admin scopes")
+	}
+
+	// read-only: infer ONLY, on allow-listed models, no implicit admin scopes.
+	ro := byName[RoleReadOnly]
+	if got, want := ro.InferenceActions, []string{"infer"}; !equalStrings(got, want) {
+		t.Errorf("read-only actions = %v, want %v", got, want)
+	}
+	if ro.ModelScope != ModelScopeAllowListed {
+		t.Errorf("read-only model_scope = %q, want %q", ro.ModelScope, ModelScopeAllowListed)
+	}
+	if ro.GrantsAllAdminScopes {
+		t.Error("read-only should NOT grant all admin scopes")
+	}
+}
+
+// TestAllRolesIsACopy proves AllRoles hands back a fresh slice each call so a
+// caller mutating the result cannot corrupt the shared role definitions.
+func TestAllRolesIsACopy(t *testing.T) {
+	t.Parallel()
+	first := AllRoles()
+	first[0].Name = "tampered"
+	first[0].InferenceActions[0] = "tampered"
+	second := AllRoles()
+	if second[0].Name != RoleAdmin {
+		t.Fatalf("mutating the returned slice leaked into AllRoles: %q", second[0].Name)
+	}
+}
+
+// TestValidRole proves every built-in role name validates and an unknown string
+// (including a near-miss and the empty string) does not — the seam the
+// permissions API rejects unknown roles at.
+func TestValidRole(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{RoleAdmin, RoleUser, RoleReadOnly} {
+		if !ValidRole(name) {
+			t.Errorf("ValidRole(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "superuser", "Admin", "readonly", "read_only", "owner"} {
+		if ValidRole(name) {
+			t.Errorf("ValidRole(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestAllRolesValidateAndCoverDecide cross-checks the enumeration against the
+// live decide() ladder: every enumerated role validates, and for each its
+// declared InferenceActions are exactly the actions decide() grants an
+// allow-listed model (so the GUI's matrix can never drift from enforcement).
+func TestAllRolesValidateAndCoverDecide(t *testing.T) {
+	t.Parallel()
+	for _, ri := range AllRoles() {
+		if !ValidRole(ri.Name) {
+			t.Errorf("enumerated role %q does not pass ValidRole", ri.Name)
+		}
+		// For admin, decide() allows everything regardless of the allow-list; for
+		// user/read-only the model must be allow-listed. Use an allow-listed model so
+		// the comparison is apples-to-apples across roles.
+		key := store.APIKey{Roles: []string{ri.Name}, AllowModels: []string{"m"}}
+		var granted []string
+		for _, act := range []Action{Pull, Load, Infer} {
+			if _, _, ok := decide(key, "m", act); ok {
+				granted = append(granted, act.op())
+			}
+		}
+		if !equalStrings(granted, ri.InferenceActions) {
+			t.Errorf("role %q: decide() grants %v but RoleInfo declares %v", ri.Name, granted, ri.InferenceActions)
+		}
+	}
+}
+
+// equalStrings reports whether two string slices are equal element-for-element.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -100,6 +100,7 @@ func allAdminRoutes() []adminRoute {
 		{http.MethodPut, "/v1/admin/keys/abc/permissions", `{"roles":["user"]}`},
 		{http.MethodPut, "/v1/admin/keys/abc/quota", `{"rpm":1}`},
 		{http.MethodGet, "/v1/admin/keys/abc/quota", ""},
+		{http.MethodGet, "/v1/admin/roles", ""},
 		{http.MethodGet, "/v1/admin/workers", ""},
 		{http.MethodGet, "/v1/admin/workers/abc", ""},
 		{http.MethodGet, "/v1/admin/gpus", ""},

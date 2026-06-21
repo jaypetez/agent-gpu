@@ -323,8 +323,9 @@ type adminQuotaUsageResponse struct {
 
 // adminCreateKeyRequest is the POST /v1/admin/keys body. Name is a human label;
 // the role, admin-scope, and allow/deny lists set the new key's initial
-// permissions. AdminScopes grants the fine-grained management scopes (#90); an
-// unknown scope is rejected with 400.
+// permissions. Roles are validated against the known vocabulary (authz.ValidRole,
+// #95) and AdminScopes grants the fine-grained management scopes (#90); an unknown
+// role or scope is rejected with 400 (no key is created).
 type adminCreateKeyRequest struct {
 	Name        string   `json:"name"`
 	Roles       []string `json:"roles"`
@@ -336,8 +337,10 @@ type adminCreateKeyRequest struct {
 // adminPermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body. It is
 // a full replace (not a merge): the supplied lists become the key's roles,
 // admin scopes, and allow/deny lists; an omitted/null list clears that
-// dimension. The full permissions editor is issue #95; here the endpoint already
-// stores and serializes admin_scopes (validating against the known vocabulary).
+// dimension. Both the role names and the admin scopes are validated against the
+// known vocabularies (authz.ValidRole / authz.ValidScope) BEFORE any mutation, so
+// an unknown role or scope is rejected with 400 and the key is left unchanged
+// (#95). GET /v1/admin/roles enumerates the valid roles + scopes for a GUI editor.
 type adminPermissionsRequest struct {
 	Roles       []string `json:"roles"`
 	AdminScopes []string `json:"admin_scopes"`
@@ -378,6 +381,9 @@ type adminPullModelRequest struct {
 func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	var req adminCreateKeyRequest
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !validateRoles(w, req.Roles) {
 		return
 	}
 	if !validateScopes(w, req.AdminScopes) {
@@ -481,6 +487,12 @@ func (s *Server) handleAdminRotateKey(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAdminSetPermissions(w http.ResponseWriter, r *http.Request) {
 	var req adminPermissionsRequest
 	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// Validate both vocabularies BEFORE any mutation, so a rejected request (400)
+	// leaves the key entirely unchanged (the full-replace SetPermissions never
+	// runs). Roles are validated here (#95); admin scopes were validated since #90.
+	if !validateRoles(w, req.Roles) {
 		return
 	}
 	if !validateScopes(w, req.AdminScopes) {
@@ -749,6 +761,22 @@ func validateScopes(w http.ResponseWriter, scopes []string) bool {
 	for _, sc := range scopes {
 		if !authz.ValidScope(sc) {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "unknown admin scope")
+			return false
+		}
+	}
+	return true
+}
+
+// validateRoles checks every requested role against the known role vocabulary
+// (authz.ValidRole), writing a 400 and returning false on the first unknown role
+// so a key is never assigned a role string that grants nothing (the editor GUI
+// can enumerate the valid roles via GET /v1/admin/roles). An empty or nil set is
+// valid (no roles granted — an opt-in, do-nothing key). It mirrors
+// validateScopes; a handler returns immediately when it returns false.
+func validateRoles(w http.ResponseWriter, roles []string) bool {
+	for _, role := range roles {
+		if !authz.ValidRole(role) {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "unknown role")
 			return false
 		}
 	}

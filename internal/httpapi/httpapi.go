@@ -325,6 +325,12 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("PUT /v1/admin/keys/{id}/permissions", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminSetPermissions))
 	mux.Handle("PUT /v1/admin/keys/{id}/quota", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminSetQuota))
 	mux.Handle("GET /v1/admin/keys/{id}/quota", s.requireScope(authz.ScopeKeysRead, s.handleAdminGetQuota))
+	// Role/scope catalog (#95): the assignable roles + the inference actions and
+	// admin scopes each grants, plus the full scope vocabulary, so a permissions
+	// editor GUI can render its pickers without reverse-engineering authz.decide.
+	// A pure read of static metadata gated to keys:read (same resource as the keys
+	// it helps edit) — not audited.
+	mux.Handle("GET /v1/admin/roles", s.requireScope(authz.ScopeKeysRead, s.handleAdminRoles))
 	mux.Handle("GET /v1/admin/workers", s.requireScope(authz.ScopeWorkersRead, s.handleAdminListWorkers))
 	mux.Handle("GET /v1/admin/workers/{id}", s.requireScope(authz.ScopeWorkersRead, s.handleAdminGetWorker))
 	// Aggregated GPU/fleet capacity inventory (#94): a read-only roll-up over the
