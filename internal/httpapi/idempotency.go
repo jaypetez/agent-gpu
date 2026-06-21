@@ -151,17 +151,46 @@ func (r *idempotencyRecorder) Write(b []byte) (int, error) {
 // request without the header passes straight through. Only a 2xx response is
 // cached: a failed attempt is not the committed outcome, so the client may retry
 // it. It is applied to admin write routes alongside the scope gate.
+//
+// The cache is keyed by the COMPOSITE of (authenticated actor key id, HTTP
+// method, request path, raw header value), not the bare client-supplied header.
+// The cache instance (s.idempotency) is server-wide and shared across every
+// admin write route, and create/rotate return a one-time plaintext token in the
+// 201 body; keying on the bare header alone would let one actor's reply (id +
+// plaintext token) be served to a DIFFERENT actor — or to a different route —
+// that happened to send the same client-chosen, non-secret key. Namespacing by
+// actor + method + path confines a replay to the exact actor and request that
+// produced it, which is the only correct dedup target. (This is stricter than
+// the documented "concurrent same-key" simplification, which only excuses
+// genuinely concurrent races — not cross-actor/cross-path reuse.)
 func (s *Server) idempotent(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cache := s.idempotencyCache()
-		key := r.Header.Get(idempotencyHeader)
-		if key == "" || len(key) > maxIdempotencyKeyLen {
+		rawKey := r.Header.Get(idempotencyHeader)
+		// The over-long guard applies to the RAW client value: a client cannot bloat
+		// the cache with an arbitrarily long key (the composite key adds only the
+		// bounded actor id, method, and path).
+		if rawKey == "" || len(rawKey) > maxIdempotencyKeyLen {
 			// No key (or an over-long one we refuse to cache): behave exactly as if
 			// the middleware were absent. An over-long key still executes the write;
 			// it simply is not deduplicated.
 			h.ServeHTTP(w, r)
 			return
 		}
+		// Read the authenticated actor the auth middleware stashed (idempotent runs
+		// inside requireScopeWrite, i.e. behind authMiddleware, so a key is present).
+		// Fail safe if absent: do NOT serve from or write to the shared cache — just
+		// pass through. This is defensive and should not happen in production.
+		actor, ok := keyFromContext(r.Context())
+		if !ok {
+			h.ServeHTTP(w, r)
+			return
+		}
+		// Compose the cache key from (actor id, method, path, raw header value),
+		// joined by NUL — a byte that cannot occur in an HTTP method, URL path, or
+		// header value — so the parts are unambiguous and cannot be confused across
+		// actors or routes. r.URL.Path is the concrete path (it includes any {id}).
+		key := actor.ID + "\x00" + r.Method + "\x00" + r.URL.Path + "\x00" + rawKey
 
 		if cached, ok := cache.get(key); ok {
 			if cached.contentType != "" {
