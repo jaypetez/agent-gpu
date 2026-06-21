@@ -80,7 +80,13 @@ func (s *Server) registerUIRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /admin/login", http.HandlerFunc(s.handleUILoginPage))
 	mux.Handle("POST /admin/login", http.HandlerFunc(s.handleUILoginSubmit))
 	mux.Handle("POST /admin/logout", http.HandlerFunc(s.handleUILogout))
-	mux.Handle("GET /admin/partials/overview", s.uiAuth(http.HandlerFunc(s.handleUIOverviewPartial)))
+	// The overview partial is data-bearing (queue depth, worker health, throttle
+	// counters — the same telemetry GET /v1/admin/telemetry serves), so it is gated
+	// on telemetry:read, NOT bare authentication. A plain user key (no admin scope)
+	// must get 403 here exactly as it does on the JSON telemetry route; the
+	// per-viewer events/log sub-panel additionally requires logs:read (enforced in
+	// collectOverview).
+	mux.Handle("GET /admin/partials/overview", s.uiScopeAuth(authz.ScopeTelemetryRead, http.HandlerFunc(s.handleUIOverviewPartial)))
 
 	assetFS := s.uiAssets
 	if assetFS == nil {
@@ -113,6 +119,49 @@ func (s *Server) uiAuth(next http.Handler) http.Handler {
 			}
 			s.reqLog(r.Context()).Error("ui authentication failed", "err", err)
 			s.renderUIError(w, r, http.StatusInternalServerError, "Something went wrong on our end. Try again.")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(withKey(r.Context(), key)))
+	})
+}
+
+// uiScopeAuth gates a data-bearing console route to a viewer that is BOTH
+// authenticated AND holds a specific admin scope. It authenticates exactly like
+// uiAuth (session cookie or Bearer → auth.Authenticate, stashing the key on the
+// context), then requires authz.HasScope(key, scope) — the same scope check the
+// JSON admin routes enforce via scopeMiddleware, and the same HasScope the
+// sidebar's per-section Visible gating uses. The two failure modes are kept
+// distinct, mirroring the 401/403 split: an UNAUTHENTICATED request is redirected
+// to login (it is a browser, like uiAuth), but an AUTHENTICATED-but-unscoped key
+// is refused with a 403 HTML page rather than a redirect — bouncing it to login
+// would loop forever (the key is valid, so it would just re-authenticate into the
+// same 403). This closes the hole where a plain user key, by setting its own token
+// as the session cookie, could read the telemetry board that GET
+// /v1/admin/telemetry correctly denies it.
+func (s *Server) uiScopeAuth(scope string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := tokenFromRequest(r)
+		if !ok {
+			s.redirectToLogin(w, r, "")
+			return
+		}
+		key, err := s.auth.Authenticate(r.Context(), token)
+		if err != nil {
+			if errors.Is(err, auth.ErrUnauthenticated) {
+				// Stale/invalid cookie: clear it and bounce to login rather than loop.
+				s.clearSessionCookies(w, r)
+				s.redirectToLogin(w, r, "Your session has expired. Sign in again.")
+				return
+			}
+			s.reqLog(r.Context()).Error("ui authentication failed", "err", err)
+			s.renderUIError(w, r, http.StatusInternalServerError, "Something went wrong on our end. Try again.")
+			return
+		}
+		if !authz.HasScope(key, scope) {
+			// Authenticated but unscoped: a 403, NOT a redirect (a valid key would
+			// loop straight back through login into the same refusal). The message is
+			// generic and never echoes the key's id, roles, or scopes.
+			s.renderUIError(w, r, http.StatusForbidden, "You don't have access to this. Ask for a key with the right admin scope.")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(withKey(r.Context(), key)))
@@ -228,7 +277,9 @@ func (s *Server) handleUILogout(w http.ResponseWriter, r *http.Request) {
 // telemetry pull plus the worker snapshot and recent events. It is the HTMX
 // partial behind #overview. On a data error it returns the board's error partial
 // (HTTP 200 with the error markup, so HTMX swaps it in — an HTTP error would make
-// HTMX show nothing). It is gated by uiAuth.
+// HTMX show nothing). It is gated by uiScopeAuth on telemetry:read (the panels are
+// telemetry data); the event-stream sub-panel additionally requires logs:read,
+// enforced in collectOverview, so a telemetry-only viewer never sees log lines.
 func (s *Server) handleUIOverviewPartial(w http.ResponseWriter, r *http.Request) {
 	setUIPageHeaders(w)
 	data := s.collectOverview(r)

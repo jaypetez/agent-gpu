@@ -404,6 +404,154 @@ func TestUIOverviewPartialRenders(t *testing.T) {
 	}
 }
 
+// uiLogMarker is a distinctive log-line message seeded into a test log source so a
+// test can assert whether the overview's event-stream panel actually rendered log
+// content (it appears in the HTML only when the viewer holds logs:read).
+const uiLogMarker = "boom-from-log-ring"
+
+// seedUILogSource wires a fake log source carrying one recognizable ERROR line and
+// returns it, so the overview's event panel has real content to render when the
+// viewer is allowed to see it.
+func seedUILogSource(s *Server) *fakeLogSource {
+	src := &fakeLogSource{}
+	src.add(LogRecord{Time: logAt(10), Level: "ERROR", Message: uiLogMarker, Attrs: map[string]any{"worker": "w1"}})
+	s.logs = src
+	return src
+}
+
+// TestUIOverviewPartialDeniedForNonAdmin is the security regression for the
+// blocking defect: a valid but non-admin "user" key (inference-only, no admin
+// scope) must NOT be able to read the dashboard telemetry partial by presenting
+// its own token as the session cookie. Before the fix the route was gated by bare
+// uiAuth, which admitted any authenticated key and returned 200 with the full
+// telemetry board; now it is gated on telemetry:read, so the same key gets 403 and
+// the response carries none of the fleet/queue/log data. This mirrors GET
+// /v1/admin/telemetry correctly 403-ing the same key.
+func TestUIOverviewPartialDeniedForNonAdmin(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	seedUILogSource(s) // ensure there IS data to leak, so the test proves it does not.
+	// A "user" role grants inference but no admin role/scope (no telemetry:read).
+	token := mustKey(t, authSvc, auth.Permissions{Roles: []string{authz.RoleUser}})
+
+	// Sanity: the JSON telemetry route already denies this key. The UI partial must
+	// match that boundary rather than be a weaker side door.
+	apiRec := req(t, s, http.MethodGet, "/v1/admin/telemetry", token, "")
+	if apiRec.Code != http.StatusForbidden {
+		t.Fatalf("GET /v1/admin/telemetry for user key = %d, want 403 (precondition)", apiRec.Code)
+	}
+
+	// The exploit: set the holder's own token as the admin session cookie.
+	rec := uiGet(t, s, "/admin/partials/overview", map[string]string{sessionCookieName: token})
+	if rec.Code == http.StatusOK {
+		t.Fatalf("overview partial for non-admin user = 200, want non-200 (403); broken access control")
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("overview partial for non-admin user = %d, want 403", rec.Code)
+	}
+	body := rec.Body.String()
+	// The telemetry board and any log content must be absent from the denied body.
+	for _, leaked := range []string{"Queue depth", "Worker health", "Workers online", "Event stream", uiLogMarker} {
+		if strings.Contains(body, leaked) {
+			t.Errorf("403 overview body leaked %q — telemetry/log data must not render for an unscoped key", leaked)
+		}
+	}
+}
+
+// TestUIOverviewPartialUnauthenticatedRedirects proves uiScopeAuth keeps uiAuth's
+// browser behavior for an UNAUTHENTICATED request: no token → redirect to login,
+// not a 403 (the 403 is reserved for an authenticated-but-unscoped key, asserted
+// separately).
+func TestUIOverviewPartialUnauthenticatedRedirects(t *testing.T) {
+	s, _ := adminTestServer(t, &fakeFleet{})
+
+	rec := uiGet(t, s, "/admin/partials/overview", nil)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("unauthenticated overview partial = %d, want 303 redirect to login", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "/admin/login") {
+		t.Errorf("unauthenticated overview redirect = %q, want /admin/login", loc)
+	}
+}
+
+// TestUIOverviewPartialTelemetryOnlyOmitsEvents proves the layered gating: a key
+// with ONLY telemetry:read gets 200 with the queue/worker/throttle panels, but the
+// event-stream panel renders its empty state — the log lines are NEITHER fetched
+// NOR rendered, because that data is logs:read territory.
+func TestUIOverviewPartialTelemetryOnlyOmitsEvents(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	seedUILogSource(s)
+	token := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeTelemetryRead}})
+	session, _ := loginAndGetSession(t, s, token)
+
+	rec := uiGet(t, s, "/admin/partials/overview", map[string]string{sessionCookieName: session})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("telemetry:read overview partial = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	// Telemetry panels are present.
+	for _, panel := range []string{"Queue depth", "Worker health", "Workers online", "Throttled"} {
+		if !strings.Contains(body, panel) {
+			t.Errorf("telemetry:read overview missing the %q panel", panel)
+		}
+	}
+	// But the seeded log line must NOT appear — no logs:read, no event content.
+	if strings.Contains(body, uiLogMarker) {
+		t.Error("telemetry:read viewer must NOT see log lines in the event stream (logs:read required)")
+	}
+	// The panel renders its calm empty state instead of the log lines.
+	if !strings.Contains(body, "Nothing to report") {
+		t.Error("telemetry:read overview should render the event panel's empty state when logs are withheld")
+	}
+}
+
+// TestUIOverviewPartialWithLogsReadShowsEvents proves a key holding BOTH
+// telemetry:read and logs:read gets the full board including the populated event
+// stream (the seeded log line renders).
+func TestUIOverviewPartialWithLogsReadShowsEvents(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	seedUILogSource(s)
+	token := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeTelemetryRead, authz.ScopeLogsRead}})
+	session, _ := loginAndGetSession(t, s, token)
+
+	rec := uiGet(t, s, "/admin/partials/overview", map[string]string{sessionCookieName: session})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("telemetry+logs overview partial = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, panel := range []string{"Queue depth", "Worker health", "Event stream"} {
+		if !strings.Contains(body, panel) {
+			t.Errorf("telemetry+logs overview missing the %q panel", panel)
+		}
+	}
+	if !strings.Contains(body, uiLogMarker) {
+		t.Error("a logs:read viewer should see the seeded log line in the event stream")
+	}
+}
+
+// TestUIOverviewPartialAdminSeesFullBoard preserves the existing behavior: a
+// RoleAdmin superuser (which satisfies both telemetry:read and logs:read) still
+// gets the full board including the event stream with real log content.
+func TestUIOverviewPartialAdminSeesFullBoard(t *testing.T) {
+	s, authSvc := adminTestServer(t, &fakeFleet{})
+	seedUILogSource(s)
+	token := mustKey(t, authSvc, adminPerms())
+	session, _ := loginAndGetSession(t, s, token)
+
+	rec := uiGet(t, s, "/admin/partials/overview", map[string]string{sessionCookieName: session})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("admin overview partial = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, panel := range []string{"Queue depth", "Worker health", "Workers online", "Event stream"} {
+		if !strings.Contains(body, panel) {
+			t.Errorf("admin overview missing the %q panel", panel)
+		}
+	}
+	if !strings.Contains(body, uiLogMarker) {
+		t.Error("admin should see the seeded log line in the event stream (superuser holds logs:read)")
+	}
+}
+
 // TestUIAssetsServed proves the embedded static assets are served under the asset
 // path with the right content type and a cache header, with no auth required (they
 // carry no secrets and the login page needs the CSS before any session exists).

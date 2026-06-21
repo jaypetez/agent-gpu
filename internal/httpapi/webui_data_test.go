@@ -1,10 +1,14 @@
 package httpapi
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/httpapi/webui"
 	"github.com/jaypetez/agent-gpu/internal/queue"
+	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 )
 
@@ -167,12 +171,17 @@ func TestFormatCount(t *testing.T) {
 }
 
 // TestCollectOverviewWithFakeFleet proves the end-to-end data pull wires the fleet
-// snapshot into the view-models (no logs source -> empty events, no panic).
+// snapshot into the view-models. With no log source wired it yields empty events
+// even for a viewer holding logs:read (the admin key on the context), and never
+// panics. The request carries an admin key on its context, matching how the
+// uiScopeAuth wrapper invokes collectOverview in production.
 func TestCollectOverviewWithFakeFleet(t *testing.T) {
 	s, _ := adminTestServer(t, &fakeFleet{
 		snapshot: []types.Worker{{ID: "w1", Status: types.WorkerOnline, ActiveJobs: 1, Load: 20}},
 	})
-	data := s.collectOverview(nil)
+	r := httptest.NewRequest(http.MethodGet, "/admin/partials/overview", nil)
+	r = r.WithContext(withKey(r.Context(), store.APIKey{Roles: []string{authz.RoleAdmin}}))
+	data := s.collectOverview(r)
 	if len(data.kpis) != 3 {
 		t.Fatalf("want 3 KPIs, got %d", len(data.kpis))
 	}
@@ -181,5 +190,32 @@ func TestCollectOverviewWithFakeFleet(t *testing.T) {
 	}
 	if data.events != nil {
 		t.Errorf("expected nil events with no log source, got %+v", data.events)
+	}
+}
+
+// TestCollectOverviewOmitsEventsWithoutLogsRead proves the per-viewer log gating at
+// the data layer: a viewer holding telemetry:read but NOT logs:read never has the
+// log ring read for them, so events are empty even when a log source IS wired with
+// content — the telemetry panels are unaffected.
+func TestCollectOverviewOmitsEventsWithoutLogsRead(t *testing.T) {
+	s, _ := adminTestServer(t, &fakeFleet{
+		snapshot: []types.Worker{{ID: "w1", Status: types.WorkerOnline}},
+	})
+	src := &fakeLogSource{}
+	src.add(LogRecord{Time: logAt(10), Level: "ERROR", Message: "leak-me", Attrs: nil})
+	s.logs = src
+
+	// telemetry:read only — must NOT pull events.
+	r := httptest.NewRequest(http.MethodGet, "/admin/partials/overview", nil)
+	r = r.WithContext(withKey(r.Context(), store.APIKey{AdminScopes: []string{authz.ScopeTelemetryRead}}))
+	if data := s.collectOverview(r); len(data.events) != 0 {
+		t.Errorf("telemetry-only viewer should get no events, got %+v", data.events)
+	}
+
+	// telemetry:read + logs:read — events are pulled.
+	r = httptest.NewRequest(http.MethodGet, "/admin/partials/overview", nil)
+	r = r.WithContext(withKey(r.Context(), store.APIKey{AdminScopes: []string{authz.ScopeTelemetryRead, authz.ScopeLogsRead}}))
+	if data := s.collectOverview(r); len(data.events) != 1 || data.events[0].Message != "leak-me" {
+		t.Errorf("logs:read viewer should get the seeded event, got %+v", data.events)
 	}
 }

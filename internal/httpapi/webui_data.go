@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/httpapi/webui"
 	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/types"
@@ -34,17 +35,30 @@ const maxEventRows = 8
 // collectOverview reads the live fleet/telemetry/log state once and folds it into
 // the dashboard view-models. It is the single data pull behind the Overview
 // partial, so the KPI row and all three panels reflect one consistent instant.
-func (s *Server) collectOverview(_ *http.Request) overviewData {
+//
+// The queue/worker/throttle data is telemetry (the route is gated on
+// telemetry:read), but the event-stream panel surfaces LOG lines, which are
+// logs:read territory. So the events are fetched ONLY when the viewer also holds
+// logs:read — mirroring the per-section Visible gating in buildShell. A viewer
+// with telemetry:read but not logs:read gets every panel except a populated event
+// stream (it renders its calm empty state), and crucially we never even read the
+// log ring for them, so no log line can leak through this surface.
+func (s *Server) collectOverview(r *http.Request) overviewData {
 	fleet := s.fleet.Fleet()
 	qs := s.fleet.QueueStats()
 	reqs := s.RequestStats()
 	rl := s.RateLimitStats()
 
+	var events []webui.EventRow
+	if key, ok := keyFromContext(r.Context()); ok && authz.HasScope(key, authz.ScopeLogsRead) {
+		events = s.buildEvents()
+	}
+
 	return overviewData{
 		kpis:    buildKPIs(fleet, qs, reqs, rl),
 		queue:   buildQueueDepth(qs),
 		workers: buildWorkerRows(fleet),
-		events:  s.buildEvents(),
+		events:  events,
 	}
 }
 
