@@ -4,19 +4,24 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 
+	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
 )
 
-// The admin API (#4): admin-only HTTP endpoints to manage API keys (CRUD),
-// per-key quotas, roles + per-model allow/deny lists, and to list/inspect/drain
-// workers. Every route is gated by authMiddleware + adminMiddleware (registered
-// via s.admin in httpapi.go), so a non-admin key gets 403 and an unauthenticated
-// request 401 on every endpoint before any handler runs.
+// The admin API (#4, scoped in #90): admin-only HTTP endpoints to manage API
+// keys (CRUD), per-key quotas, roles + per-model allow/deny lists, and to
+// list/inspect/drain workers. Every route is gated by authMiddleware + the scope
+// middleware (registered via s.requireScope / s.requireScopeWrite in
+// httpapi.go), so a key lacking the route's admin scope gets 403 and an
+// unauthenticated request 401 before any handler runs. The RoleAdmin superuser
+// holds every scope, so an admin key passes every route exactly as before.
 //
 // This package only adds the HTTP surface; the underlying key/quota/permission
 // and worker implementations live in internal/auth, internal/quota, and
@@ -41,6 +46,7 @@ type adminKeyView struct {
 	ID          string      `json:"id"`
 	Name        string      `json:"name"`
 	Roles       []string    `json:"roles"`
+	AdminScopes []string    `json:"admin_scopes"`
 	AllowModels []string    `json:"allow_models"`
 	DenyModels  []string    `json:"deny_models"`
 	Revoked     bool        `json:"revoked"`
@@ -66,6 +72,7 @@ func newAdminKeyView(k store.APIKey) adminKeyView {
 		ID:          k.ID,
 		Name:        k.Name,
 		Roles:       orEmpty(k.Roles),
+		AdminScopes: orEmpty(k.AdminScopes),
 		AllowModels: orEmpty(k.AllowModels),
 		DenyModels:  orEmpty(k.DenyModels),
 		Revoked:     k.Revoked(),
@@ -103,6 +110,7 @@ type adminCreateKeyResponse struct {
 	Name        string   `json:"name"`
 	Token       string   `json:"token"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Created     int64    `json:"created"`
@@ -193,8 +201,9 @@ func priorityName(p queue.Priority) string {
 
 // handleAdminStats serves GET /v1/admin/stats. It reads queue depth, the fleet
 // snapshot, and the time-in-queue distribution live (no caching) and returns
-// them as one consolidated JSON document. Gated to admin keys (s.admin), so a
-// non-admin gets 403 and an unauthenticated request 401 before this runs.
+// them as one consolidated JSON document. Gated to the telemetry:read scope
+// (s.requireScope), so a key lacking it gets 403 and an unauthenticated request
+// 401 before this runs.
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	qs := s.fleet.QueueStats()
 	byPriority := make(map[string]int, len(qs.ByPriority))
@@ -256,19 +265,25 @@ type adminQuotaUsageResponse struct {
 // ---- request shapes ----
 
 // adminCreateKeyRequest is the POST /v1/admin/keys body. Name is a human label;
-// the role and allow/deny lists set the new key's initial permissions.
+// the role, admin-scope, and allow/deny lists set the new key's initial
+// permissions. AdminScopes grants the fine-grained management scopes (#90); an
+// unknown scope is rejected with 400.
 type adminCreateKeyRequest struct {
 	Name        string   `json:"name"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 }
 
 // adminPermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body. It is
-// a full replace (not a merge): the supplied lists become the key's roles and
-// allow/deny lists; an omitted/null list clears that dimension.
+// a full replace (not a merge): the supplied lists become the key's roles,
+// admin scopes, and allow/deny lists; an omitted/null list clears that
+// dimension. The full permissions editor is issue #95; here the endpoint already
+// stores and serializes admin_scopes (validating against the known vocabulary).
 type adminPermissionsRequest struct {
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 }
@@ -293,21 +308,30 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if !validateScopes(w, req.AdminScopes) {
+		return
+	}
 	token, key, err := s.auth.CreateWithPermissions(r.Context(), req.Name, auth.Permissions{
 		Roles:       req.Roles,
+		AdminScopes: req.AdminScopes,
 		AllowModels: req.AllowModels,
 		DenyModels:  req.DenyModels,
 	})
 	if err != nil {
+		s.recordAudit(r, auditOpKeyCreate, "", audit.OutcomeFailure, nil, nil)
 		s.reqLog(r.Context()).Error("admin create key failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create key")
 		return
 	}
+	// Audit the create: there is no Before (the key did not exist); the After is
+	// the redacted projection of the new key. The one-time token is NEVER recorded.
+	s.recordAudit(r, auditOpKeyCreate, key.ID, audit.OutcomeSuccess, nil, auditKeyValues(key))
 	writeJSON(w, http.StatusCreated, adminCreateKeyResponse{
 		ID:          key.ID,
 		Name:        key.Name,
 		Token:       token,
 		Roles:       orEmpty(key.Roles),
+		AdminScopes: orEmpty(key.AdminScopes),
 		AllowModels: orEmpty(key.AllowModels),
 		DenyModels:  orEmpty(key.DenyModels),
 		Created:     key.CreatedAt.Unix(),
@@ -315,7 +339,9 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAdminListKeys serves GET /v1/admin/keys. It returns metadata for every
-// key (never any secret).
+// key (never any secret), in the shared cursor-paginated list envelope
+// ({"data":[...],"pagination":{...}}). Keys are stably sorted by id so a cursor
+// names a stable position across requests. Honors ?limit= and ?cursor=.
 func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.auth.List(r.Context())
 	if err != nil {
@@ -323,11 +349,13 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list keys")
 		return
 	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
 	views := make([]adminKeyView, len(keys))
 	for i, k := range keys {
 		views[i] = newAdminKeyView(k)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": views})
+	limit, offset := parsePageParams(r)
+	writeList(w, views, limit, offset)
 }
 
 // handleAdminGetKey serves GET /v1/admin/keys/{id}. It returns one key's
@@ -343,12 +371,17 @@ func (s *Server) handleAdminGetKey(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminRevokeKey serves DELETE /v1/admin/keys/{id}. It revokes the key
 // (subsequent authentication fails immediately) and returns 204, or 404 if
-// unknown.
+// unknown. The revoke is audited with the key's before/after state.
 func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
-	if err := s.auth.Revoke(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	before, _ := s.auth.Get(r.Context(), id)
+	if err := s.auth.Revoke(r.Context(), id); err != nil {
+		s.recordAudit(r, auditOpKeyRevoke, id, audit.OutcomeFailure, auditKeyValues(before), nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	after, _ := s.auth.Get(r.Context(), id)
+	s.recordAudit(r, auditOpKeyRevoke, id, audit.OutcomeSuccess, auditKeyValues(before), auditKeyValues(after))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -359,9 +392,14 @@ func (s *Server) handleAdminRotateKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	token, err := s.auth.Rotate(r.Context(), id)
 	if err != nil {
+		s.recordAudit(r, auditOpKeyRotate, id, audit.OutcomeFailure, nil, nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	// The rotation changes only the secret (which is never recorded), so there is
+	// no meaningful before/after metadata to capture — the op + target + outcome
+	// is the audit trail. The new token is NEVER recorded.
+	s.recordAudit(r, auditOpKeyRotate, id, audit.OutcomeSuccess, nil, nil)
 	writeJSON(w, http.StatusOK, adminRotateKeyResponse{ID: id, Token: token})
 }
 
@@ -373,15 +411,23 @@ func (s *Server) handleAdminSetPermissions(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	key, err := s.auth.SetPermissions(r.Context(), r.PathValue("id"), auth.Permissions{
+	if !validateScopes(w, req.AdminScopes) {
+		return
+	}
+	id := r.PathValue("id")
+	before, _ := s.auth.Get(r.Context(), id)
+	key, err := s.auth.SetPermissions(r.Context(), id, auth.Permissions{
 		Roles:       req.Roles,
+		AdminScopes: req.AdminScopes,
 		AllowModels: req.AllowModels,
 		DenyModels:  req.DenyModels,
 	})
 	if err != nil {
+		s.recordAudit(r, auditOpKeyPermissions, id, audit.OutcomeFailure, auditKeyValues(before), nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	s.recordAudit(r, auditOpKeyPermissions, id, audit.OutcomeSuccess, auditKeyValues(before), auditKeyValues(key))
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
 }
 
@@ -405,11 +451,15 @@ func (s *Server) handleAdminSetQuota(w http.ResponseWriter, r *http.Request) {
 			MonthlyTokens: deref(req.MonthlyTokens),
 		}
 	}
-	key, err := s.auth.SetLimits(r.Context(), r.PathValue("id"), limits)
+	id := r.PathValue("id")
+	before, _ := s.auth.Get(r.Context(), id)
+	key, err := s.auth.SetLimits(r.Context(), id, limits)
 	if err != nil {
+		s.recordAudit(r, auditOpKeyQuota, id, audit.OutcomeFailure, auditKeyValues(before), nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	s.recordAudit(r, auditOpKeyQuota, id, audit.OutcomeSuccess, auditKeyValues(before), auditKeyValues(key))
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
 }
 
@@ -455,9 +505,12 @@ func newQuotaUsageResponse(s quota.Snapshot) adminQuotaUsageResponse {
 }
 
 // handleAdminListWorkers serves GET /v1/admin/workers. It returns a point-in-time
-// snapshot of every worker in the fleet.
+// snapshot of every worker in the fleet, in the shared cursor-paginated list
+// envelope. Workers are stably sorted by id so a cursor names a stable position.
+// Honors ?limit= and ?cursor=.
 func (s *Server) handleAdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	fleet := s.fleet.Fleet()
+	sort.Slice(fleet, func(i, j int) bool { return fleet[i].ID < fleet[j].ID })
 	views := make([]adminWorkerView, len(fleet))
 	for i, wk := range fleet {
 		models := make([]string, len(wk.Models))
@@ -476,14 +529,17 @@ func (s *Server) handleAdminListWorkers(w http.ResponseWriter, r *http.Request) 
 			LastSeen:   wk.LastSeen.Unix(),
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"workers": views})
+	limit, offset := parsePageParams(r)
+	writeList(w, views, limit, offset)
 }
 
 // handleAdminDrainWorker serves POST /v1/admin/workers/{id}/drain. It marks the
 // worker draining (no new jobs; in-flight jobs finish) and returns 204, or 404 if
-// no such worker is connected.
+// no such worker is connected. The drain is audited.
 func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) {
-	if err := s.fleet.DrainWorker(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.fleet.DrainWorker(id); err != nil {
+		s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeFailure, nil, nil)
 		if errors.Is(err, server.ErrWorkerNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "worker not found")
 			return
@@ -492,6 +548,8 @@ func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not drain worker")
 		return
 	}
+	s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeSuccess, nil,
+		audit.RedactedValues{"status": "draining"})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -513,6 +571,21 @@ func deref(p *uint64) uint64 {
 		return 0
 	}
 	return *p
+}
+
+// validateScopes checks every requested admin scope against the known scope
+// vocabulary (authz.ValidScope), writing a 400 and returning false on the first
+// unknown scope so a key is never granted a string that gates nothing. An empty
+// or nil set is valid (no scopes granted). A handler returns immediately when it
+// returns false.
+func validateScopes(w http.ResponseWriter, scopes []string) bool {
+	for _, sc := range scopes {
+		if !authz.ValidScope(sc) {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "unknown admin scope")
+			return false
+		}
+	}
+	return true
 }
 
 // writeAdminKeyError maps an auth/store error from a key operation to its HTTP

@@ -264,6 +264,33 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// scopeMiddleware gates a route to keys holding a specific admin scope (#90). It
+// runs INSIDE authMiddleware (wrap as s.authMiddleware(s.scopeMiddleware(scope,
+// h))), so the key is already authenticated and stashed on the context: it reads
+// keyFromContext and requires authz.HasScope(key, scope), otherwise 403. The
+// RoleAdmin superuser holds every scope (so existing admin keys pass every
+// route, preserving backward compatibility — AC2), while a key granted only a
+// specific scope passes exactly its scope-gated routes and a key with neither
+// gets 403. As with adminMiddleware, an unauthenticated request never reaches
+// here (authMiddleware already returned 401), and the 403 message is generic and
+// never echoes the key's id, roles, or scopes.
+func (s *Server) scopeMiddleware(scope string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, ok := keyFromContext(r.Context())
+		if !ok {
+			// Defensive: authMiddleware always stashes a key before us. If it is
+			// somehow absent, fail closed as unauthenticated rather than admitting.
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing api key")
+			return
+		}
+		if !authz.HasScope(key, scope) {
+			writeError(w, http.StatusForbidden, "forbidden", "insufficient scope")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // hasRole reports whether role appears in roles. Role lists are tiny, so a
 // linear scan is the right tool.
 func hasRole(roles []string, role string) bool {

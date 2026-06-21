@@ -47,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 
 	"github.com/jaypetez/agent-gpu/internal/store"
 )
@@ -92,12 +93,98 @@ func (a Action) String() string { return a.op() }
 // and in docs/architecture.md.
 const (
 	// RoleAdmin grants every action on every model, bypassing allow/deny lists.
+	// It is ALSO the admin-API superuser: it grants every admin scope (see
+	// HasScope and the Scope* constants), so an existing admin key keeps full
+	// access to the management surface without being granted individual scopes.
 	RoleAdmin = "admin"
 	// RoleUser grants pull/load/infer, but only on permitted models.
 	RoleUser = "user"
 	// RoleReadOnly grants infer only (never pull/load), on permitted models.
 	RoleReadOnly = "read-only"
 )
+
+// Admin-API scopes (#90). The management surface is authorized at
+// resource×operation granularity: each scope is "<resource>:<read|write>".
+// A read scope gates the GETs of a resource; a write scope gates its mutations.
+// A key may hold any subset; the RoleAdmin superuser implicitly holds them ALL
+// (see HasScope). Scopes are stored on store.APIKey.AdminScopes and gate the
+// HTTP admin routes via the scope middleware — they are independent of the
+// model-action authorization (Authorize/decide) above, which governs inference.
+//
+// The resources mirror the management epic's surfaces: server config, the
+// worker fleet, model lifecycle, API keys, the structured log stream, telemetry
+// (queue/fleet stats), and the audit log itself.
+const (
+	ScopeConfigRead     = "config:read"
+	ScopeConfigWrite    = "config:write"
+	ScopeWorkersRead    = "workers:read"
+	ScopeWorkersWrite   = "workers:write"
+	ScopeModelsRead     = "models:read"
+	ScopeModelsWrite    = "models:write"
+	ScopeKeysRead       = "keys:read"
+	ScopeKeysWrite      = "keys:write"
+	ScopeLogsRead       = "logs:read"
+	ScopeLogsWrite      = "logs:write"
+	ScopeTelemetryRead  = "telemetry:read"
+	ScopeTelemetryWrite = "telemetry:write"
+	ScopeAuditRead      = "audit:read"
+	ScopeAuditWrite     = "audit:write"
+)
+
+// allScopes is the complete set of admin scopes, used to validate a requested
+// scope set (rejecting unknown scope strings at the create/permissions seam) and
+// documented as exactly what the RoleAdmin superuser implicitly grants. It is
+// the single source of truth for the scope vocabulary.
+var allScopes = map[string]struct{}{
+	ScopeConfigRead:     {},
+	ScopeConfigWrite:    {},
+	ScopeWorkersRead:    {},
+	ScopeWorkersWrite:   {},
+	ScopeModelsRead:     {},
+	ScopeModelsWrite:    {},
+	ScopeKeysRead:       {},
+	ScopeKeysWrite:      {},
+	ScopeLogsRead:       {},
+	ScopeLogsWrite:      {},
+	ScopeTelemetryRead:  {},
+	ScopeTelemetryWrite: {},
+	ScopeAuditRead:      {},
+	ScopeAuditWrite:     {},
+}
+
+// ValidScope reports whether scope names a known admin scope. The HTTP layer
+// uses it to reject an unknown scope on key create/permissions rather than
+// silently storing a string that gates nothing.
+func ValidScope(scope string) bool {
+	_, ok := allScopes[scope]
+	return ok
+}
+
+// AllScopes returns a sorted copy of every defined admin scope. It is the
+// canonical superuser scope set (what RoleAdmin grants) and the validation
+// vocabulary; returning a copy keeps the internal set immutable.
+func AllScopes() []string {
+	out := make([]string, 0, len(allScopes))
+	for s := range allScopes {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HasScope reports whether key is authorized for the admin scope. The RoleAdmin
+// superuser is authorized for every scope (so existing admin keys keep full
+// access); otherwise the key must list the exact scope in its AdminScopes. This
+// is the single decision the admin-route scope middleware consults, mirroring
+// the deny-wins discipline of decide() but for the management surface: a key
+// with neither the admin role nor the scope is denied (the HTTP layer maps that
+// to 403).
+func HasScope(key store.APIKey, scope string) bool {
+	if contains(key.Roles, RoleAdmin) {
+		return true
+	}
+	return contains(key.AdminScopes, scope)
+}
 
 // Authorizer decides whether an authenticated key may perform an action on a
 // model, auditing each decision. It is stateless beyond its logger and safe for

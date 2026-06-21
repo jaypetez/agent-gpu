@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/queue"
@@ -25,25 +26,41 @@ import (
 // GET .../quota usage endpoint is exercised, and returns the fleet so a test can
 // configure DrainWorker behaviour.
 func adminTestServer(t *testing.T, fleet *fakeFleet) (*Server, *auth.Service) {
+	s, authSvc, _ := adminTestServerWithAudit(t, fleet)
+	return s, authSvc
+}
+
+// adminTestServerWithAudit is adminTestServer plus an attached audit store, so a
+// test can assert on the recorded audit entries (#90).
+func adminTestServerWithAudit(t *testing.T, fleet *fakeFleet) (*Server, *auth.Service, *audit.MemoryStore) {
 	t.Helper()
 	st := store.NewMemory()
 	authSvc := auth.NewService(st)
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	az := authz.NewAuthorizer(authz.WithLogger(discard))
+	auditLog := audit.NewMemoryStore(0)
 	s := &Server{
-		fleet: fleet,
-		auth:  authSvc,
-		authz: az,
-		quota: quota.NewEngine(quota.NewMemoryCounterStore()),
-		log:   discard,
+		fleet:    fleet,
+		auth:     authSvc,
+		authz:    az,
+		quota:    quota.NewEngine(quota.NewMemoryCounterStore()),
+		log:      discard,
+		auditLog: auditLog,
 	}
-	return s, authSvc
+	return s, authSvc, auditLog
 }
 
 // req issues an authenticated request with an optional JSON body through the
 // routed handler and returns the recorder. An empty token sends no
 // Authorization header.
 func req(t *testing.T, s *Server, method, path, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return reqWithHeaders(t, s, method, path, token, body, nil)
+}
+
+// reqWithHeaders is req with extra request headers (e.g. Idempotency-Key) so the
+// header-driven middleware can be exercised through the routed handler.
+func reqWithHeaders(t *testing.T, s *Server, method, path, token, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	var r *http.Request
 	if body != "" {
@@ -54,6 +71,9 @@ func req(t *testing.T, s *Server, method, path, token, body string) *httptest.Re
 	}
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range headers {
+		r.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, r)
@@ -161,18 +181,26 @@ func TestAdminKeyLifecycle(t *testing.T) {
 	}
 	id := created.ID
 
-	// List: the new key appears, never with a secret.
+	// List: the new key appears, never with a secret. The list response is the
+	// shared cursor-paginated envelope ({"data":[...],"pagination":{...}}).
 	rec = req(t, s, http.MethodGet, "/v1/admin/keys", adminToken, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list status = %d, want 200", rec.Code)
 	}
 	assertNoSecret(t, rec.Body.String())
 	var list struct {
-		Keys []map[string]any `json:"keys"`
+		Data       []map[string]any `json:"data"`
+		Pagination struct {
+			NextCursor *string `json:"next_cursor"`
+			HasMore    bool    `json:"has_more"`
+		} `json:"pagination"`
 	}
 	decode(t, rec, &list)
-	if !containsKeyID(list.Keys, id) {
-		t.Fatalf("list does not contain created key %s: %+v", id, list.Keys)
+	if !containsKeyID(list.Data, id) {
+		t.Fatalf("list does not contain created key %s: %+v", id, list.Data)
+	}
+	if list.Pagination.HasMore {
+		t.Errorf("single-key list should not report has_more")
 	}
 
 	// Inspect one.
@@ -333,19 +361,19 @@ func TestAdminWorkers(t *testing.T) {
 		t.Fatalf("list workers status = %d, want 200", rec.Code)
 	}
 	var out struct {
-		Workers []struct {
+		Data []struct {
 			ID         string   `json:"id"`
 			Models     []string `json:"models"`
 			Status     string   `json:"status"`
 			ActiveJobs uint32   `json:"active_jobs"`
 			GPUType    string   `json:"gpu_type"`
-		} `json:"workers"`
+		} `json:"data"`
 	}
 	decode(t, rec, &out)
-	if len(out.Workers) != 1 || out.Workers[0].ID != "w1" || out.Workers[0].Status != "online" ||
-		out.Workers[0].ActiveJobs != 2 || out.Workers[0].GPUType != "a100" ||
-		len(out.Workers[0].Models) != 1 || out.Workers[0].Models[0] != "llama3" {
-		t.Fatalf("worker projection wrong: %+v", out.Workers)
+	if len(out.Data) != 1 || out.Data[0].ID != "w1" || out.Data[0].Status != "online" ||
+		out.Data[0].ActiveJobs != 2 || out.Data[0].GPUType != "a100" ||
+		len(out.Data[0].Models) != 1 || out.Data[0].Models[0] != "llama3" {
+		t.Fatalf("worker projection wrong: %+v", out.Data)
 	}
 
 	// Drain a known worker → 204, id forwarded to the control plane.

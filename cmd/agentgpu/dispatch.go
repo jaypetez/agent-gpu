@@ -23,14 +23,18 @@ func dispatch(args []string) error {
 	// Build the single root logger both the server and worker inherit (#23):
 	// level/format/output resolved from env + defaults (flag > env > default), so
 	// the log level is configurable without a code change. The redaction
-	// ReplaceAttr and JSON-by-default encoding live in newLogger so they apply
-	// uniformly to every subsystem that takes this logger. A file sink (if any) is
-	// closed on the way out so its buffer is flushed.
-	logger, closeLog, err := newLogger(config.ResolveLog(config.LogConfig{}, nil))
+	// ReplaceAttr and JSON-by-default encoding live in newLoggerHandle so they
+	// apply uniformly to every subsystem that takes this logger. The handle also
+	// carries the dynamic level var and the in-memory log ring (#90 foundation for
+	// the log-stream/level admin endpoints in #92/#99); they are live in-process
+	// here (every record is buffered) even though no HTTP endpoint reads them yet.
+	// A file sink (if any) is closed on the way out so its buffer is flushed.
+	lh, err := newLoggerHandle(config.ResolveLog(config.LogConfig{}, nil))
 	if err != nil {
 		return err
 	}
-	defer func() { _ = closeLog() }()
+	defer func() { _ = lh.Close() }()
+	logger := lh.Logger
 	slog.SetDefault(logger)
 
 	switch args[0] {

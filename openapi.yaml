@@ -11,17 +11,40 @@ info:
     This document is the formal contract for the public HTTP surface served by `internal/httpapi`.
     The server-to-worker control plane is gRPC and is intentionally **not** described here.
 
-    ## Authentication
+    ## Authentication & authorization
 
     Every endpoint requires an API key presented as an HTTP Bearer token
-    (`Authorization: Bearer agpu_<keyid>_<secret>`). See the `bearerAuth` security scheme. Admin
-    endpoints additionally require the key to hold the `admin` role; a non-admin key receives `403`.
+    (`Authorization: Bearer agpu_<keyid>_<secret>`). See the `bearerAuth` security scheme.
+
+    Admin endpoints are authorized at **resource×operation scope** granularity: each admin route
+    requires a scope of the form `<resource>:<read|write>` (see `AdminScope`) — e.g. `keys:read`
+    gates `GET /v1/admin/keys`, `keys:write` gates the key mutations, `workers:write` gates draining
+    a worker, `telemetry:read` gates the stats endpoint. The built-in `admin` role is a **superuser**
+    that implicitly holds every scope, so an admin key may use every admin endpoint. A key holding a
+    specific scope (but not the admin role) passes only that scope's routes; a key with neither
+    receives `403`.
 
     ## Errors
 
     Every error response uses one consistent envelope — see the `Error` schema — carrying a generic
     human-readable `message` and a stable machine-readable `code`. Messages never leak secrets or
     internal detail; clients branch on `code`.
+
+    ## Pagination
+
+    Admin list endpoints (`GET /v1/admin/keys`, `GET /v1/admin/workers`) return a cursor-paginated
+    envelope `{"data": [...], "pagination": {"next_cursor": <string|null>, "has_more": <bool>}}`.
+    Pass `pagination.next_cursor` back as the `cursor` query parameter to fetch the next page;
+    `cursor` is `null` on the last page. The cursor is opaque — do not construct or parse it.
+    Pagination is cursor-based (not offset-based) so a page boundary is stable as the underlying set
+    changes.
+
+    ## Idempotency
+
+    Admin write requests accept an optional `Idempotency-Key` header. Re-sending a request with the
+    same key within the server's retention window replays the original (successful) response instead
+    of performing the write again — making retries on a flaky network safe. A replay carries the
+    `Idempotency-Replayed: true` response header.
 
     ## Streaming
 
@@ -56,7 +79,10 @@ tags:
   - name: Sessions
     description: Owner-scoped server-side conversation sessions backing the stateful chat mode.
   - name: Admin
-    description: Admin-only management of API keys, quotas, permissions, and workers. Requires the admin role.
+    description: |
+      Admin-only management of API keys, quotas, permissions, and workers. Each route requires the
+      matching admin scope (see `AdminScope`); the `admin` role grants every scope. Writes accept an
+      `Idempotency-Key` header and list endpoints are cursor-paginated.
 
 paths:
   /v1/models:
@@ -413,11 +439,14 @@ paths:
       operationId: adminCreateKey
       summary: Create an API key
       description: |
-        Mints a new API key with the requested roles and per-model allow/deny lists, and returns its
-        id together with the **one-time** plaintext token. The token is shown exactly once and cannot
-        be recovered afterward. Requires the admin role.
+        Mints a new API key with the requested roles, admin scopes, and per-model allow/deny lists,
+        and returns its id together with the **one-time** plaintext token. The token is shown exactly
+        once and cannot be recovered afterward. Requires the `keys:write` scope (the `admin` role
+        grants it). Supports the `Idempotency-Key` header so a retry does not mint a duplicate key.
       tags:
         - Admin
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -443,6 +472,7 @@ paths:
                 token: agpu_8f3a1c2b_Sx9Qd2m7nKpZ4tL6yR0wF1hJ3vC5bN8
                 roles:
                   - user
+                admin_scopes: []
                 allow_models:
                   - llama3
                 deny_models: []
@@ -458,12 +488,17 @@ paths:
     get:
       operationId: adminListKeys
       summary: List API keys
-      description: Returns metadata for every API key. Secrets are never included. Requires the admin role.
+      description: |
+        Returns a cursor-paginated page of API-key metadata (secrets are never included) in the
+        shared list envelope. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
       responses:
         "200":
-          description: The list of API keys (metadata only).
+          description: A cursor-paginated page of API keys (metadata only).
           content:
             application/json:
               schema:
@@ -479,7 +514,7 @@ paths:
     get:
       operationId: adminGetKey
       summary: Get an API key
-      description: Returns one API key's metadata, or `404` if the id is unknown. Requires the admin role.
+      description: Returns one API key's metadata, or `404` if the id is unknown. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
       parameters:
@@ -504,11 +539,13 @@ paths:
       summary: Revoke an API key
       description: |
         Revokes the key so subsequent authentication fails immediately, and returns `204`, or `404`
-        if the id is unknown. Requires the admin role.
+        if the id is unknown. Requires the `keys:write` scope (the `admin` role grants it). Supports
+        the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: The key was revoked. No content.
@@ -527,11 +564,13 @@ paths:
       summary: Rotate an API key secret
       description: |
         Replaces the key's secret (the old token stops verifying immediately) and returns the new
-        **one-time** plaintext token, or `404` if the id is unknown. Requires the admin role.
+        **one-time** plaintext token, or `404` if the id is unknown. Requires the `keys:write` scope
+        (the `admin` role grants it). Supports the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: The key id and its new one-time plaintext token.
@@ -553,13 +592,16 @@ paths:
       operationId: adminSetKeyPermissions
       summary: Replace an API key's permissions
       description: |
-        Replaces the key's roles and per-model allow/deny lists (a full replace, not a merge: an
-        omitted or null list clears that dimension) and returns the updated metadata, or `404` if the
-        id is unknown. The change takes effect immediately. Requires the admin role.
+        Replaces the key's roles, admin scopes, and per-model allow/deny lists (a full replace, not a
+        merge: an omitted or null list clears that dimension) and returns the updated metadata, or
+        `404` if the id is unknown. The change takes effect immediately. Requires the `keys:write`
+        scope (the `admin` role grants it). An unknown admin scope is rejected with `400`. Supports
+        the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -569,6 +611,7 @@ paths:
             example:
               roles:
                 - user
+              admin_scopes: []
               allow_models:
                 - llama3
                 - qwen2:0.5b
@@ -586,6 +629,7 @@ paths:
                 name: my-agent
                 roles:
                   - user
+                admin_scopes: []
                 allow_models:
                   - llama3
                   - qwen2:0.5b
@@ -615,12 +659,13 @@ paths:
         Sets the key's per-key quota override and returns the updated metadata, or `404` if the id is
         unknown. Each field is optional: an omitted field defaults to `0` ("unlimited" for that
         dimension), while a body with **every** field omitted clears the override entirely so the key
-        falls back to the global defaults. The change takes effect immediately. Requires the admin
-        role.
+        falls back to the global defaults. The change takes effect immediately. Requires the
+        `keys:write` scope (the `admin` role grants it). Supports the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -644,6 +689,7 @@ paths:
                 name: my-agent
                 roles:
                   - user
+                admin_scopes: []
                 allow_models:
                   - llama3
                 deny_models: []
@@ -672,7 +718,7 @@ paths:
       description: |
         Returns the key's current usage in each window versus its effective limits, plus when each
         window next resets, or `404` if the id is unknown. Returns `501` when the quota subsystem is
-        disabled. Requires the admin role.
+        disabled. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
       parameters:
@@ -713,12 +759,17 @@ paths:
     get:
       operationId: adminListWorkers
       summary: List workers
-      description: Returns a point-in-time snapshot of every worker in the fleet. Requires the admin role.
+      description: |
+        Returns a cursor-paginated page of the fleet snapshot in the shared list envelope. Requires
+        the `workers:read` scope (the `admin` role grants it).
       tags:
         - Admin
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
       responses:
         "200":
-          description: The fleet snapshot.
+          description: A cursor-paginated page of the fleet snapshot.
           content:
             application/json:
               schema:
@@ -736,11 +787,13 @@ paths:
       summary: Drain a worker
       description: |
         Marks the worker draining: it receives no new jobs while its in-flight jobs are allowed to
-        finish. Returns `204`, or `404` if no such worker is connected. Requires the admin role.
+        finish. Returns `204`, or `404` if no such worker is connected. Requires the `workers:write`
+        scope (the `admin` role grants it). Supports the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/WorkerId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: The worker is now draining. No content.
@@ -762,7 +815,7 @@ paths:
         global job-queue depth (total plus a per-priority breakdown), per-worker load, and the
         time-in-queue distribution. The wait-time distribution covers only jobs that were queued and
         then placed on a worker — the synchronous fast path (never queued) is deliberately excluded.
-        Contains no secrets. Requires the admin role.
+        Contains no secrets. Requires the `telemetry:read` scope (the `admin` role grants it).
       tags:
         - Admin
       responses:
@@ -815,7 +868,8 @@ components:
       scheme: bearer
       description: |
         An agent-gpu API key presented as `Authorization: Bearer agpu_<keyid>_<secret>`. Every
-        endpoint requires it. Admin endpoints additionally require the key to hold the `admin` role.
+        endpoint requires it. Admin endpoints additionally require the matching admin scope (see
+        `AdminScope`); the `admin` role is a superuser that grants every scope.
 
   parameters:
     SessionId:
@@ -850,6 +904,40 @@ components:
         field (stateful mode); if both are present the body field wins.
       schema:
         type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        An optional client-chosen key that makes an admin **write** safe to retry. If a request is
+        re-sent with the same key within the server's retention window, the server replays the
+        original response (status + body) instead of performing the write again, and sets the
+        `Idempotency-Replayed: true` response header on the replay. Only a successful (2xx) response
+        is cached; a failed attempt is not replayed (it may be retried). Use a unique value per
+        logical operation (e.g. a UUID).
+      schema:
+        type: string
+        maxLength: 255
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        The maximum number of items to return in this page. Clamped to the server maximum; an absent
+        or invalid value uses the server default.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+    PageCursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        An opaque pagination cursor from a prior response's `pagination.next_cursor`. Omit it to
+        start at the first page. A stale or invalid cursor restarts pagination at the first page.
+      schema:
+        type: string
 
   responses:
     Unauthorized:
@@ -864,15 +952,15 @@ components:
               code: unauthorized
     Forbidden:
       description: |
-        The authenticated key is not permitted to perform this action (a non-admin key on an admin
-        endpoint, or a key not permitted to use the requested model).
+        The authenticated key is not permitted to perform this action (it lacks the admin scope the
+        route requires, or it is not permitted to use the requested model).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example:
             error:
-              message: admin role required
+              message: insufficient scope
               code: forbidden
     NotFound:
       description: The requested resource does not exist (or is not visible to this key).
@@ -1550,11 +1638,58 @@ components:
 
     Role:
       type: string
-      description: A built-in API-key role.
+      description: |
+        A built-in API-key role. `admin` is the management **superuser**: it grants every admin
+        scope (see `AdminScope`), so an admin key may use every admin endpoint regardless of its
+        explicit scope set.
       enum:
         - admin
         - user
         - read-only
+
+    AdminScope:
+      type: string
+      description: |
+        A fine-grained admin-API scope of the form `<resource>:<read|write>`. Scopes authorize the
+        management surface at resource×operation granularity: a `read` scope gates a resource's GET
+        endpoints, a `write` scope gates its mutations. A key may hold any subset; the `admin` role
+        is a superuser that implicitly holds them all. A key holding a specific scope (but not the
+        admin role) passes only that scope's routes and receives `403` elsewhere. Granting an
+        unknown scope on key create/permissions is rejected with `400`.
+      enum:
+        - config:read
+        - config:write
+        - workers:read
+        - workers:write
+        - models:read
+        - models:write
+        - keys:read
+        - keys:write
+        - logs:read
+        - logs:write
+        - telemetry:read
+        - telemetry:write
+        - audit:read
+        - audit:write
+
+    Pagination:
+      type: object
+      description: |
+        The cursor-pagination footer of a list response. Pagination is cursor-based (not offset):
+        pass `next_cursor` back as the `cursor` query parameter to fetch the next page. The cursor is
+        an opaque token — treat it as a black box; do not construct or parse it.
+      required:
+        - next_cursor
+        - has_more
+      properties:
+        next_cursor:
+          type: [string, "null"]
+          description: |
+            An opaque token for the next page, or `null` when this is the last page. Pass it as the
+            `cursor` query parameter on the next request.
+        has_more:
+          type: boolean
+          description: Whether a further page exists (true exactly when `next_cursor` is non-null).
 
     Limits:
       type: object
@@ -1596,6 +1731,7 @@ components:
         - id
         - name
         - roles
+        - admin_scopes
         - allow_models
         - deny_models
         - revoked
@@ -1612,6 +1748,11 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: array
+          description: The fine-grained admin-API scopes granted to the key (empty unless scoped).
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: array
           description: The per-key allow-list of model names.
@@ -1646,14 +1787,19 @@ components:
 
     AdminKeyListResponse:
       type: object
-      description: The list of API keys.
+      description: |
+        A cursor-paginated page of API keys in the shared list envelope. `data` holds the page of
+        keys (metadata only); `pagination` carries the cursor for the next page.
       required:
-        - keys
+        - data
+        - pagination
       properties:
-        keys:
+        data:
           type: array
           items:
             $ref: "#/components/schemas/AdminKeyView"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
 
     AdminCreateKeyRequest:
       type: object
@@ -1669,6 +1815,11 @@ components:
           description: The roles to grant the new key.
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: [array, "null"]
+          description: The fine-grained admin-API scopes to grant. An unknown scope is rejected with 400.
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: [array, "null"]
           description: The per-key allow-list of model names.
@@ -1690,6 +1841,7 @@ components:
         - name
         - token
         - roles
+        - admin_scopes
         - allow_models
         - deny_models
         - created
@@ -1706,6 +1858,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: array
           items:
@@ -1736,13 +1892,17 @@ components:
     AdminPermissionsRequest:
       type: object
       description: |
-        A full replacement of a key's roles and allow/deny lists. An omitted or null list clears that
-        dimension.
+        A full replacement of a key's roles, admin scopes, and allow/deny lists. An omitted or null
+        list clears that dimension. An unknown admin scope is rejected with 400.
       properties:
         roles:
           type: [array, "null"]
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: [array, "null"]
           items:
@@ -1886,14 +2046,19 @@ components:
 
     AdminWorkerListResponse:
       type: object
-      description: The fleet snapshot.
+      description: |
+        A cursor-paginated page of the fleet snapshot in the shared list envelope. `data` holds the
+        page of workers; `pagination` carries the cursor for the next page.
       required:
-        - workers
+        - data
+        - pagination
       properties:
-        workers:
+        data:
           type: array
           items:
             $ref: "#/components/schemas/AdminWorkerView"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
 
     AdminStatsResponse:
       type: object

@@ -121,6 +121,7 @@ func (s *Service) CreateWithPermissions(ctx context.Context, name string, perms 
 		Salt:        salt,
 		CreatedAt:   s.now().UTC(),
 		Roles:       perms.Roles,
+		AdminScopes: perms.AdminScopes,
 		AllowModels: perms.AllowModels,
 		DenyModels:  perms.DenyModels,
 	}
@@ -164,19 +165,20 @@ func (s *Service) Revoke(ctx context.Context, id string) error {
 	return nil
 }
 
-// Permissions are the role and per-model allow/deny lists set on a key. They
-// are interpreted by internal/authz; this package only persists them.
+// Permissions are the role, admin-scope, and per-model allow/deny lists set on a
+// key. They are interpreted by internal/authz; this package only persists them.
 type Permissions struct {
 	Roles       []string
+	AdminScopes []string
 	AllowModels []string
 	DenyModels  []string
 }
 
-// SetPermissions replaces a key's roles and allow/deny lists with the supplied
-// values (a full replace, not a merge), preserving the key's identity and
-// secret. It is the management seam used by the `key perms` CLI until the admin
-// HTTP endpoints (#4) exist. Setting permissions on an unknown key returns
-// store.ErrNotFound; nil slices clear the corresponding list.
+// SetPermissions replaces a key's roles, admin scopes, and allow/deny lists with
+// the supplied values (a full replace, not a merge), preserving the key's
+// identity and secret. It is the management seam used by the `key perms` CLI and
+// the admin HTTP endpoints (#4/#90). Setting permissions on an unknown key
+// returns store.ErrNotFound; nil slices clear the corresponding list.
 //
 // Because authorization reads the key fresh from the store on every check
 // (internal/authz caches nothing), a change here takes effect immediately with
@@ -190,6 +192,7 @@ func (s *Service) SetPermissions(ctx context.Context, id string, perms Permissio
 		return store.APIKey{}, err
 	}
 	rec.Roles = perms.Roles
+	rec.AdminScopes = perms.AdminScopes
 	rec.AllowModels = perms.AllowModels
 	rec.DenyModels = perms.DenyModels
 	if err := s.store.PutAPIKey(ctx, rec); err != nil {

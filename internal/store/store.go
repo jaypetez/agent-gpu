@@ -48,6 +48,13 @@ type APIKey struct {
 	// "user", "read-only"). The authorization engine (#3) interprets them; the
 	// store only persists them.
 	Roles []string
+	// AdminScopes are the fine-grained admin-API scopes granted to this key
+	// (e.g. "keys:read", "workers:write" — see internal/authz). They gate the
+	// management surface (#90) at resource×read/write granularity. A nil/empty
+	// set grants no admin scope; the "admin" role is a superuser that grants ALL
+	// scopes regardless of this field, so existing admin keys are unaffected. The
+	// authorization layer interprets these; the store only persists them.
+	AdminScopes []string
 	// AllowModels is the per-key allow-list of model names. A model present here
 	// is permitted (subject to role/deny precedence — see internal/authz).
 	AllowModels []string
@@ -143,6 +150,9 @@ func cloneAPIKey(k APIKey) APIKey {
 	}
 	if k.Roles != nil {
 		out.Roles = append([]string(nil), k.Roles...)
+	}
+	if k.AdminScopes != nil {
+		out.AdminScopes = append([]string(nil), k.AdminScopes...)
 	}
 	if k.AllowModels != nil {
 		out.AllowModels = append([]string(nil), k.AllowModels...)

@@ -80,7 +80,9 @@ func TestCreateKey(t *testing.T) {
 func TestListKeys(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"keys":[{"id":"a","name":"one","roles":["admin"],"revoked":false,"usage_count":3,"created":10},{"id":"b","name":"two","roles":[],"revoked":true,"usage_count":0,"created":20}]}`)
+		// The server returns the cursor-paginated list envelope; a single page with
+		// a null next_cursor terminates the client's follow loop.
+		_, _ = io.WriteString(w, `{"data":[{"id":"a","name":"one","roles":["admin"],"revoked":false,"usage_count":3,"created":10},{"id":"b","name":"two","roles":[],"revoked":true,"usage_count":0,"created":20}],"pagination":{"next_cursor":null,"has_more":false}}`)
 	}))
 	defer srv.Close()
 
@@ -90,6 +92,32 @@ func TestListKeys(t *testing.T) {
 	}
 	if len(keys) != 2 || keys[0].ID != "a" || !keys[1].Revoked {
 		t.Fatalf("unexpected keys: %+v", keys)
+	}
+}
+
+// TestListKeysFollowsCursor proves the client walks multiple pages: the stub
+// hands out one key per page with a next_cursor until exhausted, and the client
+// assembles the full list across requests.
+func TestListKeysFollowsCursor(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = io.WriteString(w, `{"data":[{"id":"a"}],"pagination":{"next_cursor":"MQ","has_more":true}}`)
+		case "MQ":
+			_, _ = io.WriteString(w, `{"data":[{"id":"b"}],"pagination":{"next_cursor":"Mg","has_more":true}}`)
+		default:
+			_, _ = io.WriteString(w, `{"data":[{"id":"c"}],"pagination":{"next_cursor":null,"has_more":false}}`)
+		}
+	}))
+	defer srv.Close()
+
+	keys, err := newTestClient(t, srv).ListKeys(context.Background())
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	if len(keys) != 3 || keys[0].ID != "a" || keys[1].ID != "b" || keys[2].ID != "c" {
+		t.Fatalf("cursor follow assembled wrong list: %+v", keys)
 	}
 }
 
@@ -229,7 +257,7 @@ func TestListModels(t *testing.T) {
 func TestListWorkers(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"workers":[{"id":"w1","models":["llama3"],"status":"online","active_jobs":1,"load":2}]}`)
+		_, _ = io.WriteString(w, `{"data":[{"id":"w1","models":["llama3"],"status":"online","active_jobs":1,"load":2}],"pagination":{"next_cursor":null,"has_more":false}}`)
 	}))
 	defer srv.Close()
 
@@ -338,7 +366,7 @@ func TestTransportErrorNotAPIError(t *testing.T) {
 func TestNoTokenOmitsAuthHeader(t *testing.T) {
 	t.Parallel()
 	var cap capture
-	srv := httptest.NewServer(recordingHandler(&cap, http.StatusOK, `{"keys":[]}`))
+	srv := httptest.NewServer(recordingHandler(&cap, http.StatusOK, `{"data":[],"pagination":{"next_cursor":null,"has_more":false}}`))
 	defer srv.Close()
 
 	c := New(srv.URL, "", WithHTTPClient(srv.Client()))

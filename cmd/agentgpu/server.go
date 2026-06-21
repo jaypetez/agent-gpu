@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/config"
@@ -33,6 +34,16 @@ const quotaCheckpointInterval = 30 * time.Second
 // history to disk while running, bounding how much conversation state a crash
 // can lose (mirrors the quota checkpoint cadence).
 const sessionCheckpointInterval = 30 * time.Second
+
+// auditCheckpointInterval is how often the server flushes the admin audit log to
+// disk while running, bounding how much of the audit trail a crash can lose to
+// one interval (mirrors the quota/session checkpoint cadence) (#90).
+const auditCheckpointInterval = 30 * time.Second
+
+// auditLogCapacity bounds the in-memory admin audit log to a rolling window of
+// the most recent entries, so the trail cannot grow without limit (#90). It is
+// generous for an admin API's write volume.
+const auditLogCapacity = 100_000
 
 // httpShutdownTimeout bounds how long the HTTP server is given to drain
 // in-flight requests on graceful shutdown before the process proceeds to stop
@@ -267,11 +278,24 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		return fmt.Errorf("register metrics collector: %w", err)
 	}
 
+	// Admin audit log (#90): an append-only, in-memory + file-checkpoint trail of
+	// every admin WRITE. It is loaded from its checkpoint at boot and flushed
+	// periodically + on shutdown (mirroring the quota/session wiring), so the trail
+	// survives restarts and a crash loses at most one checkpoint interval. The
+	// checkpoint lives alongside the other control-plane state files.
+	auditPath := auditCheckpointPath(qcfg.Path)
+	auditLog := audit.NewMemoryStore(auditLogCapacity)
+	if err := auditLog.LoadCheckpoint(auditPath); err != nil {
+		return fmt.Errorf("load audit checkpoint: %w", err)
+	}
+
 	// Public HTTP API: authenticates Bearer tokens via the same key store and
 	// permission-filters the catalog with the shared authorizer above. The same
-	// Prometheus instrument is threaded in so the request path is metered.
+	// Prometheus instrument is threaded in so the request path is metered, and the
+	// audit log records every admin write.
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen)
+	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen,
+		httpapi.WithAuditLog(auditLog))
 
 	// Metrics listener (#24): a second HTTP server serving only /metrics on a
 	// dedicated port, unauthenticated (it is an operational port, not the public
@@ -327,6 +351,23 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		}
 	}()
 
+	// Periodic audit-log checkpoint, bounding how much of the admin audit trail a
+	// crash can lose to one interval (mirrors the quota/session checkpoints).
+	auditTicker := time.NewTicker(auditCheckpointInterval)
+	defer auditTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-auditTicker.C:
+				if err := auditLog.Checkpoint(auditPath); err != nil {
+					logger.Warn("audit checkpoint failed", "err", err)
+				}
+			}
+		}
+	}()
+
 	errCh := make(chan error, 3)
 	go func() { errCh <- gs.Serve(lis) }()
 	go func() {
@@ -367,6 +408,9 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 			logger.Warn("quota checkpoint on shutdown failed", "err", err)
 		}
 		checkpointSessions(logger, sessStore, histStore, sessPath, histPath)
+		if err := auditLog.Checkpoint(auditPath); err != nil {
+			logger.Warn("audit checkpoint on shutdown failed", "err", err)
+		}
 		return nil
 	case err := <-errCh:
 		return err
@@ -380,6 +424,15 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 // lifecycle, so a single --session-path flag configures both.
 func sessionHistoryPath(sessionPath string) string {
 	return filepath.Join(filepath.Dir(sessionPath), "history.json")
+}
+
+// auditCheckpointPath derives the admin audit-log checkpoint path from the quota
+// checkpoint path: audit.json alongside the other control-plane state files. The
+// audit log shares the state directory and lifecycle with quota/session, so it
+// needs no separate flag (#90); it can be promoted to its own flag/env later if
+// an operator needs to relocate it.
+func auditCheckpointPath(quotaPath string) string {
+	return filepath.Join(filepath.Dir(quotaPath), "audit.json")
 }
 
 // sessionKeepSet returns the ids of the sessions currently in the store, used as
