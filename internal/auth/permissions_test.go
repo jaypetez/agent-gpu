@@ -106,3 +106,41 @@ func TestSetPermissionsUnknownKey(t *testing.T) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
+
+// TestAdminScopesPersist verifies admin scopes (#90) round-trip through create
+// and SetPermissions and survive a fresh read from the store, alongside roles.
+func TestAdminScopesPersist(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	svc := newTestService(t)
+
+	_, key, err := svc.CreateWithPermissions(ctx, "scoped", Permissions{AdminScopes: []string{"keys:read", "workers:write"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := svc.store.GetAPIKey(ctx, key.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(got.AdminScopes) != 2 || got.AdminScopes[0] != "keys:read" || got.AdminScopes[1] != "workers:write" {
+		t.Fatalf("created admin_scopes = %v", got.AdminScopes)
+	}
+
+	// SetPermissions replaces the scope set.
+	updated, err := svc.SetPermissions(ctx, key.ID, Permissions{AdminScopes: []string{"audit:read"}})
+	if err != nil {
+		t.Fatalf("set permissions: %v", err)
+	}
+	if len(updated.AdminScopes) != 1 || updated.AdminScopes[0] != "audit:read" {
+		t.Fatalf("replaced admin_scopes = %v", updated.AdminScopes)
+	}
+
+	// Clearing drops the scope set entirely.
+	cleared, err := svc.SetPermissions(ctx, key.ID, Permissions{Roles: []string{"user"}})
+	if err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if len(cleared.AdminScopes) != 0 {
+		t.Fatalf("admin_scopes not cleared: %v", cleared.AdminScopes)
+	}
+}

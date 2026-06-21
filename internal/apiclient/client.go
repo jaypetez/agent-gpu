@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -123,6 +125,7 @@ type KeyView struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Revoked     bool     `json:"revoked"`
@@ -149,6 +152,7 @@ type CreateKeyResponse struct {
 	Name        string   `json:"name"`
 	Token       string   `json:"token"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Created     int64    `json:"created"`
@@ -200,19 +204,37 @@ type Worker struct {
 	LastSeen   int64    `json:"last_seen"`
 }
 
+// listEnvelope is the shared cursor-paginated list response shape every admin
+// list endpoint returns ({"data":[...],"pagination":{...}}). It mirrors
+// httpapi.listEnvelope. The client follows next_cursor to assemble the full list.
+type listEnvelope[T any] struct {
+	Data       []T `json:"data"`
+	Pagination struct {
+		NextCursor *string `json:"next_cursor"`
+		HasMore    bool    `json:"has_more"`
+	} `json:"pagination"`
+}
+
+// maxPageSize mirrors the server's maximum page size (httpapi.maxPageSize); the
+// list methods request it to minimize round-trips while following the cursor.
+const maxPageSize = 200
+
 // CreateKeyRequest is the POST /v1/admin/keys body. Mirrors
 // httpapi.adminCreateKeyRequest.
 type CreateKeyRequest struct {
 	Name        string   `json:"name"`
 	Roles       []string `json:"roles,omitempty"`
+	AdminScopes []string `json:"admin_scopes,omitempty"`
 	AllowModels []string `json:"allow_models,omitempty"`
 	DenyModels  []string `json:"deny_models,omitempty"`
 }
 
 // PermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body — a full
-// replace of roles and allow/deny lists. Mirrors httpapi.adminPermissionsRequest.
+// replace of roles, admin scopes, and allow/deny lists. Mirrors
+// httpapi.adminPermissionsRequest.
 type PermissionsRequest struct {
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes,omitempty"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 }
@@ -238,15 +260,28 @@ func (c *Client) CreateKey(ctx context.Context, req CreateKeyRequest) (CreateKey
 	return out, err
 }
 
-// ListKeys returns metadata for every key (GET /v1/admin/keys). No secrets.
+// ListKeys returns metadata for every key (GET /v1/admin/keys). No secrets. The
+// server returns the cursor-paginated list envelope ({"data":[...],
+// "pagination":{...}}); this method requests the maximum page size and follows
+// the next_cursor until exhausted, so the CLI sees the full keyset as before.
 func (c *Client) ListKeys(ctx context.Context) ([]KeyView, error) {
-	var out struct {
-		Keys []KeyView `json:"keys"`
+	var all []KeyView
+	cursor := ""
+	for {
+		var out listEnvelope[KeyView]
+		path := "/v1/admin/keys?limit=" + strconv.Itoa(maxPageSize)
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
 	}
-	if err := c.do(ctx, http.MethodGet, "/v1/admin/keys", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Keys, nil
 }
 
 // GetKey returns one key's metadata (GET /v1/admin/keys/{id}), or ErrNotFound.
@@ -308,15 +343,27 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 // ListWorkers returns a point-in-time snapshot of the fleet (GET
-// /v1/admin/workers).
+// /v1/admin/workers). Like ListKeys, the server returns the cursor-paginated
+// list envelope; this method requests the maximum page size and follows the
+// next_cursor until exhausted so the CLI sees the whole fleet.
 func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
-	var out struct {
-		Workers []Worker `json:"workers"`
+	var all []Worker
+	cursor := ""
+	for {
+		var out listEnvelope[Worker]
+		path := "/v1/admin/workers?limit=" + strconv.Itoa(maxPageSize)
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
 	}
-	if err := c.do(ctx, http.MethodGet, "/v1/admin/workers", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Workers, nil
 }
 
 // Get performs a raw authenticated GET against path and decodes the JSON body

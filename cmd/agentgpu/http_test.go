@@ -109,7 +109,7 @@ func TestKeyListHTTPNoSecretLeak(t *testing.T) {
 	t.Parallel()
 	a := newAdminStub(t, map[string]stubResponse{
 		"GET /v1/admin/keys": {http.StatusOK,
-			`{"keys":[{"id":"k1","name":"app","roles":["admin"],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":7,"created":1700000000,"last_used":1700000100}]}`},
+			`{"data":[{"id":"k1","name":"app","roles":["admin"],"admin_scopes":[],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":7,"created":1700000000,"last_used":1700000100}],"pagination":{"next_cursor":null,"has_more":false}}`},
 	})
 
 	out, err := runHTTP(t, a, runKeyCmd, "list")
