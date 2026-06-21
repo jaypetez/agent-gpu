@@ -307,6 +307,84 @@ type GPUWorkerCell struct {
 	ActiveJobs uint32 `json:"active_jobs"`
 }
 
+// UsageReport is the GET /v1/admin/usage response: a fleet-wide throttle summary
+// plus the cursor-paginated per-key usage rows. Mirrors httpapi.adminUsageResponse.
+// The client follows next_cursor to assemble the full set; ListUsage returns just
+// the rows, GetUsage the whole report (summary + first page).
+type UsageReport struct {
+	Summary    UsageSummary `json:"summary"`
+	Data       []UsageRow   `json:"data"`
+	Pagination struct {
+		NextCursor *string `json:"next_cursor"`
+		HasMore    bool    `json:"has_more"`
+	} `json:"pagination"`
+}
+
+// UsageSummary is the top-level, fleet-wide section of the usage report: the
+// number of keys matched by the filters and the AGGREGATE (server-wide) throttle
+// counts. Per-key throttling is not tracked, so these are reported once at the top
+// level. Mirrors httpapi.adminUsageSummary.
+type UsageSummary struct {
+	KeyCount        int    `json:"key_count"`
+	GlobalThrottled uint64 `json:"global_throttled"`
+	KeyThrottled    uint64 `json:"key_throttled"`
+}
+
+// UsageRow is one key's usage row: identity/labels, the live quota snapshot
+// (current usage vs effective limits), the rolling daily token series (a
+// sparkline; empty when no history), and a best-effort exhaustion forecast.
+// Mirrors httpapi.adminUsageRow.
+type UsageRow struct {
+	KeyID  string `json:"key_id"`
+	Name   string `json:"name"`
+	Owner  string `json:"owner,omitempty"`
+	Team   string `json:"team,omitempty"`
+	Limits Limits `json:"limits"`
+
+	RequestsThisMinute uint64 `json:"requests_this_minute"`
+	TokensThisMinute   uint64 `json:"tokens_this_minute"`
+	TokensToday        uint64 `json:"tokens_today"`
+	TokensThisMonth    uint64 `json:"tokens_this_month"`
+
+	MinuteResetsAt int64 `json:"minute_resets_at"`
+	DayResetsAt    int64 `json:"day_resets_at"`
+	MonthResetsAt  int64 `json:"month_resets_at"`
+
+	Series   []UsageSeriesPoint `json:"series"`
+	Forecast UsageForecast      `json:"forecast"`
+}
+
+// UsageSeriesPoint is one daily point of a key's usage series: the UTC day (unix
+// seconds at midnight), that day's cumulative tokens, and the requests observed in
+// the minute window at sample time. Mirrors httpapi.adminUsageSeriesPoint.
+type UsageSeriesPoint struct {
+	Day      int64  `json:"day"`
+	Tokens   uint64 `json:"tokens"`
+	Requests uint64 `json:"requests"`
+}
+
+// UsageForecast is a key's best-effort exhaustion forecast: the projected unix
+// seconds each token budget is reached at the recent daily burn rate, or nil when
+// there is no estimate (unlimited budget, non-rising usage, or insufficient
+// history). It is an ESTIMATE for rendering, not an enforcement signal. Mirrors
+// httpapi.adminUsageForecast.
+type UsageForecast struct {
+	DailyExhaustionAt   *int64 `json:"daily_exhaustion_at"`
+	MonthlyExhaustionAt *int64 `json:"monthly_exhaustion_at"`
+}
+
+// UsageFilter narrows a usage query to keys matching the given exact labels. Every
+// field is optional; a zero UsageFilter requests every key. Non-empty fields are
+// ANDed by the server (matching the server-side filter semantics).
+type UsageFilter struct {
+	// KeyID, if non-empty, matches exactly this key id.
+	KeyID string
+	// Owner, if non-empty, matches keys whose owner label equals it.
+	Owner string
+	// Team, if non-empty, matches keys whose team label equals it.
+	Team string
+}
+
 // AuditEntry is one record of the admin audit log (GET /v1/admin/audit): who did
 // it (Actor key id), what (Op), to which resource (Target), the redacted
 // before/after metadata projection of the affected object, the request
@@ -652,6 +730,63 @@ func auditQuery(f AuditFilter) string {
 	}
 	if !f.Until.IsZero() {
 		q.Set("until", strconv.FormatInt(f.Until.Unix(), 10))
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "&" + q.Encode()
+}
+
+// ListUsage returns the per-key usage rows matching filter (GET /v1/admin/usage),
+// sorted by key id. Like ListKeys/ListAudit the server returns the cursor-
+// paginated list envelope; this method requests the maximum page size and follows
+// the next_cursor until exhausted, so the caller sees every matching key's row. The
+// fleet-wide throttle summary is dropped (it is identical on every page); use
+// GetUsage when the summary is needed. The rows never carry secret material.
+func (c *Client) ListUsage(ctx context.Context, filter UsageFilter) ([]UsageRow, error) {
+	base := usageQuery(filter)
+	var all []UsageRow
+	cursor := ""
+	for {
+		var out UsageReport
+		path := "/v1/admin/usage?limit=" + strconv.Itoa(maxPageSize) + base
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
+	}
+}
+
+// GetUsage returns the first page of the usage report for filter, including the
+// fleet-wide throttle summary (GET /v1/admin/usage). It is the single-request form
+// for callers that want the aggregate summary and a page of rows rather than the
+// full cursor-followed row set ListUsage assembles.
+func (c *Client) GetUsage(ctx context.Context, filter UsageFilter) (UsageReport, error) {
+	var out UsageReport
+	err := c.do(ctx, http.MethodGet, "/v1/admin/usage?limit="+strconv.Itoa(maxPageSize)+usageQuery(filter), nil, &out)
+	return out, err
+}
+
+// usageQuery renders a UsageFilter into the query-string suffix (each piece
+// prefixed with "&", to follow the leading "?limit=") for ListUsage/GetUsage.
+// Empty fields are omitted; an empty filter yields the empty string.
+func usageQuery(f UsageFilter) string {
+	q := url.Values{}
+	if f.KeyID != "" {
+		q.Set("key_id", f.KeyID)
+	}
+	if f.Owner != "" {
+		q.Set("owner", f.Owner)
+	}
+	if f.Team != "" {
+		q.Set("team", f.Team)
 	}
 	if len(q) == 0 {
 		return ""

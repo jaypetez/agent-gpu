@@ -24,6 +24,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/session"
+	usagepkg "github.com/jaypetez/agent-gpu/internal/usage"
 )
 
 // quotaCheckpointInterval is how often the server flushes the quota counters to
@@ -39,6 +40,19 @@ const sessionCheckpointInterval = 30 * time.Second
 // disk while running, bounding how much of the audit trail a crash can lose to
 // one interval (mirrors the quota/session checkpoint cadence) (#90).
 const auditCheckpointInterval = 30 * time.Second
+
+// usageSampleInterval is how often the snapshotter folds the live per-key quota
+// snapshots into the rolling usage series (#97). The series is DAILY-granularity,
+// so a sample only ever refreshes today's point (or rolls to a new day at UTC
+// midnight); a coarse cadence is therefore plenty — it does not need the 30s of
+// the counter checkpoint. Five minutes keeps "tokens today" current for the
+// dashboard while the per-key List+UsageForKey sweep stays cheap.
+const usageSampleInterval = 5 * time.Minute
+
+// usageCheckpointInterval is how often the rolling usage series is flushed to
+// disk, bounding how much history a crash can lose. It mirrors the quota/session/
+// audit checkpoint cadence so the state files flush together (#97).
+const usageCheckpointInterval = 30 * time.Second
 
 // auditLogCapacity bounds the in-memory admin audit log to a rolling window of
 // the most recent entries, so the trail cannot grow without limit (#90). It is
@@ -294,6 +308,19 @@ func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConf
 		return fmt.Errorf("load audit checkpoint: %w", err)
 	}
 
+	// Rolling per-key usage series (#97): a bounded daily-token history backing the
+	// sparkline + exhaustion forecast in GET /v1/admin/usage. It is loaded from its
+	// checkpoint at boot and fed by the snapshotter goroutine below (which folds the
+	// live quota snapshots into today's daily sample), then flushed periodically + on
+	// shutdown — mirroring the quota/audit wiring so the history survives restarts and
+	// a crash loses at most one checkpoint interval. The checkpoint lives alongside
+	// the other control-plane state files.
+	usagePath := usageCheckpointPath(qcfg.Path)
+	usageStore := usagepkg.New()
+	if err := usageStore.LoadCheckpoint(usagePath); err != nil {
+		return fmt.Errorf("load usage checkpoint: %w", err)
+	}
+
 	// Runtime settings/config (#92): the effective resolved tunable values seed the
 	// admin config holder, the boot-only values are surfaced read-only, and the
 	// appliers wire each tunable field to the matching thread-safe subsystem setter
@@ -339,6 +366,7 @@ func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConf
 	authSvc := auth.NewService(st)
 	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen,
 		httpapi.WithAuditLog(auditLog),
+		httpapi.WithUsageSeries(usageStore),
 		httpapi.WithRuntimeConfig(configInitial, configBoot, configAppliers, configPath))
 
 	// Re-apply any persisted PUT overrides on top of the freshly-resolved config, so
@@ -420,6 +448,44 @@ func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConf
 		}
 	}()
 
+	// Usage snapshotter (#97): on a coarse cadence, fold the live per-key quota
+	// snapshots into the rolling daily usage series so GET /v1/admin/usage reports a
+	// current "tokens today" point and a forecast. It selects on ctx.Done so it stops
+	// cleanly on shutdown (no goroutine leak). A sweep is List(all keys) →
+	// UsageForKey(each); a List error is logged and the sweep skipped (the next tick
+	// retries) rather than crashing the running server. Sampled once at startup so a
+	// freshly-booted dashboard is not blank until the first tick.
+	sampleUsage(ctx, logger, authSvc, eng, usageStore)
+	usageTicker := time.NewTicker(usageSampleInterval)
+	defer usageTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-usageTicker.C:
+				sampleUsage(ctx, logger, authSvc, eng, usageStore)
+			}
+		}
+	}()
+
+	// Periodic usage-series checkpoint, bounding how much history a crash can lose to
+	// one interval (mirrors the quota/session/audit checkpoints).
+	usageTickerCP := time.NewTicker(usageCheckpointInterval)
+	defer usageTickerCP.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-usageTickerCP.C:
+				if err := usageStore.Checkpoint(usagePath); err != nil {
+					logger.Warn("usage checkpoint failed", "err", err)
+				}
+			}
+		}
+	}()
+
 	errCh := make(chan error, 3)
 	go func() { errCh <- gs.Serve(lis) }()
 	go func() {
@@ -463,6 +529,12 @@ func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConf
 		if err := auditLog.Checkpoint(auditPath); err != nil {
 			logger.Warn("audit checkpoint on shutdown failed", "err", err)
 		}
+		// Sample once more on the way out so the persisted series carries the latest
+		// "tokens today" figure, then flush it (mirrors the quota checkpoint).
+		sampleUsage(context.Background(), logger, authSvc, eng, usageStore)
+		if err := usageStore.Checkpoint(usagePath); err != nil {
+			logger.Warn("usage checkpoint on shutdown failed", "err", err)
+		}
 		return nil
 	case err := <-errCh:
 		return err
@@ -485,6 +557,41 @@ func sessionHistoryPath(sessionPath string) string {
 // an operator needs to relocate it.
 func auditCheckpointPath(quotaPath string) string {
 	return filepath.Join(filepath.Dir(quotaPath), "audit.json")
+}
+
+// usageCheckpointPath derives the rolling usage-series checkpoint path from the
+// quota checkpoint path: usage.json alongside the other control-plane state files
+// (#97). The series shares the state directory and lifecycle with quota/session/
+// audit, so it needs no separate flag; it holds only per-key daily token history
+// (no secrets) and is re-loaded at boot so the sparkline survives a restart.
+func usageCheckpointPath(quotaPath string) string {
+	return filepath.Join(filepath.Dir(quotaPath), "usage.json")
+}
+
+// sampleUsage folds one round of live per-key quota snapshots into the rolling
+// usage series (#97): it lists every key and records each key's current snapshot
+// (TokensToday/RequestsThisMinute) into today's daily sample. A List error is
+// logged and the sweep skipped (the next tick retries) rather than failing — a
+// telemetry sample must never crash the running server. A per-key snapshot error
+// is logged and that key skipped. It is called from the snapshotter goroutine, at
+// startup, and on shutdown, so it must be cheap and side-effect-free beyond the
+// store write.
+func sampleUsage(ctx context.Context, logger *slog.Logger, authSvc *auth.Service, eng *quota.Engine, usageStore *usagepkg.Store) {
+	keys, err := authSvc.List(ctx)
+	if err != nil {
+		logger.Warn("usage sample: list keys failed", "err", err)
+		return
+	}
+	snaps := make([]quota.Snapshot, 0, len(keys))
+	for _, k := range keys {
+		snap, err := eng.UsageForKey(ctx, k)
+		if err != nil {
+			logger.Warn("usage sample: snapshot failed", "key_id", k.ID, "err", err)
+			continue
+		}
+		snaps = append(snaps, snap)
+	}
+	usageStore.Record(snaps, time.Now())
 }
 
 // configCheckpointPath derives the runtime-config override checkpoint path from
