@@ -353,10 +353,14 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 
 	for chunk := range chunks {
 		if chunk.Err != nil {
-			// Mid-stream failure: emit a terminal error frame then [DONE] so the
-			// client's stream parser ends cleanly rather than hanging. Do NOT persist
-			// a partial turn for a failed stream.
-			s.writeChatErrorFrame(r, w, flusher, id, created, model, chunk.Err)
+			// Mid-stream failure: emit a terminal SSE error frame (the OpenAI error
+			// envelope) then [DONE] so the client's stream parser ends cleanly AND
+			// observes the failure, rather than a truncated answer masquerading as a
+			// clean completion. No chunk with a fake finish_reason is emitted. Do NOT
+			// persist a partial turn for a failed stream. The worker's actual code is
+			// logged server-side; the client gets only a generic message.
+			s.reqLog(r.Context()).Warn("chat stream failed mid-stream", "code", chunk.Err.Code, "err", chunk.Err.Message)
+			writeSSEError(w, flusher, streamErrorBody(chunk.Err))
 			failed = true
 			break
 		}
@@ -410,22 +414,6 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, key store.AP
 	if mode == modeStateful && !failed && sawDone && r.Context().Err() == nil {
 		s.persistTurn(context.WithoutCancel(r.Context()), sessionID, key.ID, newMessages, content.String(), toolCalls)
 	}
-}
-
-// writeChatErrorFrame emits a terminal chat chunk carrying finish_reason
-// "error" so a client streaming the response observes a clean termination on an
-// upstream failure (after headers are already sent, a JSON error is no longer
-// an option). The actual error code is logged server-side.
-func (s *Server) writeChatErrorFrame(r *http.Request, w http.ResponseWriter, flusher http.Flusher, id string, created int64, model string, jerr *types.JobError) {
-	s.reqLog(r.Context()).Warn("chat stream failed mid-stream", "code", jerr.Code, "err", jerr.Message)
-	fr := "error"
-	writeSSEData(w, flusher, chatChunkResponse{
-		ID:      id,
-		Object:  "chat.completion.chunk",
-		Created: created,
-		Model:   model,
-		Choices: []chatChunkChoice{{Index: 0, FinishReason: &fr}},
-	})
 }
 
 // ---- request/response conversions ----

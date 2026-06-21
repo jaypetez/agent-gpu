@@ -47,6 +47,19 @@ func writeSSEData(w http.ResponseWriter, flusher http.Flusher, v any) {
 	flusher.Flush()
 }
 
+// writeSSEError marshals an error envelope and writes it as one SSE data frame,
+// then flushes. It is the mid-stream-failure counterpart of writeSSEData: once a
+// stream has begun (headers and the first frame are sent) a JSON error + status
+// is no longer possible, so an upstream failure is surfaced as a single
+// `data: {"error":{...}}\n\n` frame carrying the OpenAI error envelope. The
+// caller follows it with writeSSEDone so the client's stream parser ends cleanly,
+// and — crucially — emits NO chunk with a fake finish_reason, so a truncated
+// answer is never mistaken for a clean completion. Framing is identical to
+// writeSSEData; the distinct name documents the intent at the call site.
+func writeSSEError(w http.ResponseWriter, flusher http.Flusher, body errorBody) {
+	writeSSEData(w, flusher, body)
+}
+
 // writeSSEDone writes the OpenAI stream terminator and flushes it, signalling
 // end-of-stream to an OpenAI-compatible client.
 func writeSSEDone(w http.ResponseWriter, flusher http.Flusher) {

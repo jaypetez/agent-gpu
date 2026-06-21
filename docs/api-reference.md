@@ -48,17 +48,25 @@ Retry-After: 30
 ### Errors
 
 Every error response uses one consistent envelope carrying a generic,
-human-readable `message` and a stable, machine-readable `code`. Messages never
-leak secrets or internal detail; clients should branch on `code`:
+human-readable `message`, a stable, machine-readable `code`, and a `type` (the
+OpenAI error class). Messages never leak secrets or internal detail; clients
+should branch on `code`:
 
 ```json
-{ "error": { "message": "rate limit exceeded", "code": "rate_limit_exceeded" } }
+{ "error": { "message": "rate limit exceeded", "code": "rate_limit_exceeded", "type": "rate_limit_error" } }
 ```
 
 The `code` values are a fixed set (see the `Error` schema in the spec):
 `unauthorized`, `forbidden`, `rate_limit_exceeded`, `session_limit_exceeded`,
-`unavailable`, `invalid_request_error`, `not_found`, `method_not_allowed`,
-`not_implemented`, and `internal_error`.
+`unavailable`, `invalid_request_error`, `not_found`, `model_not_found`,
+`method_not_allowed`, `not_implemented`, and `internal_error`.
+
+The `type` field makes the envelope a strict **superset** of OpenAI's error
+object: an OpenAI-compatible client that branches on `error.type` works
+unchanged, while agent-gpu clients use the finer-grained `code`. It is derived
+from the HTTP status and is one of `invalid_request_error` (4xx client faults
+other than 401/429), `authentication_error` (401), `rate_limit_error` (429), or
+`server_error` (5xx).
 
 ### Session limits
 
