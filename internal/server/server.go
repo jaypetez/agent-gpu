@@ -50,6 +50,17 @@ const defaultModelWarmMax = time.Hour
 // ErrShuttingDown is returned when a job is submitted during shutdown.
 var ErrShuttingDown = errors.New("server: shutting down")
 
+// ErrModelUnavailable is returned by the dispatch path when no live (connected,
+// non-stale) worker advertises the requested model at submit time. It is the
+// fail-fast counterpart to legitimate backpressure: a model that simply does not
+// exist on the fleet can never be served by waiting, so the request is rejected
+// immediately rather than queued behind a (potentially unbounded) waiter that
+// would only resolve if a matching worker happened to appear. The queue-and-block
+// path is reserved for the case where a worker that HAS the model is connected
+// but cannot take the job right now (busy/draining). The request path (#13) maps
+// it to 503 "unavailable". See modelServed for the precise liveness rule.
+var ErrModelUnavailable = errors.New("server: no worker serves the requested model")
+
 // ErrWorkerNotFound is returned by DrainWorker when no worker has the given id.
 var ErrWorkerNotFound = errors.New("server: worker not found")
 
@@ -1012,6 +1023,36 @@ func (s *Server) pickWorker(model, preferredWorkerID string) (*worker, bool) {
 	return w, ok
 }
 
+// modelServed reports whether at least one LIVE worker currently advertises a
+// model named model. It is the fail-fast gate the dispatch path consults before
+// queueing: a model no connected worker serves can never be satisfied by
+// waiting, so submit returns ErrModelUnavailable instead of enqueueing the job
+// behind a waiter that would block until the client's own timeout.
+//
+// "Live" here means present and not stale (Online OR Draining), which is BROADER
+// than the scheduler's runnability filter (Online-and-fit) on purpose. The
+// distinction is exactly the queue's reason to exist (#9): a model is "served"
+// — and a job for it legitimately queues for capacity — whenever a worker that
+// has the model is connected, even if no such worker can take the job right now
+// (it is draining its in-flight work, or, once capacity gating lands, busy). A
+// stale worker (missed heartbeats, about to be evicted) does not count: it is no
+// longer a credible home for the model. This keeps the queue-and-block path
+// reachable for genuine backpressure while still failing fast when the model is
+// simply not on the fleet at all (the headline case: no connected worker has it).
+func (s *Server) modelServed(model string) bool {
+	for _, wk := range s.Fleet() {
+		if wk.Status == types.WorkerStale {
+			continue
+		}
+		for _, m := range wk.Models {
+			if m.Name == model {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // affinityFor resolves the worker a job's session is bound to, for affinity
 // routing (#34). It returns "" — meaning "no preference" — unless a session
 // manager is configured AND the job carries a SessionID AND the (owner-checked)
@@ -1497,7 +1538,15 @@ func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey
 	w, ok := s.pickWorker(job.Model, preferred)
 	if !ok {
 		// No live worker for the model: there is nothing to attach a stream to.
-		// Surface backpressure the same way the queue would, mapped to 503.
+		// Distinguish "no worker serves this model at all" (a fail-fast 503 with a
+		// clear "unavailable" message) from "a capable worker exists but is busy"
+		// (legitimate backpressure, surfaced like a full queue) so the streaming
+		// path matches the non-streaming submit's diagnosis.
+		if !s.modelServed(job.Model) {
+			return nil, ErrModelUnavailable
+		}
+		// A capable worker exists but none can take the stream right now. Surface
+		// backpressure the same way the queue would, mapped to 503.
 		return nil, queue.ErrQueueFull
 	}
 	// Record/update the binding now that a worker is committed for this turn. The
@@ -1667,6 +1716,17 @@ func (s *Server) submit(ctx context.Context, job types.Job, keyID string, prio q
 	// dispatch paths carry it.
 	preferred, keepAlive := s.sessionDispatchHints(ctx, job, keyID)
 	job.KeepAliveSeconds = keepAlive
+
+	// Fail fast when no live worker serves the model at all: there is nothing to
+	// wait for, so reject immediately rather than enqueueing behind a waiter that
+	// would block until the caller's own timeout. The queue-and-block path below is
+	// reserved for the case where a worker that HAS the model is connected but
+	// cannot take the job right now (busy/draining — legitimate backpressure).
+	// Checked after affinity/keep-alive resolution but before the fast-path
+	// pick/enqueue so neither path can park on an unserved model.
+	if !s.modelServed(job.Model) {
+		return types.JobResult{}, ErrModelUnavailable
+	}
 
 	// Fast path: a worker fits right now. Dispatch synchronously.
 	if w, ok := s.pickWorker(job.Model, preferred); ok {

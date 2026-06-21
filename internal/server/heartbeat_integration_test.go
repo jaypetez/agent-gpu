@@ -388,7 +388,12 @@ func TestWorkerReportsCapacityAndActiveJobs(t *testing.T) {
 		FreeVRAM:  6 << 30,
 		GPUType:   "test-gpu",
 		Load:      7,
-		Executor:  testutil.NewFakeExecutor(testutil.WithBlock(release)),
+		// Advertise the model from the executor too, so the worker's heartbeat
+		// available_models keeps reporting llama3 (the heartbeat refresh would
+		// otherwise overwrite the registration models with the executor's empty
+		// list). The dispatch path now fails fast for a model NO worker serves, so
+		// the worker must genuinely advertise the model it is expected to run.
+		Executor: testutil.NewFakeExecutor(testutil.WithBlock(release), testutil.WithExecModels("llama3")),
 	})
 	go func() { _ = w.Run(ctx) }()
 

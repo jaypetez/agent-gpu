@@ -11,26 +11,38 @@ import (
 )
 
 // TestQueueDepthReflectsBacklog covers AC3/AC4 for queue depth: a growing backlog
-// (jobs submitted while no worker is connected) is reflected live in QueueStats()
-// — the total grows to N and the per-priority breakdown attributes every queued
-// job to its lane. Keyless SubmitJob queues at PriorityNormal, so this asserts a
-// known queue state of N normal-lane jobs. (The distinct-priority ordering of the
-// breakdown is exercised directly in the queue package's priority tests.)
+// (jobs that queue because the model is served but no worker can take them) is
+// reflected live in QueueStats() — the total reflects the queued jobs and the
+// per-priority breakdown attributes every queued job to its lane. Keyless
+// SubmitJob queues at PriorityNormal, so this asserts a known queue state of
+// normal-lane jobs. (The distinct-priority ordering of the breakdown is exercised
+// directly in the queue package's priority tests.)
+//
+// Setup note (post fail-fast, #13 client-readiness): a job only queues when the
+// model is SERVED, so freezeQueue connects a drained worker serving the model and
+// parks the placement loop on a sentinel — the model is served (jobs queue
+// instead of fast-failing) and the loop no longer drains the queue, so the N
+// submits below form a static, observable backlog.
 func TestQueueDepthReflectsBacklog(t *testing.T) {
 	clk := newTestClock(time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC))
+	placing := make(chan string, 8)
 	h := newHarnessWith(t,
 		server.WithClock(clk.now),
 		server.WithHeartbeatTimeout(time.Minute),
 		server.WithEvictScanInterval(5*time.Millisecond),
 		server.WithPlaceScanInterval(5*time.Millisecond),
+		server.WithPlacementObserver(func(jobID string) { placing <- jobID }),
 	)
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
 
+	busy := freezeQueue(t, h, placing, "m")
+	defer busy.close()
+
 	const n = 4
 	for i := 0; i < n; i++ {
 		id := "job-" + string(rune('A'+i))
-		// Each blocks (queued, no worker) until Close releases it.
+		// Each blocks (queued, no worker free) until Close releases it.
 		go func(id string) {
 			_, _ = h.srv.SubmitJob(context.Background(), types.Job{ID: id, Model: "m"})
 		}(id)
@@ -70,9 +82,22 @@ func TestWaitTimeRecordedOnPlacement(t *testing.T) {
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
 	// Start the placement loop now so it drains the queue (and fires the placement
-	// observer) before any worker connects; otherwise the loop would not run until
-	// the first Connect and awaitPlacing below would deadlock.
+	// observer) before any RUNNABLE worker connects; otherwise the loop would not
+	// run until the first Connect and awaitPlacing below would deadlock.
 	h.srv.Start()
+
+	// A drained worker serving the model keeps it "served" so the job below queues
+	// (model served, no worker free) rather than fast-failing with
+	// ErrModelUnavailable; the placement loop then parks it until a runnable worker
+	// appears, which is exactly the wait this test measures.
+	busy := dialRaw(t, h, "busy-worker", []types.Model{{Name: "llama3"}})
+	defer busy.close()
+	waitFor(t, 2*time.Second, "busy worker registered", func() bool {
+		return h.srv.WorkerCount() == 1
+	})
+	if err := h.srv.DrainWorker("busy-worker"); err != nil {
+		t.Fatalf("drain busy-worker: %v", err)
+	}
 
 	awaitPlacing := func(want string) {
 		t.Helper()
