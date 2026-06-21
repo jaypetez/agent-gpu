@@ -1110,6 +1110,94 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/telemetry:
+    get:
+      operationId: adminGetTelemetry
+      summary: Get the dashboard telemetry summary
+      description: |
+        Returns, in a single call, the structured statistics a monitoring dashboard renders: the HTTP
+        request count and latency distribution, the aggregate (server-wide) throttle counts, fleet
+        health (worker count, a breakdown by lifecycle status, the job-queue depth, and the
+        time-in-queue distribution), the live active-session count, the session-affinity
+        hit/miss/rebind counters, and the process uptime in seconds. It is read live (no caching) and
+        contains no secrets.
+
+        This is a read-only JSON facade over the **same in-process collectors** the server already
+        maintains — it scrapes or parses nothing from the Prometheus `/metrics` endpoint, which is
+        unchanged and remains the canonical scrape target. It is distinct from `GET /v1/admin/stats`
+        (which keeps its own queue/worker/wait-time shape): this endpoint rolls up every dashboard
+        signal so a GUI fetches them once. The request `count` is monotonic; divide its delta by the
+        change in `uptime_seconds` (or the wall-clock between two polls) to derive a request rate.
+
+        The latency histogram mirrors the wait-time histogram shape: cumulative `le_ms` buckets with a
+        trailing `+Inf` bucket (`le_ms` of `0`). Requires the `telemetry:read` scope (the `admin` role
+        grants it).
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The consolidated dashboard telemetry summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTelemetryResponse"
+              example:
+                requests:
+                  count: 1840
+                  latency:
+                    sum_ms: 220800
+                    max_ms: 4200
+                    mean_ms: 120
+                    buckets:
+                      - le_ms: 10
+                        count: 320
+                      - le_ms: 100
+                        count: 1180
+                      - le_ms: 1000
+                        count: 1790
+                      - le_ms: 10000
+                        count: 1840
+                      - le_ms: 0
+                        count: 1840
+                throttles:
+                  global: 4
+                  key: 1
+                fleet:
+                  worker_count: 2
+                  by_status:
+                    online: 1
+                    draining: 1
+                  queue:
+                    total: 3
+                    by_priority:
+                      normal: 2
+                      high: 1
+                  wait_time:
+                    count: 128
+                    sum_ms: 76800
+                    max_ms: 4200
+                    mean_ms: 600
+                    buckets:
+                      - le_ms: 100
+                        count: 40
+                      - le_ms: 1000
+                        count: 118
+                      - le_ms: 0
+                        count: 128
+                sessions:
+                  active: 7
+                affinity:
+                  hits: 512
+                  misses: 18
+                  rebinds: 18
+                uptime_seconds: 3600
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /v1/admin/usage:
     get:
       operationId: adminGetUsage
@@ -3489,6 +3577,181 @@ components:
           format: int64
           minimum: 0
           description: The number of jobs the worker is currently running.
+
+    AdminTelemetryResponse:
+      type: object
+      description: |
+        The dashboard telemetry summary returned by `GET /v1/admin/telemetry`: request rate/latency,
+        aggregate throttle counts, fleet health (status breakdown, queue depth, time-in-queue
+        distribution), the live session count, session-affinity counters, and process uptime — all read
+        live from the same in-process collectors the rest of the server maintains (the Prometheus
+        `/metrics` surface is unchanged). Contains no secrets.
+      required:
+        - requests
+        - throttles
+        - fleet
+        - sessions
+        - affinity
+        - uptime_seconds
+      properties:
+        requests:
+          $ref: "#/components/schemas/TelemetryRequests"
+        throttles:
+          $ref: "#/components/schemas/TelemetryThrottles"
+        fleet:
+          $ref: "#/components/schemas/TelemetryFleet"
+        sessions:
+          $ref: "#/components/schemas/TelemetrySessions"
+        affinity:
+          $ref: "#/components/schemas/TelemetryAffinity"
+        uptime_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Whole seconds since the API server started. Combine with the monotonic `requests.count`
+            (or sample across two polls) to derive a request rate.
+
+    TelemetryRequests:
+      type: object
+      description: |
+        The request-rate/latency section: the total HTTP requests observed and the latency
+        distribution. It is the in-process mirror of the Prometheus request-duration histogram.
+      required:
+        - count
+        - latency
+      properties:
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The total number of HTTP requests observed (monotonic).
+        latency:
+          $ref: "#/components/schemas/TelemetryLatency"
+
+    TelemetryLatency:
+      type: object
+      description: |
+        The request-latency distribution: sum, max, and mean (all in milliseconds) plus the cumulative
+        le-bucketed histogram. The bucket shape matches `AdminWaitBucket` (a trailing `le_ms` of `0` is
+        the `+Inf` bucket).
+      required:
+        - sum_ms
+        - max_ms
+        - mean_ms
+        - buckets
+      properties:
+        sum_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The sum of all observed request latencies, in milliseconds.
+        max_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The longest observed request latency, in milliseconds.
+        mean_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The mean observed request latency, in milliseconds (0 when no request is recorded).
+        buckets:
+          type: array
+          description: The cumulative le-bucketed request-latency histogram, smallest bound first.
+          items:
+            $ref: "#/components/schemas/AdminWaitBucket"
+
+    TelemetryThrottles:
+      type: object
+      description: |
+        The throttle section: the cumulative count of requests rejected by the server-wide (global)
+        rate limiter and by per-key quota. These are **aggregate** (server-wide) — the rate limiter
+        does not attribute throttling to individual keys — matching the usage report's summary.
+      required:
+        - global
+        - key
+      properties:
+        global:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of requests rejected by the global rate limiter.
+        key:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of per-key quota rejections (429s).
+
+    TelemetryFleet:
+      type: object
+      description: |
+        The fleet-health section: the worker count, a breakdown of workers by lifecycle status, the
+        job-queue depth (total plus per-priority), and the time-in-queue distribution.
+      required:
+        - worker_count
+        - by_status
+        - queue
+        - wait_time
+      properties:
+        worker_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of workers in the snapshot.
+        by_status:
+          type: object
+          description: |
+            The worker count keyed by lifecycle status (`online`, `draining`, `stale`); only statuses
+            with at least one worker appear.
+          additionalProperties:
+            type: integer
+            format: int64
+            minimum: 0
+        queue:
+          $ref: "#/components/schemas/AdminQueueStats"
+        wait_time:
+          $ref: "#/components/schemas/AdminWaitTime"
+
+    TelemetrySessions:
+      type: object
+      description: |
+        The sessions section: the number of live (not-yet-expired) conversation sessions across all
+        owners. It is `0` when sessions are disabled.
+      required:
+        - active
+      properties:
+        active:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of live sessions (0 when sessions are disabled).
+
+    TelemetryAffinity:
+      type: object
+      description: |
+        The session-affinity section: turns that reused a session's warm worker (`hits`), turns that
+        rebound to a different worker (`misses`), and the session→worker rebindings (`rebinds`).
+      required:
+        - hits
+        - misses
+        - rebinds
+      properties:
+        hits:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Turns that routed back to the worker the session was already bound to (warm cache reused).
+        misses:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Turns that rebound to a different worker because the bound one was gone/unfit.
+        rebinds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The session→worker rebindings (equals `misses` today; reported distinctly).
 
     AdminRolesResponse:
       type: object

@@ -307,6 +307,95 @@ type GPUWorkerCell struct {
 	ActiveJobs uint32 `json:"active_jobs"`
 }
 
+// Telemetry is the GET /v1/admin/telemetry response: the dashboard summary in one
+// document — request rate/latency, throttles, fleet health (status breakdown, queue
+// depth, time-in-queue distribution), the live session count, session-affinity
+// counters, and process uptime. It mirrors httpapi.adminTelemetryResponse. It is a
+// read-only view over the same in-process collectors the server already maintains
+// (the Prometheus /metrics surface is separate and unchanged). The histogram bucket
+// slices are never nil.
+type Telemetry struct {
+	Requests      TelemetryRequests  `json:"requests"`
+	Throttles     TelemetryThrottles `json:"throttles"`
+	Fleet         TelemetryFleet     `json:"fleet"`
+	Sessions      TelemetrySessions  `json:"sessions"`
+	Affinity      TelemetryAffinity  `json:"affinity"`
+	UptimeSeconds int64              `json:"uptime_seconds"`
+}
+
+// TelemetryRequests is the request-rate/latency section of Telemetry: the total
+// requests observed and the latency distribution. Mirrors httpapi.telemetryRequests.
+type TelemetryRequests struct {
+	Count   uint64           `json:"count"`
+	Latency TelemetryLatency `json:"latency"`
+}
+
+// TelemetryLatency is the request-latency distribution: sum/max/mean (milliseconds)
+// and the cumulative le-bucketed histogram (trailing le_ms == 0 is the +Inf bucket).
+// Mirrors httpapi.telemetryLatency; Buckets reuses the wait-bucket shape.
+type TelemetryLatency struct {
+	SumMs   uint64                `json:"sum_ms"`
+	MaxMs   uint64                `json:"max_ms"`
+	MeanMs  uint64                `json:"mean_ms"`
+	Buckets []TelemetryStatBucket `json:"buckets"`
+}
+
+// TelemetryStatBucket is one cumulative histogram bucket (latency or wait-time): the
+// count of observations <= LeMs, with LeMs == 0 the sentinel for the +Inf bucket.
+// Mirrors httpapi.adminWaitBucket.
+type TelemetryStatBucket struct {
+	LeMs  uint64 `json:"le_ms"`
+	Count uint64 `json:"count"`
+}
+
+// TelemetryThrottles is the throttle section: the aggregate (server-wide) global and
+// per-key throttle counts. Mirrors httpapi.telemetryThrottles.
+type TelemetryThrottles struct {
+	Global uint64 `json:"global"`
+	Key    uint64 `json:"key"`
+}
+
+// TelemetryFleet is the fleet-health section: worker count, a breakdown of workers
+// by lifecycle status, the queue depth, and the time-in-queue distribution. Mirrors
+// httpapi.telemetryFleet. ByStatus carries only statuses with at least one worker.
+type TelemetryFleet struct {
+	WorkerCount int               `json:"worker_count"`
+	ByStatus    map[string]int    `json:"by_status"`
+	Queue       TelemetryQueue    `json:"queue"`
+	WaitTime    TelemetryWaitTime `json:"wait_time"`
+}
+
+// TelemetryQueue is the queue-depth section: the total pending jobs plus a
+// per-priority breakdown keyed by priority name. Mirrors httpapi.adminQueueStats.
+type TelemetryQueue struct {
+	Total      int            `json:"total"`
+	ByPriority map[string]int `json:"by_priority"`
+}
+
+// TelemetryWaitTime is the time-in-queue distribution: count/sum/max/mean (ms) and
+// the cumulative le-bucketed histogram. Mirrors httpapi.adminWaitTime.
+type TelemetryWaitTime struct {
+	Count   uint64                `json:"count"`
+	SumMs   uint64                `json:"sum_ms"`
+	MaxMs   uint64                `json:"max_ms"`
+	MeanMs  uint64                `json:"mean_ms"`
+	Buckets []TelemetryStatBucket `json:"buckets"`
+}
+
+// TelemetrySessions is the sessions section: the count of live sessions (0 when
+// sessions are disabled). Mirrors httpapi.telemetrySessions.
+type TelemetrySessions struct {
+	Active int `json:"active"`
+}
+
+// TelemetryAffinity is the session-affinity section: hits/misses/rebinds. Mirrors
+// httpapi.telemetryAffinity.
+type TelemetryAffinity struct {
+	Hits    uint64 `json:"hits"`
+	Misses  uint64 `json:"misses"`
+	Rebinds uint64 `json:"rebinds"`
+}
+
 // UsageReport is the GET /v1/admin/usage response: a fleet-wide throttle summary
 // plus the cursor-paginated per-key usage rows. Mirrors httpapi.adminUsageResponse.
 // The client follows next_cursor to assemble the full set; ListUsage returns just
@@ -629,6 +718,19 @@ func (c *Client) WorkerDetail(ctx context.Context, id string) (WorkerDetail, err
 func (c *Client) FleetCapacity(ctx context.Context) (FleetCapacity, error) {
 	var out FleetCapacity
 	err := c.do(ctx, http.MethodGet, "/v1/admin/gpus", nil, &out)
+	return out, err
+}
+
+// Telemetry returns the dashboard telemetry summary (GET /v1/admin/telemetry): the
+// request rate/latency, throttle counts, fleet health (status breakdown, queue
+// depth, time-in-queue distribution), live session count, session-affinity
+// counters, and process uptime — in one call. It is a live read over the same
+// in-process collectors the server maintains (the Prometheus /metrics surface is
+// separate and unchanged), so it reflects the server as of the call. Requires the
+// telemetry:read scope (the admin role grants it).
+func (c *Client) Telemetry(ctx context.Context) (Telemetry, error) {
+	var out Telemetry
+	err := c.do(ctx, http.MethodGet, "/v1/admin/telemetry", nil, &out)
 	return out, err
 }
 

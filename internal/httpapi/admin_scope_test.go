@@ -64,6 +64,7 @@ func TestScopedKeyMatrix(t *testing.T) {
 		{http.MethodPost, "/v1/admin/workers/w1/models", `{"model":"llama3"}`, authz.ScopeModelsWrite},
 		{http.MethodDelete, "/v1/admin/workers/w1/models/llama3", "", authz.ScopeModelsWrite},
 		{http.MethodGet, "/v1/admin/stats", "", authz.ScopeTelemetryRead},
+		{http.MethodGet, "/v1/admin/telemetry", "", authz.ScopeTelemetryRead},
 		{http.MethodGet, "/v1/admin/usage", "", authz.ScopeTelemetryRead},
 		{http.MethodGet, "/v1/admin/audit", "", authz.ScopeAuditRead},
 	}

@@ -146,6 +146,13 @@ func (s *Server) metricsMiddleware(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
-		s.metrics.ObserveRequest(endpointLabel(r.URL.Path), r.Method, rec.status, time.Since(start).Seconds())
+		elapsed := time.Since(start)
+		s.metrics.ObserveRequest(endpointLabel(r.URL.Path), r.Method, rec.status, elapsed.Seconds())
+		// Additively fold the same measured latency into the lock-free in-process
+		// accumulator backing GET /v1/admin/telemetry (#98). This is independent of
+		// (and does not change) the Prometheus ObserveRequest above — it exists only
+		// because the Prometheus histogram has no in-process read API — and is
+		// atomics-only so it adds negligible overhead to the hot path.
+		s.recordRequest(elapsed)
 	})
 }

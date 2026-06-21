@@ -47,6 +47,9 @@ type fakeFleet struct {
 	// the zero values model an empty queue / no recorded waits.
 	queueStats queue.Stats
 	waitStats  server.WaitTimeStats
+	// affinityStats backs the affinity section of the telemetry endpoint (#98); the
+	// zero value models no recorded turns.
+	affinityStats server.AffinityStats
 }
 
 func (f *fakeFleet) Fleet() []types.Worker { return f.snapshot }
@@ -87,6 +90,8 @@ func (f *fakeFleet) AdminUnloadModel(_ context.Context, workerID, model string) 
 func (f *fakeFleet) QueueStats() queue.Stats { return f.queueStats }
 
 func (f *fakeFleet) WaitTimeStats() server.WaitTimeStats { return f.waitStats }
+
+func (f *fakeFleet) AffinityStats() server.AffinityStats { return f.affinityStats }
 
 // testServer builds an httpapi.Server wired to the fake fleet and a real auth
 // service + authorizer over an in-memory store, plus a discarding logger.
