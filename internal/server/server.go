@@ -360,6 +360,12 @@ type Server struct {
 	// existing scheduler/dispatch/quota/authz path is unchanged. Wired by #36.
 	sessionMgr *session.Manager
 
+	// warmMu guards modelWarmMax, which is runtime-tunable (#92): SetModelWarmMax
+	// replaces it live with no restart, and sessionDispatchHints reads it under
+	// warmMu so a concurrent dispatch observes the change atomically. It is a small
+	// dedicated mutex separate from s.mu so a warm-window update never contends with
+	// the fleet read path.
+	warmMu sync.RWMutex
 	// modelWarmMax caps the model-warmth keep_alive window (#35): for a
 	// session-bound job the dispatcher sets Job.KeepAliveSeconds to
 	// min(session TTL, modelWarmMax) so the model stays resident across the
@@ -1091,7 +1097,10 @@ func (s *Server) sessionDispatchHints(ctx context.Context, job types.Job, keyID 
 			"session", job.SessionID, "key_id", keyID, "err", err)
 		return "", 0
 	}
-	return sess.BoundWorkerID, warmWindowSeconds(sess.TTL, s.modelWarmMax)
+	s.warmMu.RLock()
+	warm := s.modelWarmMax
+	s.warmMu.RUnlock()
+	return sess.BoundWorkerID, warmWindowSeconds(sess.TTL, warm)
 }
 
 // warmWindowSeconds derives the keep_alive window (in whole seconds) for a
@@ -1605,6 +1614,57 @@ func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey
 // Quota exposes the configured quota engine (a seam for usage inspection and
 // graceful-shutdown checkpointing by the cmd layer).
 func (s *Server) Quota() *quota.Engine { return s.quota }
+
+// SetHeartbeatTimeout replaces the stale-eviction window at runtime (#92): the
+// length of time a worker may go without a heartbeat before the eviction loop
+// reaps it. A non-positive value is rejected (the existing timeout is kept) so
+// eviction is never disabled by a bad value; the runtime-config layer validates
+// d > 0 before calling, so a rejection here is a defensive backstop. It takes
+// effect immediately with no restart — evictStale, pickWorker, and Fleet all read
+// heartbeatTimeout under s.mu, and this writes it under s.mu.Lock() — and is safe
+// for concurrent use. The eviction-loop scan cadence (evictScan) is unchanged; the
+// next scan simply uses the new timeout.
+func (s *Server) SetHeartbeatTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heartbeatTimeout = d
+}
+
+// HeartbeatTimeout returns the current stale-eviction window (#92), read under
+// s.mu so it reflects any live SetHeartbeatTimeout. It backs the admin config GET
+// projection.
+func (s *Server) HeartbeatTimeout() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.heartbeatTimeout
+}
+
+// SetModelWarmMax replaces the model-warmth keep_alive cap at runtime (#92): the
+// longest a session-bound model is kept resident on its worker after a turn. A
+// non-positive value is rejected (the existing cap is kept) so the derived warm
+// window stays bounded; the runtime-config layer validates d > 0 before calling.
+// It takes effect on the next session-bound dispatch with no restart
+// (sessionDispatchHints reads it under warmMu) and is safe for concurrent use.
+func (s *Server) SetModelWarmMax(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+	s.modelWarmMax = d
+}
+
+// ModelWarmMax returns the current model-warmth keep_alive cap (#92), read under
+// warmMu so it reflects any live SetModelWarmMax. It backs the admin config GET
+// projection.
+func (s *Server) ModelWarmMax() time.Duration {
+	s.warmMu.RLock()
+	defer s.warmMu.RUnlock()
+	return s.modelWarmMax
+}
 
 // PullModel authorizes an already-authenticated key for the Pull action on
 // model and, if permitted, instructs the named worker to fetch it onto its

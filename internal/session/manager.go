@@ -30,14 +30,23 @@ type Manager struct {
 	history  HistoryStore
 
 	// now is the injectable clock (defaults to time.Now); tests fast-forward it
-	// instead of sleeping. ttl is the default idle TTL stamped onto new sessions.
+	// instead of sleeping.
 	now func() time.Time
-	ttl time.Duration
+
+	// ttlMu guards ttl, the default idle TTL stamped onto new sessions. ttl is
+	// runtime-tunable (#92): SetTTL replaces it live with no restart, and Create
+	// reads it under ttlMu so a concurrent create observes the change atomically.
+	// It is a small dedicated mutex separate from countMu so a TTL update never
+	// contends with the per-owner tally.
+	ttlMu sync.RWMutex
+	ttl   time.Duration
 
 	// maxPerKey is the maximum number of concurrent active sessions a single owner
 	// key may hold (#37). 0 means unlimited. Create rejects with
 	// ErrSessionLimitExceeded when the owner is already at the cap; the count
-	// decrements on Delete and on idle-expiry by the sweeper.
+	// decrements on Delete and on idle-expiry by the sweeper. It is read and
+	// updated under countMu (SetMaxSessionsPerKey, #92) so a live change is
+	// consistent with the concurrent check-and-increment in reserveSlot.
 	maxPerKey int
 
 	// countMu guards counts. It is a dedicated mutex (not the store's) so the
@@ -282,6 +291,58 @@ func (m *Manager) activeCount(ownerKeyID string) int {
 	return m.counts[ownerKeyID]
 }
 
+// currentTTL returns the default idle TTL under ttlMu so a concurrent Create
+// observes a live SetTTL atomically (#92).
+func (m *Manager) currentTTL() time.Duration {
+	m.ttlMu.RLock()
+	defer m.ttlMu.RUnlock()
+	return m.ttl
+}
+
+// SetTTL replaces the default idle TTL stamped onto sessions created from now on
+// (#92). A non-positive value is rejected (the existing TTL is kept) so a session
+// always idles out within a bounded window; the runtime-config layer validates
+// ttl > 0 before calling this, so a rejection here is a defensive backstop. It
+// takes effect immediately with no restart and is safe for concurrent use.
+// Already-created sessions keep the TTL they were stamped with; only new sessions
+// pick up the change.
+func (m *Manager) SetTTL(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.ttlMu.Lock()
+	defer m.ttlMu.Unlock()
+	m.ttl = d
+}
+
+// TTL returns the current default idle TTL (#92), read under ttlMu so it
+// reflects any live SetTTL. It backs the admin config GET projection.
+func (m *Manager) TTL() time.Duration { return m.currentTTL() }
+
+// SetMaxSessionsPerKey replaces the per-owner concurrent-session cap at runtime
+// (#92). A non-positive value means unlimited. It is updated under countMu so the
+// new cap is consistent with the concurrent check-and-increment reserveSlot
+// performs; lowering the cap below an owner's current tally does not retroactively
+// evict sessions — it simply refuses new creates for that owner until the tally
+// falls back under the cap. Safe for concurrent use.
+func (m *Manager) SetMaxSessionsPerKey(n int) {
+	if n < 0 {
+		n = 0
+	}
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	m.maxPerKey = n
+}
+
+// MaxSessionsPerKey returns the current per-owner concurrent-session cap (#92; 0
+// = unlimited), read under countMu so it reflects any live
+// SetMaxSessionsPerKey. It backs the admin config GET projection.
+func (m *Manager) MaxSessionsPerKey() int {
+	m.countMu.Lock()
+	defer m.countMu.Unlock()
+	return m.maxPerKey
+}
+
 // ActiveSessions returns the total number of live (not-yet-expired-or-deleted)
 // sessions across all owners. It is the live read backing the
 // agentgpu_active_sessions gauge (#38): the metrics collector calls it at scrape
@@ -329,7 +390,7 @@ func (m *Manager) Create(_ context.Context, ownerKeyID, model string) (Session, 
 		Model:        model,
 		CreatedAt:    now,
 		LastActiveAt: now,
-		TTL:          m.ttl,
+		TTL:          m.currentTTL(),
 		Status:       StatusActive,
 	}
 	if err := m.sessions.Put(s); err != nil {
