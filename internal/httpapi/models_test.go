@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
@@ -24,11 +25,24 @@ import (
 // control-plane call without a live server.
 type fakeFleet struct {
 	snapshot []types.Worker
-	// drainErr is returned by DrainWorker (nil = success). The admin drain test
-	// sets server.ErrWorkerNotFound to exercise the 404 mapping.
+	// drainErr is returned by DrainWorker / DrainWorkerWithDeadline (nil = success).
+	// The admin drain test sets server.ErrWorkerNotFound to exercise 404 mapping.
 	drainErr error
-	// drained records the id DrainWorker was last called with.
-	drained string
+	// drained records the id the last drain call was made with; drainDeadline
+	// records the deadline it carried, so a test can assert the timed-drain wiring
+	// (#93).
+	drained       string
+	drainDeadline time.Duration
+	// pullErr / unloadErr are returned by AdminPullModel / AdminUnloadModel (nil =
+	// success); pulledWorker/pulledModel and unloadedWorker/unloadedModel record
+	// the last call so the admin model-management tests can assert the dispatch
+	// reached the control plane (#93).
+	pullErr        error
+	pulledWorker   string
+	pulledModel    string
+	unloadErr      error
+	unloadedWorker string
+	unloadedModel  string
 	// queueStats and waitStats back the consolidated admin stats endpoint (#10);
 	// the zero values model an empty queue / no recorded waits.
 	queueStats queue.Stats
@@ -37,9 +51,37 @@ type fakeFleet struct {
 
 func (f *fakeFleet) Fleet() []types.Worker { return f.snapshot }
 
+// WorkerByID finds the worker by id in the configured snapshot, returning false
+// when absent so the detail endpoint's 404 path is exercised.
+func (f *fakeFleet) WorkerByID(id string) (types.Worker, bool) {
+	for _, w := range f.snapshot {
+		if w.ID == id {
+			return w, true
+		}
+	}
+	return types.Worker{}, false
+}
+
 func (f *fakeFleet) DrainWorker(id string) error {
+	return f.DrainWorkerWithDeadline(id, 0)
+}
+
+func (f *fakeFleet) DrainWorkerWithDeadline(id string, deadline time.Duration) error {
 	f.drained = id
+	f.drainDeadline = deadline
 	return f.drainErr
+}
+
+func (f *fakeFleet) AdminPullModel(_ context.Context, workerID, model string) error {
+	f.pulledWorker = workerID
+	f.pulledModel = model
+	return f.pullErr
+}
+
+func (f *fakeFleet) AdminUnloadModel(_ context.Context, workerID, model string) error {
+	f.unloadedWorker = workerID
+	f.unloadedModel = model
+	return f.unloadErr
 }
 
 func (f *fakeFleet) QueueStats() queue.Stats { return f.queueStats }

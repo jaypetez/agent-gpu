@@ -93,6 +93,8 @@ const (
 	auditOpKeyPermissions = "key.permissions"
 	auditOpKeyQuota       = "key.quota"
 	auditOpWorkerDrain    = "worker.drain"
+	auditOpModelPull      = "model.pull"
+	auditOpModelUnload    = "model.unload"
 	auditOpConfigUpdate   = "config.update"
 )
 

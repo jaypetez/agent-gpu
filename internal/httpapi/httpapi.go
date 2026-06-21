@@ -74,7 +74,20 @@ import (
 // it.
 type fleetSource interface {
 	Fleet() []types.Worker
+	// WorkerByID resolves one worker's snapshot for the admin detail endpoint
+	// (#93); the bool is false when no such worker is connected (mapped to 404).
+	WorkerByID(id string) (types.Worker, bool)
 	DrainWorker(id string) error
+	// DrainWorkerWithDeadline is the timed/forced drain (#93): a deadline > 0
+	// schedules a forced eviction once in-flight jobs reach zero or the deadline
+	// elapses; a deadline <= 0 is the pure soft drain (identical to DrainWorker).
+	DrainWorkerWithDeadline(id string, deadline time.Duration) error
+	// AdminPullModel / AdminUnloadModel dispatch a model pull/unload to a worker on
+	// behalf of an admin operator (#93); authorization is the HTTP models:write
+	// scope, so neither re-runs the inference-path model authz. ErrWorkerNotFound
+	// when the worker is not connected.
+	AdminPullModel(ctx context.Context, workerID, model string) error
+	AdminUnloadModel(ctx context.Context, workerID, model string) error
 	QueueStats() queue.Stats
 	WaitTimeStats() server.WaitTimeStats
 }
@@ -313,7 +326,15 @@ func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
 	mux.Handle("PUT /v1/admin/keys/{id}/quota", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminSetQuota))
 	mux.Handle("GET /v1/admin/keys/{id}/quota", s.requireScope(authz.ScopeKeysRead, s.handleAdminGetQuota))
 	mux.Handle("GET /v1/admin/workers", s.requireScope(authz.ScopeWorkersRead, s.handleAdminListWorkers))
+	mux.Handle("GET /v1/admin/workers/{id}", s.requireScope(authz.ScopeWorkersRead, s.handleAdminGetWorker))
 	mux.Handle("POST /v1/admin/workers/{id}/drain", s.requireScopeWrite(authz.ScopeWorkersWrite, s.handleAdminDrainWorker))
+	// Per-worker model management (#93): pull a model onto a worker / unload one
+	// from it. Gated to models:write (not workers:write) — they act on the model
+	// catalog resident on the worker. {model...} is a multi-segment wildcard so a
+	// namespaced or colon-tagged model (library/x:tag, qwen2:0.5b) is captured
+	// whole via r.PathValue("model").
+	mux.Handle("POST /v1/admin/workers/{id}/models", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminPullModel))
+	mux.Handle("DELETE /v1/admin/workers/{id}/models/{model...}", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminUnloadModel))
 	mux.Handle("GET /v1/admin/stats", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminStats))
 	mux.Handle("GET /v1/admin/audit", s.requireScope(authz.ScopeAuditRead, s.handleAdminAudit))
 	// Settings/config management (#92): the effective resolved settings (config:read)

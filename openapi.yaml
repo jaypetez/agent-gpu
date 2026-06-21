@@ -781,6 +781,36 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/workers/{id}:
+    get:
+      operationId: adminGetWorker
+      summary: Inspect one worker
+      description: |
+        Returns the rich per-worker detail projection: its available models, lifecycle status (and a
+        convenience `draining` boolean), GPU type, total/free VRAM, coarse load, active-job count,
+        last-heartbeat time, registration time, and a derived uptime. GPU capacity is reported at the
+        aggregate level the control plane tracks (there is no per-GPU breakdown). Returns `404` if no
+        such worker is connected. Requires the `workers:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+      responses:
+        "200":
+          description: The per-worker detail projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWorkerDetailView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /v1/admin/workers/{id}/drain:
     post:
       operationId: adminDrainWorker
@@ -789,14 +819,95 @@ paths:
         Marks the worker draining: it receives no new jobs while its in-flight jobs are allowed to
         finish. Returns `204`, or `404` if no such worker is connected. Requires the `workers:write`
         scope (the `admin` role grants it). Supports the `Idempotency-Key` header.
+
+        An optional body `{"deadline_seconds": N}` turns the soft drain into a **timed forced drain**:
+        with `N > 0` the worker is evicted once its in-flight jobs finish **or** `N` seconds elapse,
+        whichever comes first (its pending jobs then fail). An absent/empty body or `N == 0` is the
+        pure soft drain; a negative `N` is rejected with `400`.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/WorkerId"
         - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminDrainWorkerRequest"
+            example:
+              deadline_seconds: 30
       responses:
         "204":
           description: The worker is now draining. No content.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers/{id}/models:
+    post:
+      operationId: adminPullModel
+      summary: Pull a model onto a worker
+      description: |
+        Instructs the worker to pull the named model onto its local Ollama. The pull is
+        fire-and-forget: the server dispatches the request and returns `202 Accepted` immediately; the
+        model appears in the worker's detail/list once it finishes pulling and the worker's next
+        heartbeat advertises it. Returns `404` if no such worker is connected, or `400` for an empty
+        model. Requires the `models:write` scope (the `admin` role grants it). Supports the
+        `Idempotency-Key` header.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminPullModelRequest"
+            example:
+              model: llama3
+      responses:
+        "202":
+          description: The pull has been accepted and dispatched to the worker. No content.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers/{id}/models/{model}:
+    delete:
+      operationId: adminUnloadModel
+      summary: Unload a model from a worker
+      description: |
+        Best-effort asks the worker to unload the named model from its Ollama, freeing the VRAM.
+        Returns `204`. A model that is not currently loaded is a no-op and is still reported as
+        success (the "missing model is success" contract). Returns `404` only when no such worker is
+        connected. Requires the `models:write` scope (the `admin` role grants it). Supports the
+        `Idempotency-Key` header.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+        - $ref: "#/components/parameters/ModelName"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: The unload has been dispatched (or the model was already absent). No content.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -868,10 +979,10 @@ paths:
       description: |
         Returns a cursor-paginated page of admin audit-log entries — **newest first** — in the shared
         list envelope. Every administrative write (key create/rotate/revoke, permission and quota
-        changes, worker drain) records one entry: the actor key id, the operation, the target
-        resource, the redacted before/after metadata projection of the affected object, the request
-        correlation id, and the outcome. Secrets are never recorded (the before/after snapshots carry
-        only safe metadata fields).
+        changes, worker drain, model pull/unload, config update) records one entry: the actor key id,
+        the operation, the target resource, the redacted before/after metadata projection of the
+        affected object, the request correlation id, and the outcome. Secrets are never recorded (the
+        before/after snapshots carry only safe metadata fields).
 
         The optional `actor`, `op`, and `target` query parameters filter by exact match, and
         `since`/`until` bound the time window (unix epoch seconds; `since` inclusive, `until`
@@ -1003,6 +1114,15 @@ components:
       in: path
       required: true
       description: The worker id.
+      schema:
+        type: string
+    ModelName:
+      name: model
+      in: path
+      required: true
+      description: |
+        The model id (name), e.g. `llama3` or `qwen2:0.5b`. The path segment is matched whole, so a
+        namespaced (`library/llama3`) or colon-tagged (`qwen2:0.5b`) model id is supported.
       schema:
         type: string
     SessionIdHeader:
@@ -2434,6 +2554,109 @@ components:
             $ref: "#/components/schemas/AdminWorkerView"
         pagination:
           $ref: "#/components/schemas/Pagination"
+
+    AdminWorkerDetailView:
+      type: object
+      description: |
+        The rich per-worker detail projection returned by `GET /v1/admin/workers/{id}`: the list
+        view's fields plus the registration time and a derived uptime. GPU capacity is reported at the
+        aggregate level the control plane tracks (`gpu_type` + `total_vram`/`free_vram`); there is no
+        per-GPU breakdown.
+      required:
+        - id
+        - models
+        - status
+        - draining
+        - active_jobs
+        - total_vram
+        - free_vram
+        - load
+        - gpu_type
+        - last_seen
+      properties:
+        id:
+          type: string
+        models:
+          type: array
+          description: The model names the worker currently has available.
+          items:
+            type: string
+        status:
+          type: string
+          description: The worker's lifecycle state.
+          enum:
+            - online
+            - draining
+            - stale
+            - unknown
+        draining:
+          type: boolean
+          description: Whether the worker is draining (also implied by `status == "draining"`).
+        active_jobs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of jobs the worker is currently running.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total VRAM in bytes (aggregate across the worker's GPUs).
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Free VRAM in bytes (aggregate across the worker's GPUs).
+        load:
+          type: integer
+          format: int64
+          minimum: 0
+          description: A coarse 0-100 utilization value.
+        gpu_type:
+          type: string
+          description: The worker's reported GPU type.
+        last_seen:
+          type: integer
+          format: int64
+          description: Unix epoch seconds of the worker's last heartbeat.
+        registered_at:
+          type: integer
+          format: int64
+          description: |
+            Unix epoch seconds of when the worker registered with the server. Omitted when no
+            registration time is recorded. Uptime resets on reconnect.
+        uptime_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Seconds the worker has been registered, derived as `last_seen - registered_at`. Omitted
+            when no registration time is recorded.
+
+    AdminDrainWorkerRequest:
+      type: object
+      description: |
+        The optional body for draining a worker. `deadline_seconds > 0` turns the soft drain into a
+        timed forced drain (evict once in-flight jobs finish or the deadline elapses); `0` or an
+        absent body is the pure soft drain.
+      properties:
+        deadline_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Seconds to wait for in-flight jobs to finish before force-evicting the worker. `0` (or
+            omitted) leaves the worker to drain naturally with no forced eviction.
+
+    AdminPullModelRequest:
+      type: object
+      description: The body for pulling a model onto a worker.
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          description: The model name to pull onto the worker (e.g. `llama3`).
 
     AuditRedactedValues:
       type: object
