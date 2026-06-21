@@ -204,6 +204,26 @@ type Worker struct {
 	LastSeen   int64    `json:"last_seen"`
 }
 
+// WorkerDetail is the GET /v1/admin/workers/{id} response: the list view's fields
+// plus the registration time and a derived uptime. Mirrors
+// httpapi.adminWorkerDetailView. GPU capacity is the aggregate the control plane
+// tracks (no per-GPU breakdown). RegisteredAt/UptimeSeconds are 0 when no
+// registration time is recorded.
+type WorkerDetail struct {
+	ID            string   `json:"id"`
+	Models        []string `json:"models"`
+	Status        string   `json:"status"`
+	Draining      bool     `json:"draining"`
+	ActiveJobs    uint32   `json:"active_jobs"`
+	TotalVRAM     uint64   `json:"total_vram"`
+	FreeVRAM      uint64   `json:"free_vram"`
+	Load          uint32   `json:"load"`
+	GPUType       string   `json:"gpu_type"`
+	LastSeen      int64    `json:"last_seen"`
+	RegisteredAt  int64    `json:"registered_at,omitempty"`
+	UptimeSeconds int64    `json:"uptime_seconds,omitempty"`
+}
+
 // AuditEntry is one record of the admin audit log (GET /v1/admin/audit): who did
 // it (Actor key id), what (Op), to which resource (Target), the redacted
 // before/after metadata projection of the affected object, the request
@@ -285,6 +305,19 @@ type QuotaRequest struct {
 	TPM           *uint64 `json:"tpm,omitempty"`
 	DailyTokens   *uint64 `json:"daily_tokens,omitempty"`
 	MonthlyTokens *uint64 `json:"monthly_tokens,omitempty"`
+}
+
+// drainWorkerRequest is the optional POST /v1/admin/workers/{id}/drain body.
+// DeadlineSeconds > 0 requests a timed forced drain; it is omitted (a pure soft
+// drain) when zero. Mirrors httpapi.adminDrainRequest.
+type drainWorkerRequest struct {
+	DeadlineSeconds int64 `json:"deadline_seconds,omitempty"`
+}
+
+// pullModelRequest is the POST /v1/admin/workers/{id}/models body. Mirrors
+// httpapi.adminPullModelRequest.
+type pullModelRequest struct {
+	Model string `json:"model"`
 }
 
 // ---- methods ----
@@ -401,6 +434,65 @@ func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
 		}
 		cursor = *out.Pagination.NextCursor
 	}
+}
+
+// WorkerDetail returns the rich per-worker detail (GET /v1/admin/workers/{id}),
+// or ErrNotFound if no such worker is connected.
+func (c *Client) WorkerDetail(ctx context.Context, id string) (WorkerDetail, error) {
+	var out WorkerDetail
+	err := c.do(ctx, http.MethodGet, "/v1/admin/workers/"+url.PathEscape(id), nil, &out)
+	return out, err
+}
+
+// DrainWorker drains the worker (POST /v1/admin/workers/{id}/drain): it stops
+// receiving new jobs while its in-flight jobs finish. A deadline > 0 requests a
+// timed forced drain — the worker is evicted once its in-flight jobs finish or
+// the deadline elapses, whichever first; a deadline <= 0 is the pure soft drain.
+// Returns ErrNotFound if no such worker is connected.
+func (c *Client) DrainWorker(ctx context.Context, id string, deadline time.Duration) error {
+	var body any
+	if deadline > 0 {
+		// Round up sub-second deadlines to one second so a small positive duration
+		// still requests a forced drain rather than degrading to a soft drain.
+		secs := int64(deadline / time.Second)
+		if secs == 0 {
+			secs = 1
+		}
+		body = drainWorkerRequest{DeadlineSeconds: secs}
+	}
+	return c.do(ctx, http.MethodPost, "/v1/admin/workers/"+url.PathEscape(id)+"/drain", body, nil)
+}
+
+// PullModel instructs the worker to pull model onto its local Ollama (POST
+// /v1/admin/workers/{id}/models). It is fire-and-forget: the server accepts the
+// request (202) and the model surfaces on the worker's next heartbeat once the
+// pull completes. Returns ErrNotFound if no such worker is connected.
+func (c *Client) PullModel(ctx context.Context, workerID, model string) error {
+	return c.do(ctx, http.MethodPost, "/v1/admin/workers/"+url.PathEscape(workerID)+"/models",
+		pullModelRequest{Model: model}, nil)
+}
+
+// UnloadModel asks the worker to unload model from its Ollama, freeing the VRAM
+// (DELETE /v1/admin/workers/{id}/models/{model}). A model that is not currently
+// loaded is a no-op and still reported as success. Returns ErrNotFound only when
+// no such worker is connected.
+func (c *Client) UnloadModel(ctx context.Context, workerID, model string) error {
+	return c.do(ctx, http.MethodDelete,
+		"/v1/admin/workers/"+url.PathEscape(workerID)+"/models/"+modelPathEscape(model), nil, nil)
+}
+
+// modelPathEscape escapes a model id for use as a path segment while preserving
+// the '/' in a namespaced model id (e.g. "library/llama3"): the server's
+// multi-segment wildcard captures the remainder of the path whole, so an embedded
+// slash must stay a literal separator rather than be percent-encoded. Other
+// reserved characters (notably the ':' in a colon tag like "qwen2:0.5b") are
+// valid unescaped in a path segment and are left as-is.
+func modelPathEscape(model string) string {
+	parts := strings.Split(model, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
 }
 
 // ListAudit returns the admin audit-log entries matching filter (GET

@@ -27,6 +27,7 @@ func TestScopedKeyMatrix(t *testing.T) {
 	keysWriter := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeKeysWrite}})
 	workersReader := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeWorkersRead}})
 	workersWriter := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeWorkersWrite}})
+	modelsWriter := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeModelsWrite}})
 	telemetryReader := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeTelemetryRead}})
 	auditReader := mustKey(t, authSvc, auth.Permissions{AdminScopes: []string{authz.ScopeAuditRead}})
 	adminToken := mustKey(t, authSvc, adminPerms())
@@ -56,7 +57,10 @@ func TestScopedKeyMatrix(t *testing.T) {
 		{http.MethodPut, "/v1/admin/keys/" + id + "/quota", `{"rpm":1}`, authz.ScopeKeysWrite},
 		{http.MethodGet, "/v1/admin/keys/" + id + "/quota", "", authz.ScopeKeysRead},
 		{http.MethodGet, "/v1/admin/workers", "", authz.ScopeWorkersRead},
+		{http.MethodGet, "/v1/admin/workers/w1", "", authz.ScopeWorkersRead},
 		{http.MethodPost, "/v1/admin/workers/w1/drain", "", authz.ScopeWorkersWrite},
+		{http.MethodPost, "/v1/admin/workers/w1/models", `{"model":"llama3"}`, authz.ScopeModelsWrite},
+		{http.MethodDelete, "/v1/admin/workers/w1/models/llama3", "", authz.ScopeModelsWrite},
 		{http.MethodGet, "/v1/admin/stats", "", authz.ScopeTelemetryRead},
 		{http.MethodGet, "/v1/admin/audit", "", authz.ScopeAuditRead},
 	}
@@ -66,6 +70,7 @@ func TestScopedKeyMatrix(t *testing.T) {
 		authz.ScopeKeysWrite:     keysWriter,
 		authz.ScopeWorkersRead:   workersReader,
 		authz.ScopeWorkersWrite:  workersWriter,
+		authz.ScopeModelsWrite:   modelsWriter,
 		authz.ScopeTelemetryRead: telemetryReader,
 		authz.ScopeAuditRead:     auditReader,
 	}

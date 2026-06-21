@@ -242,7 +242,10 @@ handler.
 | `PUT /v1/admin/keys/{id}/quota` | Set/clear the per-key quota override |
 | `GET /v1/admin/keys/{id}/quota` | Usage snapshot vs effective limits + reset windows |
 | `GET /v1/admin/workers` | Fleet snapshot |
-| `POST /v1/admin/workers/{id}/drain` | Drain a worker → `204` |
+| `GET /v1/admin/workers/{id}` | Inspect one worker (models, status, GPU/VRAM, load, active jobs, uptime, draining) |
+| `POST /v1/admin/workers/{id}/drain` | Drain a worker → `204`; optional `{"deadline_seconds": N}` force-evicts once in-flight jobs finish or `N` seconds elapse |
+| `POST /v1/admin/workers/{id}/models` | Pull a model onto a worker → `202` (surfaces after its next heartbeat) |
+| `DELETE /v1/admin/workers/{id}/models/{model}` | Unload a model from a worker (best-effort; a missing model is success) → `204` |
 | `GET /v1/admin/stats` | Consolidated monitoring: queue depth + per-worker load + time-in-queue distribution (see [Queue depth / monitoring](#queue-depth--monitoring)) |
 
 `PUT .../permissions` is a full replace (not a merge): an omitted/null list clears that dimension.

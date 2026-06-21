@@ -3,8 +3,10 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
@@ -13,6 +15,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
+	"github.com/jaypetez/agent-gpu/internal/types"
 )
 
 // The admin API (#4, scoped in #90): admin-only HTTP endpoints to manage API
@@ -135,6 +138,60 @@ type adminWorkerView struct {
 	Load       uint32   `json:"load"`
 	GPUType    string   `json:"gpu_type"`
 	LastSeen   int64    `json:"last_seen"`
+}
+
+// adminWorkerDetailView is the richer per-worker projection returned by GET
+// /v1/admin/workers/{id} (#93). It extends the list view's capacity/status fields
+// with the registration timestamp and a derived uptime so an operator can inspect
+// one worker fully. Draining is a convenience boolean (also implied by
+// Status == "draining"). GPU detail is reported at the aggregate level the
+// control plane tracks (GPUType + TotalVRAM/FreeVRAM); there is no per-GPU
+// breakdown in the fleet snapshot. RegisteredAt/UptimeSeconds are omitted (0)
+// when the worker has no recorded registration time.
+type adminWorkerDetailView struct {
+	ID            string   `json:"id"`
+	Models        []string `json:"models"`
+	Status        string   `json:"status"`
+	Draining      bool     `json:"draining"`
+	ActiveJobs    uint32   `json:"active_jobs"`
+	TotalVRAM     uint64   `json:"total_vram"`
+	FreeVRAM      uint64   `json:"free_vram"`
+	Load          uint32   `json:"load"`
+	GPUType       string   `json:"gpu_type"`
+	LastSeen      int64    `json:"last_seen"`
+	RegisteredAt  int64    `json:"registered_at,omitempty"`
+	UptimeSeconds int64    `json:"uptime_seconds,omitempty"`
+}
+
+// newAdminWorkerDetailView projects a fleet snapshot into the detail view. Uptime
+// is derived from RegisteredAt against the snapshot's LastSeen (the most recent
+// server-observed time for the worker) rather than wall-clock now, so it stays
+// consistent with the timestamps in the same response and needs no clock here; it
+// is clamped at 0. Models is emitted as [] (never null).
+func newAdminWorkerDetailView(wk types.Worker) adminWorkerDetailView {
+	models := make([]string, len(wk.Models))
+	for i, m := range wk.Models {
+		models[i] = m.Name
+	}
+	v := adminWorkerDetailView{
+		ID:         wk.ID,
+		Models:     models,
+		Status:     wk.Status.String(),
+		Draining:   wk.Status == types.WorkerDraining,
+		ActiveJobs: wk.ActiveJobs,
+		TotalVRAM:  wk.TotalVRAM,
+		FreeVRAM:   wk.FreeVRAM,
+		Load:       wk.Load,
+		GPUType:    wk.GPUType,
+		LastSeen:   wk.LastSeen.Unix(),
+	}
+	if !wk.RegisteredAt.IsZero() {
+		v.RegisteredAt = wk.RegisteredAt.Unix()
+		if up := wk.LastSeen.Sub(wk.RegisteredAt); up > 0 {
+			v.UptimeSeconds = int64(up.Seconds())
+		}
+	}
+	return v
 }
 
 // adminStatsResponse is the GET /v1/admin/stats response (#10): a consolidated,
@@ -297,6 +354,21 @@ type adminQuotaRequest struct {
 	TPM           *uint64 `json:"tpm"`
 	DailyTokens   *uint64 `json:"daily_tokens"`
 	MonthlyTokens *uint64 `json:"monthly_tokens"`
+}
+
+// adminDrainRequest is the optional POST /v1/admin/workers/{id}/drain body (#93).
+// DeadlineSeconds, when > 0, turns the soft drain into a timed forced drain: the
+// worker is evicted once its in-flight jobs finish OR the deadline elapses. An
+// absent or 0 deadline (including an empty body) is the pure soft drain — the
+// preserved original behavior. A negative value is rejected with 400.
+type adminDrainRequest struct {
+	DeadlineSeconds int64 `json:"deadline_seconds"`
+}
+
+// adminPullModelRequest is the POST /v1/admin/workers/{id}/models body (#93): the
+// model to pull onto the worker. An empty Model is rejected with 400.
+type adminPullModelRequest struct {
+	Model string `json:"model"`
 }
 
 // ---- handlers ----
@@ -533,12 +605,44 @@ func (s *Server) handleAdminListWorkers(w http.ResponseWriter, r *http.Request) 
 	writeList(w, views, limit, offset)
 }
 
+// handleAdminGetWorker serves GET /v1/admin/workers/{id} (#93). It returns the
+// rich per-worker detail projection (models, status/draining, GPU type + VRAM
+// aggregate, load, active jobs, last_seen, registered_at + derived uptime), or
+// 404 if no such worker is connected. Gated to workers:read (s.requireScope).
+func (s *Server) handleAdminGetWorker(w http.ResponseWriter, r *http.Request) {
+	wk, ok := s.fleet.WorkerByID(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "worker not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, newAdminWorkerDetailView(wk))
+}
+
 // handleAdminDrainWorker serves POST /v1/admin/workers/{id}/drain. It marks the
 // worker draining (no new jobs; in-flight jobs finish) and returns 204, or 404 if
 // no such worker is connected. The drain is audited.
+//
+// An optional body {"deadline_seconds": N} (#93) turns the soft drain into a
+// timed forced drain: with N > 0 the worker is evicted once its in-flight jobs
+// finish OR N seconds elapse, whichever first. An absent/empty body or N == 0 is
+// the pure soft drain (preserved original behavior); a negative N is 400.
 func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.fleet.DrainWorker(id); err != nil {
+
+	// The body is optional: an empty body is the pure soft drain. Decode only when
+	// one is present, tolerating io.EOF (no body) but rejecting malformed JSON.
+	var req adminDrainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+		return
+	}
+	if req.DeadlineSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "deadline_seconds must be >= 0")
+		return
+	}
+	deadline := time.Duration(req.DeadlineSeconds) * time.Second
+
+	if err := s.fleet.DrainWorkerWithDeadline(id, deadline); err != nil {
 		s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeFailure, nil, nil)
 		if errors.Is(err, server.ErrWorkerNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "worker not found")
@@ -548,8 +652,71 @@ func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not drain worker")
 		return
 	}
-	s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeSuccess, nil,
-		audit.RedactedValues{"status": "draining"})
+	// The after-snapshot records whether a forced deadline was attached, so the
+	// audit trail distinguishes a soft drain from a timed/forced one.
+	after := audit.RedactedValues{"status": "draining"}
+	if deadline > 0 {
+		after["deadline_seconds"] = req.DeadlineSeconds
+	}
+	s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeSuccess, nil, after)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAdminPullModel serves POST /v1/admin/workers/{id}/models (#93). It
+// dispatches a pull of the requested model onto the worker (fire-and-forget; the
+// model surfaces on the worker's next heartbeat) and returns 202 Accepted, 404 if
+// no such worker is connected, or 400 for an empty model. Gated to models:write
+// (s.requireScopeWrite, which also layers idempotency); the pull is audited.
+func (s *Server) handleAdminPullModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req adminPullModelRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
+		return
+	}
+	target := id + "/" + req.Model
+	if err := s.fleet.AdminPullModel(r.Context(), id, req.Model); err != nil {
+		s.recordAudit(r, auditOpModelPull, target, audit.OutcomeFailure, nil, nil)
+		if errors.Is(err, server.ErrWorkerNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "worker not found")
+			return
+		}
+		s.reqLog(r.Context()).Error("admin pull model failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not pull model")
+		return
+	}
+	s.recordAudit(r, auditOpModelPull, target, audit.OutcomeSuccess, nil,
+		audit.RedactedValues{"worker": id, "model": req.Model})
+	// The pull is asynchronous on the worker; 202 communicates "accepted, not yet
+	// complete" — the model appears in the worker detail after its next heartbeat.
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleAdminUnloadModel serves DELETE /v1/admin/workers/{id}/models/{model}
+// (#93). It dispatches a best-effort unload of the model from the worker's Ollama
+// and returns 204; a model that is not currently loaded is a worker-side no-op
+// and still reported as success (the "missing model is success" contract). Returns
+// 404 only when no such worker is connected. Gated to models:write
+// (s.requireScopeWrite); the unload is audited.
+func (s *Server) handleAdminUnloadModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	model := r.PathValue("model")
+	target := id + "/" + model
+	if err := s.fleet.AdminUnloadModel(r.Context(), id, model); err != nil {
+		s.recordAudit(r, auditOpModelUnload, target, audit.OutcomeFailure, nil, nil)
+		if errors.Is(err, server.ErrWorkerNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "worker not found")
+			return
+		}
+		s.reqLog(r.Context()).Error("admin unload model failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not unload model")
+		return
+	}
+	s.recordAudit(r, auditOpModelUnload, target, audit.OutcomeSuccess, nil,
+		audit.RedactedValues{"worker": id, "model": model})
 	w.WriteHeader(http.StatusNoContent)
 }
 
