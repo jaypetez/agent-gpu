@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 
 	"github.com/jaypetez/agent-gpu/internal/auth"
@@ -152,6 +153,63 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), requestIDContextKey, id)
 		ctx = context.WithValue(ctx, requestLoggerContextKey, s.log.With("request_id", id))
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// responseStarter is the optional capability recoverMiddleware probes to learn
+// whether the response has already started. statusRecorder (the writer wrapper
+// the metrics middleware installs outermost) implements it; if the writer in the
+// chain does not, recoverMiddleware conservatively assumes the response has NOT
+// started and attempts to write the 500 envelope (a no-op double-WriteHeader is
+// harmless and the standard library only logs a warning).
+type responseStarter interface {
+	responseStarted() bool
+}
+
+// recoverMiddleware is the safety net that turns a handler panic into a clean
+// 500 JSON error envelope instead of a dropped connection (a panicking handler
+// otherwise crashes the goroutine and the client sees the connection close with
+// no response). It runs INSIDE requestIDMiddleware (so the recovered panic is
+// logged with the request_id) but OUTSIDE the mux (so it covers every route and
+// every other inner middleware). On a recovered panic it:
+//
+//   - logs the recovered value and a full stack trace through the request-scoped
+//     logger at Error (so the failure is attributable and debuggable), and
+//   - writes a 500 internal_error envelope IFF the response has not already
+//     started. For a response that has begun (e.g. a streaming handler that
+//     panicked after the first SSE frame) the status line is already on the wire,
+//     so only logging is possible — writing again would corrupt the response.
+//
+// It deliberately re-raises nothing: a recovered request fails in isolation
+// without taking the server down.
+func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			// http.ErrAbortHandler is the standard library's sentinel for an
+			// intentional abort (e.g. a handler giving up on a hijacked/closed
+			// connection); net/http suppresses it and expects it to propagate, so
+			// re-panic rather than masking it as a 500.
+			if rec == http.ErrAbortHandler {
+				panic(rec)
+			}
+			s.reqLog(r.Context()).Error("recovered from panic in handler",
+				"panic", rec, "stack", string(debug.Stack()))
+			// Only write a response if none has started yet. If the chain did not
+			// install a response-state tracker, assume not-started and try the write
+			// (a double WriteHeader is a logged no-op, never a corruption risk here).
+			started := false
+			if rs, ok := w.(responseStarter); ok {
+				started = rs.responseStarted()
+			}
+			if !started {
+				writeError(w, http.StatusInternalServerError, "internal_error", "internal error")
+			}
+		}()
+		next.ServeHTTP(w, r)
 	})
 }
 

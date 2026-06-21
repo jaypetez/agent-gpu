@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jaypetez/agent-gpu/internal/store"
@@ -16,9 +19,42 @@ import (
 // when those params are plumbed to Ollama. The prompt maps onto Job.Prompt, the
 // foundational prompt path that EchoExecutor and #11 already exercise.
 type completionRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+	Model  string      `json:"model"`
+	Prompt promptField `json:"prompt"`
+	Stream bool        `json:"stream"`
+}
+
+// promptField is the OpenAI /v1/completions prompt, which may be either a single
+// string or an array of strings. agent-gpu's dispatch path takes one prompt
+// string, so an array is flattened by joining its elements with a newline — the
+// natural rendering of "these are consecutive prompt fragments" onto the single
+// Job.Prompt. OpenAI also permits integer-token arrays (a pre-tokenized prompt);
+// agent-gpu has no tokenizer, so that shape is rejected as an invalid request
+// rather than silently mishandled. The underlying type stays string so it maps
+// onto Job.Prompt unchanged.
+type promptField string
+
+// UnmarshalJSON accepts the two prompt shapes OpenAI clients send — a JSON string
+// or a JSON array of strings — and rejects anything else (an integer-token array,
+// an object, a number) so decodePost surfaces a 400 invalid_request_error rather
+// than coercing an unsupported shape. An array of strings is joined with "\n"; an
+// array element that is not a string fails the whole decode.
+func (p *promptField) UnmarshalJSON(data []byte) error {
+	// Single string: the common case.
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*p = promptField(s)
+		return nil
+	}
+	// Array of strings: join with newlines onto the single prompt. A non-string
+	// element (e.g. an integer-token array) fails to unmarshal here and is
+	// rejected, since agent-gpu has no tokenizer to interpret token ids.
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*p = promptField(strings.Join(arr, "\n"))
+		return nil
+	}
+	return errors.New("prompt must be a string or an array of strings")
 }
 
 // ---- response shapes ----
@@ -76,7 +112,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	job := types.Job{
 		ID:     jobIDFor(r),
 		Model:  req.Model,
-		Prompt: req.Prompt,
+		Prompt: string(req.Prompt),
 	}
 
 	if req.Stream {
@@ -133,15 +169,13 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request, key st
 
 	for chunk := range chunks {
 		if chunk.Err != nil {
+			// Mid-stream failure: emit a terminal SSE error frame (the OpenAI error
+			// envelope) then [DONE] so the client observes the failure rather than a
+			// truncated completion that looks clean. No fake finish_reason is emitted.
+			// The worker's actual code is logged server-side; the client gets only a
+			// generic message.
 			s.reqLog(r.Context()).Warn("completion stream failed mid-stream", "code", chunk.Err.Code, "err", chunk.Err.Message)
-			fr := "error"
-			writeSSEData(w, flusher, completionChunkResponse{
-				ID:      id,
-				Object:  "text_completion",
-				Created: created,
-				Model:   model,
-				Choices: []completionChunkChoice{{Index: 0, FinishReason: &fr}},
-			})
+			writeSSEError(w, flusher, streamErrorBody(chunk.Err))
 			failed = true
 			break
 		}

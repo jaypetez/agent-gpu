@@ -82,6 +82,40 @@ paths:
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
 
+  /v1/models/{model}:
+    get:
+      operationId: retrieveModelOpenAI
+      summary: Retrieve a model (OpenAI-compatible)
+      description: |
+        Returns the single model object in the OpenAI-canonical shape, if the model is visible to the
+        authenticated key — present on an online worker AND permitted for inference by the key. A model
+        that is unknown, offline, or hidden from the key returns `404` with code `model_not_found`; the
+        same response is used for "does not exist" and "not permitted to see", so the endpoint never
+        reveals the existence of a model the key cannot use. The path segment is matched whole, so a
+        namespaced (`library/llama3`) or colon-tagged (`qwen2:0.5b`) model id is supported.
+      tags:
+        - Models
+      parameters:
+        - name: model
+          in: path
+          required: true
+          description: The model id (name), e.g. `llama3` or `qwen2:0.5b`. Matched whole.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The requested model.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenAIModel"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/ModelNotFound"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
   /models:
     get:
       operationId: listModels
@@ -850,6 +884,19 @@ components:
             error:
               message: not found
               code: not_found
+    ModelNotFound:
+      description: |
+        The requested model does not exist, is offline, or is not visible to this key. The same
+        response is returned for all three so the endpoint never reveals a model the key cannot use.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              message: model not found
+              code: model_not_found
+              type: invalid_request_error
     BadRequest:
       description: The request body was malformed or invalid.
       content:
@@ -950,7 +997,9 @@ components:
       description: |
         The consistent error envelope returned by every endpoint on failure. `message` is a generic,
         human-readable description (never leaking secrets or internal detail); `code` is a stable,
-        machine-readable identifier clients branch on.
+        machine-readable identifier clients branch on. `type` is the OpenAI error class, so the
+        envelope is a strict **superset** of OpenAI's error object: an OpenAI client that keys off
+        `error.type` works unchanged, while agent-gpu clients use the finer-grained `code`.
       additionalProperties: false
       required:
         - error
@@ -976,9 +1025,20 @@ components:
                 - unavailable
                 - invalid_request_error
                 - not_found
+                - model_not_found
                 - method_not_allowed
                 - not_implemented
                 - internal_error
+            type:
+              type: string
+              description: |
+                The OpenAI error class, derived from the HTTP status (present so the envelope is a
+                superset of OpenAI's error object). Optional; populated on every error response today.
+              enum:
+                - invalid_request_error
+                - authentication_error
+                - rate_limit_error
+                - server_error
 
     Usage:
       type: object

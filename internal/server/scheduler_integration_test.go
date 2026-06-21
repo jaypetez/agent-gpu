@@ -2,15 +2,55 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
 	agentgpuv1 "github.com/jaypetez/agent-gpu/proto/agentgpu/v1"
 )
+
+// TestStreamFailsFastOnUnservedModel covers the streaming fail-fast contract
+// (#13 client-readiness): SubmitAuthorizedJobStream for a model NO worker serves
+// returns ErrModelUnavailable (mapped to a 503 "unavailable" by the HTTP layer),
+// distinct from queue.ErrQueueFull, which is returned only when a worker serves
+// the model but cannot take the stream right now (busy). A drained worker serving
+// the model exercises the latter case.
+func TestStreamFailsFastOnUnservedModel(t *testing.T) {
+	az := authz.NewAuthorizer()
+	h := newHarnessWith(t, server.WithAuthorizer(az), server.WithHeartbeatTimeout(time.Minute))
+	defer h.close()
+	defer func() { _ = h.srv.Close() }()
+
+	key := store.APIKey{ID: "k", Roles: []string{authz.RoleAdmin}}
+	ctx := context.Background()
+
+	// No worker serves any model: the stream submit fails fast.
+	if _, err := h.srv.SubmitAuthorizedJobStream(ctx, key,
+		types.Job{ID: "s1", Model: "ghost", Prompt: "x"}); !errors.Is(err, server.ErrModelUnavailable) {
+		t.Fatalf("unserved-model stream err = %v, want ErrModelUnavailable", err)
+	}
+
+	// A drained worker serves "llama3": the model IS served, but no worker can take
+	// the stream, so backpressure is surfaced as ErrQueueFull (NOT
+	// ErrModelUnavailable), matching the non-streaming submit's diagnosis split.
+	busy := dialRaw(t, h, "busy-worker", []types.Model{{Name: "llama3"}})
+	defer busy.close()
+	waitFor(t, 2*time.Second, "busy worker registered", func() bool {
+		return h.srv.WorkerCount() == 1
+	})
+	if err := h.srv.DrainWorker("busy-worker"); err != nil {
+		t.Fatalf("drain busy-worker: %v", err)
+	}
+	if _, err := h.srv.SubmitAuthorizedJobStream(ctx, key,
+		types.Job{ID: "s2", Model: "llama3", Prompt: "x"}); !errors.Is(err, queue.ErrQueueFull) {
+		t.Fatalf("served-but-busy stream err = %v, want ErrQueueFull", err)
+	}
+}
 
 // reply sends a successful result for jobID on the raw client's stream.
 func (r *rawClient) reply(t *testing.T, jobID, output string) {
@@ -31,16 +71,36 @@ func (r *rawClient) reply(t *testing.T, jobID, output string) {
 // so no real time approaches the heartbeat timeout.
 func TestQueuesThenPlacesWhenWorkerAppears(t *testing.T) {
 	clk := newTestClock(time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC))
+	// placing fires the instant the placement loop pulls a job for placement, a
+	// deterministic "the job queued and is being placed" edge (QueueStats().Total
+	// cannot be polled for it, as the loop dequeues it the moment it can).
+	placing := make(chan string, 4)
 	h := newHarnessWith(t,
 		server.WithClock(clk.now),
 		server.WithHeartbeatTimeout(time.Minute),
 		server.WithEvictScanInterval(5*time.Millisecond),
 		server.WithPlaceScanInterval(5*time.Millisecond),
+		server.WithPlacementObserver(func(jobID string) { placing <- jobID }),
 	)
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
 
-	// No worker yet: submit blocks, the job lands in the queue.
+	// A worker that serves the model is connected but DRAINED, so the model is
+	// "served" (a job for it queues rather than fast-failing with
+	// ErrModelUnavailable) yet no worker can take the job right now — the
+	// legitimate-backpressure case the queue exists for. Drained workers are not
+	// selectable, so the submit below queues instead of dispatching.
+	busy := dialRaw(t, h, "busy-worker", []types.Model{{Name: "llama3"}})
+	defer busy.close()
+	waitFor(t, 2*time.Second, "busy worker registered", func() bool {
+		return h.srv.WorkerCount() == 1
+	})
+	if err := h.srv.DrainWorker("busy-worker"); err != nil {
+		t.Fatalf("drain busy-worker: %v", err)
+	}
+
+	// Submit blocks, the job lands in the queue (model served, no worker free); the
+	// placement loop then pulls it and parks waiting for a runnable worker.
 	type result struct {
 		res types.JobResult
 		err error
@@ -52,12 +112,17 @@ func TestQueuesThenPlacesWhenWorkerAppears(t *testing.T) {
 		done <- result{res, err}
 	}()
 
-	waitFor(t, 2*time.Second, "job enqueued", func() bool {
-		return h.srv.QueueStats().Total == 1
-	})
+	select {
+	case got := <-placing:
+		if got != "queued-1" {
+			t.Fatalf("placement observer fired for %q, want queued-1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job was not queued/pulled for placement")
+	}
 
-	// A worker registers AFTER the job is queued, advertising the model so it is
-	// runnable immediately (a registered worker reports zero free VRAM until its
+	// A fresh worker registers AFTER the job is queued, advertising the model so it
+	// is runnable immediately (a registered worker reports zero free VRAM until its
 	// first heartbeat, but an already-loaded model is runnable regardless).
 	rc := dialRaw(t, h, "late-worker", []types.Model{{Name: "llama3"}})
 	defer rc.close()
@@ -88,21 +153,32 @@ func TestQueuesThenPlacesWhenWorkerAppears(t *testing.T) {
 }
 
 // TestPriorityUnderContention covers priority ordering: several jobs are queued
-// while no worker is available, then ONE worker is made available; the
+// while no worker can take them, then ONE worker is made available; the
 // highest-priority job must be dispatched first. Priority is derived from each
-// key's roles via SubmitAuthorizedJob. Determinism is achieved by enqueuing all
-// jobs (confirmed via QueueStats) before any worker exists, so the queue's
+// key's roles via SubmitAuthorizedJob. Determinism comes from enqueuing all jobs
+// (confirmed via QueueStats) BEFORE any runnable worker exists, so the queue's
 // priority ordering — not goroutine scheduling — decides who goes first.
+//
+// freezeQueue serves the model via a drained worker and parks the placement loop
+// on a sentinel, so the three submits below form a static, priority-ordered queue
+// (a job for an unserved model would now fast-fail). The sentinel itself is
+// dispatched FIRST when the runnable worker appears (it was pulled first), so the
+// test consumes that dispatch before asserting the high/normal/low order.
 func TestPriorityUnderContention(t *testing.T) {
 	clk := newTestClock(time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC))
+	placing := make(chan string, 8)
 	h := newHarnessWith(t,
 		server.WithClock(clk.now),
 		server.WithHeartbeatTimeout(time.Minute),
 		server.WithEvictScanInterval(5*time.Millisecond),
 		server.WithPlaceScanInterval(5*time.Millisecond),
+		server.WithPlacementObserver(func(jobID string) { placing <- jobID }),
 	)
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
+
+	busy := freezeQueue(t, h, placing, "llama3")
+	defer busy.close()
 
 	// Three keys at distinct priority tiers (admin=high, user=normal,
 	// read-only=low). Allow-list the model so user/read-only are authorized.
@@ -125,7 +201,8 @@ func TestPriorityUnderContention(t *testing.T) {
 	}
 
 	// Enqueue low first, then normal, then high — deliberately the reverse of the
-	// order we expect them served, so a FIFO bug would surface.
+	// order we expect them served, so a FIFO bug would surface. The loop is parked
+	// on the sentinel, so these accumulate statically (Total tracks each submit).
 	lowCh := submit(lowKey, "job-low")
 	waitFor(t, 2*time.Second, "low queued", func() bool { return h.srv.QueueStats().Total == 1 })
 	normCh := submit(normKey, "job-norm")
@@ -142,9 +219,16 @@ func TestPriorityUnderContention(t *testing.T) {
 	}
 
 	// Make exactly ONE worker available. Serve jobs one at a time (reply only
-	// after receiving), and assert the dispatch order is high, normal, low.
+	// after receiving). The parked sentinel is dispatched first; consume it, then
+	// assert the remaining dispatch order is high, normal, low.
 	rc := dialRaw(t, h, "single-worker", []types.Model{{Name: "llama3"}})
 	defer rc.close()
+
+	if job := rc.awaitJob(t); job.GetId() != "sentinel" {
+		t.Fatalf("first dispatch = %q, want the parked sentinel", job.GetId())
+	} else {
+		rc.reply(t, job.GetId(), "ok")
+	}
 
 	wantOrder := []string{"job-high", "job-norm", "job-low"}
 	for i, want := range wantOrder {
@@ -169,19 +253,30 @@ func TestPriorityUnderContention(t *testing.T) {
 
 // TestQueueFullRejected covers backpressure: a bounded queue at depth rejects a
 // further submit with queue.ErrQueueFull rather than blocking the caller.
+//
+// freezeQueue serves the model (via a drained worker) and parks the placement
+// loop on a sentinel, so jobs queue rather than fast-failing AND the loop does
+// not drain the bounded queue out from under the test. The sentinel is dequeued
+// (it leaves the depth-1 queue, which then holds "first"), so the second submit
+// finds the queue full.
 func TestQueueFullRejected(t *testing.T) {
 	clk := newTestClock(time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC))
+	placing := make(chan string, 8)
 	h := newHarnessWith(t,
 		server.WithClock(clk.now),
 		server.WithHeartbeatTimeout(time.Minute),
 		server.WithEvictScanInterval(5*time.Millisecond),
 		server.WithPlaceScanInterval(5*time.Millisecond),
 		server.WithQueue(queue.New(queue.WithMaxDepth(1))),
+		server.WithPlacementObserver(func(jobID string) { placing <- jobID }),
 	)
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
 
-	// No worker: the first job queues (depth 1) and blocks its caller.
+	busy := freezeQueue(t, h, placing, "m")
+	defer busy.close()
+
+	// The first job queues (depth 1) and blocks its caller.
 	first := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -293,22 +388,42 @@ func TestConcurrentQueuedJobsEachDispatchedOnce(t *testing.T) {
 // queued job that never places is released (not hung) when the server closes.
 func TestCloseReleasesQueuedCaller(t *testing.T) {
 	clk := newTestClock(time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC))
+	// placing fires when the loop pulls the job for placement — a deterministic
+	// "the job is queued and being placed (parked on the drained worker)" edge.
+	placing := make(chan string, 4)
 	h := newHarnessWith(t,
 		server.WithClock(clk.now),
 		server.WithHeartbeatTimeout(time.Minute),
 		server.WithEvictScanInterval(5*time.Millisecond),
 		server.WithPlaceScanInterval(5*time.Millisecond),
+		server.WithPlacementObserver(func(jobID string) { placing <- jobID }),
 	)
 	defer h.close()
+
+	// A drained worker serves the model so the job queues (model served, no worker
+	// free) rather than fast-failing; the loop then parks on it until Close.
+	busy := dialRaw(t, h, "busy-worker", []types.Model{{Name: "m"}})
+	defer busy.close()
+	waitFor(t, 2*time.Second, "busy worker registered", func() bool {
+		return h.srv.WorkerCount() == 1
+	})
+	if err := h.srv.DrainWorker("busy-worker"); err != nil {
+		t.Fatalf("drain busy-worker: %v", err)
+	}
 
 	done := make(chan error, 1)
 	go func() {
 		_, err := h.srv.SubmitJob(context.Background(), types.Job{ID: "stuck", Model: "m"})
 		done <- err
 	}()
-	waitFor(t, 2*time.Second, "job queued", func() bool {
-		return h.srv.QueueStats().Total == 1
-	})
+	select {
+	case got := <-placing:
+		if got != "stuck" {
+			t.Fatalf("placement observer fired for %q, want stuck", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("job was not queued/pulled for placement")
+	}
 
 	// Close must release the blocked caller and stop the placement loop.
 	if err := h.srv.Close(); err != nil {

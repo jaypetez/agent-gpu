@@ -126,6 +126,76 @@ func TestWorkerNeverHeartbeatedNotStale(t *testing.T) {
 	}
 }
 
+// TestModelServed covers the fail-fast gate (#13 client-readiness): modelServed
+// reports true when a LIVE worker (Online or Draining) advertises the model, and
+// false when no connected worker has it or only a stale worker does. The
+// Draining-counts behavior is deliberate — a job for a draining-served model
+// legitimately queues for capacity rather than fast-failing — while a model on no
+// connected (non-stale) worker fails fast (the headline case).
+func TestModelServed(t *testing.T) {
+	now := time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)
+	timeout := 30 * time.Second
+
+	mkWorker := func(id, model string, draining bool, lastHB time.Time) *worker {
+		return &worker{
+			id:              id,
+			availableModels: []types.Model{{Name: model}},
+			lastHeartbeat:   lastHB,
+			draining:        draining,
+			pending:         map[string]chan types.JobResult{},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		workers []*worker
+		model   string
+		want    bool
+	}{
+		{
+			name:    "online worker serves it",
+			workers: []*worker{mkWorker("w1", "llama3", false, now)},
+			model:   "llama3",
+			want:    true,
+		},
+		{
+			name:    "draining worker still counts (queue for capacity)",
+			workers: []*worker{mkWorker("w1", "llama3", true, now)},
+			model:   "llama3",
+			want:    true,
+		},
+		{
+			name:    "stale worker does not count",
+			workers: []*worker{mkWorker("w1", "llama3", false, now.Add(-timeout-time.Second))},
+			model:   "llama3",
+			want:    false,
+		},
+		{
+			name:    "model on no connected worker fails fast",
+			workers: []*worker{mkWorker("w1", "llama3", false, now)},
+			model:   "ghost",
+			want:    false,
+		},
+		{
+			name:    "no workers at all",
+			workers: nil,
+			model:   "llama3",
+			want:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New(WithClock(func() time.Time { return now }), WithHeartbeatTimeout(timeout))
+			for _, w := range tt.workers {
+				s.workers[w.id] = w
+			}
+			if got := s.modelServed(tt.model); got != tt.want {
+				t.Fatalf("modelServed(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestWarmWindowSeconds covers the model-warmth window derivation (#35): a
 // session-bound job's keep_alive is min(TTL, max) when the session idles out, the
 // cap when it never idles out, and always a bounded value >= 1s (so it never

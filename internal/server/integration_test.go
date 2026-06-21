@@ -121,6 +121,49 @@ func newWorkerID(h *harness, id string, onConnect func(sessionID string)) *worke
 	return w
 }
 
+// freezeQueue makes model "served" (so jobs for it queue rather than fast-failing
+// with ErrModelUnavailable) while ensuring the placement loop does NOT drain the
+// queue, so a test can build and observe a STATIC backlog through QueueStats —
+// the fixture the queue/scheduler tests need now that an unserved model fails
+// fast (#13 client-readiness).
+//
+// It (1) connects a worker advertising model and immediately DRAINS it, so the
+// model is served by a connected worker that can never be selected, then (2)
+// submits one keyless "sentinel" job that the placement loop dequeues and parks
+// on (no runnable worker), gating on the placement observer until the park is
+// confirmed. Because placeLoop processes one item at a time and the parked
+// placeItem never returns, no further dequeues happen — subsequent submits
+// accumulate statically in the queue. The sentinel is dispatched FIRST when a
+// runnable worker later appears, so a test that connects one must account for the
+// sentinel's dispatch (and reply to it) before its own jobs.
+//
+// placing must be the channel wired via server.WithPlacementObserver on h's
+// server. The returned rawClient is the (drained) busy worker; the caller defers
+// its close.
+func freezeQueue(t *testing.T, h *harness, placing <-chan string, model string) *rawClient {
+	t.Helper()
+	busy := dialRaw(t, h, "busy-worker", []types.Model{{Name: model}})
+	waitFor(t, 2*time.Second, "busy worker registered", func() bool {
+		return h.srv.WorkerCount() == 1
+	})
+	if err := h.srv.DrainWorker("busy-worker"); err != nil {
+		t.Fatalf("drain busy-worker: %v", err)
+	}
+	// Park the placement loop on a sentinel so it stops pulling further jobs.
+	go func() {
+		_, _ = h.srv.SubmitJob(context.Background(), types.Job{ID: "sentinel", Model: model})
+	}()
+	select {
+	case got := <-placing:
+		if got != "sentinel" {
+			t.Fatalf("placement observer fired for %q, want sentinel", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("placement loop never parked on the sentinel")
+	}
+	return busy
+}
+
 // newWorkerWithCapacity builds a worker that reports the given capacity stub
 // fields in its heartbeats, so a test can assert the fleet view reflects them.
 func newWorkerWithCapacity(h *harness, id string, cfg worker.Config) *worker.Worker {
@@ -169,36 +212,45 @@ func TestControlPlaneRoundTrip(t *testing.T) {
 	}
 }
 
-// TestNoWorkerQueuesAndBlocks verifies the capacity-aware behavior change (#9):
-// with no runnable worker a submitted job is QUEUED (not dropped with
-// ErrNoWorkers) and the caller blocks until a worker appears or its context is
-// done. With no worker ever appearing, a bounded-context submit times out, and
-// the job is observable in the queue while the caller waits.
-func TestNoWorkerQueuesAndBlocks(t *testing.T) {
+// TestNoWorkerServingModelFailsFast verifies the fail-fast contract: a job for a
+// model NO connected worker serves is rejected promptly with ErrModelUnavailable
+// rather than enqueued behind a waiter that would block until the caller's own
+// timeout. (Backpressure — a worker that serves the model but cannot take the job
+// right now — still queues; that path is covered by the scheduler/wait-time
+// tests, which connect a drained model-serving worker.) The job must NOT appear
+// in the queue, and the submit must return well before its context deadline.
+func TestNoWorkerServingModelFailsFast(t *testing.T) {
 	h := newHarness(t)
 	defer h.close()
 	defer func() { _ = h.srv.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	// A generous deadline: the point is that submit returns ~immediately, far
+	// inside it, NOT that it waits for the deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// The job is enqueued; observe it in the queue while the caller blocks.
 	done := make(chan error, 1)
+	start := time.Now()
 	go func() {
 		_, err := h.srv.SubmitJob(ctx, types.Job{ID: "j", Model: "m"})
 		done <- err
 	}()
-	waitFor(t, 2*time.Second, "job queued", func() bool {
-		return h.srv.QueueStats().Total == 1
-	})
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("err = %v, want context deadline exceeded", err)
+		if !errors.Is(err, server.ErrModelUnavailable) {
+			t.Fatalf("err = %v, want ErrModelUnavailable", err)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("submit took %v, want a prompt fail-fast (no block)", elapsed)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("queued submit did not unblock on context deadline")
+		t.Fatal("submit blocked instead of failing fast on an unserved model")
+	}
+
+	// The unserved job must never have been enqueued.
+	if total := h.srv.QueueStats().Total; total != 0 {
+		t.Fatalf("queue total = %d, want 0 (unserved model must not enqueue)", total)
 	}
 }
 
