@@ -41,9 +41,13 @@ templ Workers(d WorkersData) {
 				<span>Refresh</span>
 			</button>
 		</div>
-		<!-- GPU heatmap: loads on first paint, then refreshes every 6s. -->
+		<!-- GPU heatmap: loads on first paint, then refreshes every 6s. The region
+		     role + label make it a named landmark so tests (and assistive tech)
+		     address it by role, not by its #id. -->
 		<div
 			id="gpu-heatmap"
+			role="region"
+			aria-label="GPU utilization"
 			hx-get={ d.Shell.AssetPath + "/../partials/gpu-heatmap" }
 			hx-trigger="load, every 6s"
 			hx-swap="outerHTML"
@@ -71,6 +75,8 @@ templ Workers(d WorkersData) {
 templ Heatmap(assetPath string, h HeatmapData) {
 	<div
 		id="gpu-heatmap"
+		role="region"
+		aria-label="GPU utilization"
 		hx-get={ assetPath + "/../partials/gpu-heatmap" }
 		hx-trigger="every 6s"
 		hx-swap="outerHTML"
@@ -136,7 +142,7 @@ templ heatmapCell(c HeatCell) {
 // panel shape with shimmering placeholder tiles, so the operator sees structure
 // immediately rather than a blank frame.
 templ HeatmapLoading() {
-	<div id="gpu-heatmap" aria-busy="true">
+	<div id="gpu-heatmap" role="region" aria-label="GPU utilization" aria-busy="true">
 		<div class="panel">
 			<div class="panel-head"><span class="panel-title">GPU utilization</span></div>
 			<div class="panel-body">
@@ -155,7 +161,7 @@ templ HeatmapLoading() {
 // HeatmapError is the heatmap's error state (AC4): an in-voice notice with a retry
 // that re-fetches the region. Status is conveyed by the icon AND the text.
 templ HeatmapError(assetPath, msg string) {
-	<div id="gpu-heatmap">
+	<div id="gpu-heatmap" role="region" aria-label="GPU utilization">
 		<div class="panel">
 			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
 				<span class="text-danger">

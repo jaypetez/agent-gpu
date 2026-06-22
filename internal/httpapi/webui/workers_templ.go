@@ -84,14 +84,14 @@ func Workers(d WorkersData) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span>Refresh</span></button></div><!-- GPU heatmap: loads on first paint, then refreshes every 6s. --> <div id=\"gpu-heatmap\" hx-get=\"")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span>Refresh</span></button></div><!-- GPU heatmap: loads on first paint, then refreshes every 6s. The region\n\t\t     role + label make it a named landmark so tests (and assistive tech)\n\t\t     address it by role, not by its #id. --> <div id=\"gpu-heatmap\" role=\"region\" aria-label=\"GPU utilization\" hx-get=\"")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			var templ_7745c5c3_Var4 string
 			templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Shell.AssetPath + "/../partials/gpu-heatmap")
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 47, Col: 58}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 51, Col: 58}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var4)
 			if templ_7745c5c3_Err != nil {
@@ -112,7 +112,7 @@ func Workers(d WorkersData) templ.Component {
 			var templ_7745c5c3_Var5 string
 			templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Shell.AssetPath + "/../partials/worker-list")
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 57, Col: 58}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 61, Col: 58}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 			if templ_7745c5c3_Err != nil {
@@ -166,14 +166,14 @@ func Heatmap(assetPath string, h HeatmapData) templ.Component {
 			templ_7745c5c3_Var6 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "<div id=\"gpu-heatmap\" hx-get=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 8, "<div id=\"gpu-heatmap\" role=\"region\" aria-label=\"GPU utilization\" hx-get=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var7 string
 		templ_7745c5c3_Var7, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/gpu-heatmap")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 74, Col: 49}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 80, Col: 49}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var7)
 		if templ_7745c5c3_Err != nil {
@@ -186,7 +186,7 @@ func Heatmap(assetPath string, h HeatmapData) templ.Component {
 		var templ_7745c5c3_Var8 string
 		templ_7745c5c3_Var8, templ_7745c5c3_Err = templ.JoinStringErrs(itoa(h.WorkerCount))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 81, Col: 71}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 87, Col: 71}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var8))
 		if templ_7745c5c3_Err != nil {
@@ -231,7 +231,7 @@ func Heatmap(assetPath string, h HeatmapData) templ.Component {
 			var templ_7745c5c3_Var11 string
 			templ_7745c5c3_Var11, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(h.MeanLoad))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 90, Col: 97}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 96, Col: 97}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var11))
 			if templ_7745c5c3_Err != nil {
@@ -252,7 +252,7 @@ func Heatmap(assetPath string, h HeatmapData) templ.Component {
 			var templ_7745c5c3_Var12 string
 			templ_7745c5c3_Var12, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(h.MaxLoad))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 95, Col: 64}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 101, Col: 64}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var12))
 			if templ_7745c5c3_Err != nil {
@@ -265,7 +265,7 @@ func Heatmap(assetPath string, h HeatmapData) templ.Component {
 			var templ_7745c5c3_Var13 string
 			templ_7745c5c3_Var13, templ_7745c5c3_Err = templ.JoinStringErrs(h.FreeVRAM)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 99, Col: 56}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 105, Col: 56}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var13))
 			if templ_7745c5c3_Err != nil {
@@ -278,7 +278,7 @@ func Heatmap(assetPath string, h HeatmapData) templ.Component {
 			var templ_7745c5c3_Var14 string
 			templ_7745c5c3_Var14, templ_7745c5c3_Err = templ.JoinStringErrs(h.TotalVRAM)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 100, Col: 51}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 106, Col: 51}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var14))
 			if templ_7745c5c3_Err != nil {
@@ -348,7 +348,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var17 templ.SafeURL
 		templ_7745c5c3_Var17, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(c.Href))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 121, Col: 31}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 127, Col: 31}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var17))
 		if templ_7745c5c3_Err != nil {
@@ -374,7 +374,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var19 string
 		templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.ResolveAttributeValue("Worker " + c.ID + ": load " + itoaU32(c.Load) + " percent, " + c.BandWord)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 123, Col: 90}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 129, Col: 90}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var19)
 		if templ_7745c5c3_Err != nil {
@@ -387,7 +387,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var20 string
 		templ_7745c5c3_Var20, templ_7745c5c3_Err = templ.ResolveAttributeValue(c.ID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 125, Col: 70}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 131, Col: 70}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var20)
 		if templ_7745c5c3_Err != nil {
@@ -400,7 +400,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var21 string
 		templ_7745c5c3_Var21, templ_7745c5c3_Err = templ.JoinStringErrs(shortID(c.ID))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 125, Col: 88}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 131, Col: 88}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var21))
 		if templ_7745c5c3_Err != nil {
@@ -413,7 +413,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var22 string
 		templ_7745c5c3_Var22, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(c.Load))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 127, Col: 73}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 133, Col: 73}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var22))
 		if templ_7745c5c3_Err != nil {
@@ -426,7 +426,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var23 string
 		templ_7745c5c3_Var23, templ_7745c5c3_Err = templ.JoinStringErrs(c.BandWord)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 128, Col: 86}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 134, Col: 86}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var23))
 		if templ_7745c5c3_Err != nil {
@@ -439,7 +439,7 @@ func heatmapCell(c HeatCell) templ.Component {
 		var templ_7745c5c3_Var24 string
 		templ_7745c5c3_Var24, templ_7745c5c3_Err = templ.JoinStringErrs(c.VRAM)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 130, Col: 57}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 136, Col: 57}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var24))
 		if templ_7745c5c3_Err != nil {
@@ -477,7 +477,7 @@ func HeatmapLoading() templ.Component {
 			templ_7745c5c3_Var25 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 31, "<div id=\"gpu-heatmap\" aria-busy=\"true\"><div class=\"panel\"><div class=\"panel-head\"><span class=\"panel-title\">GPU utilization</span></div><div class=\"panel-body\"><div class=\"skeleton mb-4 h-4 w-64\"></div><div class=\"grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 31, "<div id=\"gpu-heatmap\" role=\"region\" aria-label=\"GPU utilization\" aria-busy=\"true\"><div class=\"panel\"><div class=\"panel-head\"><span class=\"panel-title\">GPU utilization</span></div><div class=\"panel-body\"><div class=\"skeleton mb-4 h-4 w-64\"></div><div class=\"grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -518,7 +518,7 @@ func HeatmapError(assetPath, msg string) templ.Component {
 			templ_7745c5c3_Var26 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 34, "<div id=\"gpu-heatmap\"><div class=\"panel\"><div class=\"panel-body flex flex-col items-center gap-3 py-10 text-center\"><span class=\"text-danger\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 34, "<div id=\"gpu-heatmap\" role=\"region\" aria-label=\"GPU utilization\"><div class=\"panel\"><div class=\"panel-body flex flex-col items-center gap-3 py-10 text-center\"><span class=\"text-danger\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -533,7 +533,7 @@ func HeatmapError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var27 string
 		templ_7745c5c3_Var27, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 166, Col: 48}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 172, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var27))
 		if templ_7745c5c3_Err != nil {
@@ -546,7 +546,7 @@ func HeatmapError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var28 string
 		templ_7745c5c3_Var28, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/gpu-heatmap")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 171, Col: 52}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 177, Col: 52}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var28)
 		if templ_7745c5c3_Err != nil {
@@ -593,7 +593,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 		var templ_7745c5c3_Var30 string
 		templ_7745c5c3_Var30, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/worker-list")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 189, Col: 49}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 195, Col: 49}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var30)
 		if templ_7745c5c3_Err != nil {
@@ -606,7 +606,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 		var templ_7745c5c3_Var31 string
 		templ_7745c5c3_Var31, templ_7745c5c3_Err = templ.JoinStringErrs(itoa(len(rows)))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 196, Col: 66}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 202, Col: 66}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var31))
 		if templ_7745c5c3_Err != nil {
@@ -642,7 +642,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var32 templ.SafeURL
 				templ_7745c5c3_Var32, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL("/admin/workers/" + w.ID))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 221, Col: 114}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 227, Col: 114}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var32))
 				if templ_7745c5c3_Err != nil {
@@ -655,7 +655,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var33 string
 				templ_7745c5c3_Var33, templ_7745c5c3_Err = templ.ResolveAttributeValue("Open worker " + w.ID)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 221, Col: 146}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 227, Col: 146}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var33)
 				if templ_7745c5c3_Err != nil {
@@ -668,7 +668,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var34 string
 				templ_7745c5c3_Var34, templ_7745c5c3_Err = templ.JoinStringErrs(shortID(w.ID))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 221, Col: 164}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 227, Col: 164}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var34))
 				if templ_7745c5c3_Err != nil {
@@ -689,7 +689,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var35 string
 				templ_7745c5c3_Var35, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(w.ActiveJobs))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 224, Col: 61}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 230, Col: 61}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var35))
 				if templ_7745c5c3_Err != nil {
@@ -702,7 +702,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var36 string
 				templ_7745c5c3_Var36, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(w.Load))
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 225, Col: 61}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 231, Col: 61}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var36))
 				if templ_7745c5c3_Err != nil {
@@ -715,7 +715,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var37 string
 				templ_7745c5c3_Var37, templ_7745c5c3_Err = templ.JoinStringErrs(w.GPUType)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 226, Col: 47}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 232, Col: 47}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var37))
 				if templ_7745c5c3_Err != nil {
@@ -728,7 +728,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var38 string
 				templ_7745c5c3_Var38, templ_7745c5c3_Err = templ.JoinStringErrs(w.VRAM)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 227, Col: 62}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 233, Col: 62}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var38))
 				if templ_7745c5c3_Err != nil {
@@ -741,7 +741,7 @@ func WorkerListPartial(assetPath string, rows []WorkerListItem) templ.Component 
 				var templ_7745c5c3_Var39 string
 				templ_7745c5c3_Var39, templ_7745c5c3_Err = templ.JoinStringErrs(w.LastSeen)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 228, Col: 56}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 234, Col: 56}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var39))
 				if templ_7745c5c3_Err != nil {
@@ -833,7 +833,7 @@ func WorkerListError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var42 string
 		templ_7745c5c3_Var42, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 262, Col: 48}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 268, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var42))
 		if templ_7745c5c3_Err != nil {
@@ -846,7 +846,7 @@ func WorkerListError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var43 string
 		templ_7745c5c3_Var43, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/worker-list")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 267, Col: 52}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 273, Col: 52}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var43)
 		if templ_7745c5c3_Err != nil {
@@ -906,7 +906,7 @@ func WorkerDetailPage(d WorkerDetail, shell ShellData) templ.Component {
 			var templ_7745c5c3_Var46 string
 			templ_7745c5c3_Var46, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.ID)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 287, Col: 70}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 293, Col: 70}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var46)
 			if templ_7745c5c3_Err != nil {
@@ -919,7 +919,7 @@ func WorkerDetailPage(d WorkerDetail, shell ShellData) templ.Component {
 			var templ_7745c5c3_Var47 string
 			templ_7745c5c3_Var47, templ_7745c5c3_Err = templ.JoinStringErrs(shortID(d.ID))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 287, Col: 88}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 293, Col: 88}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var47))
 			if templ_7745c5c3_Err != nil {
@@ -940,7 +940,7 @@ func WorkerDetailPage(d WorkerDetail, shell ShellData) templ.Component {
 			var templ_7745c5c3_Var48 templ.SafeURL
 			templ_7745c5c3_Var48, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(d.LogsHref))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 292, Col: 60}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 298, Col: 60}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var48))
 			if templ_7745c5c3_Err != nil {
@@ -1023,7 +1023,7 @@ func workerCapacityPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var50 string
 		templ_7745c5c3_Var50, templ_7745c5c3_Err = templ.JoinStringErrs(d.GPUType)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 317, Col: 37}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 323, Col: 37}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var50))
 		if templ_7745c5c3_Err != nil {
@@ -1036,7 +1036,7 @@ func workerCapacityPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var51 string
 		templ_7745c5c3_Var51, templ_7745c5c3_Err = templ.JoinStringErrs(itoa(d.UsedPct))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 322, Col: 59}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 328, Col: 59}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var51))
 		if templ_7745c5c3_Err != nil {
@@ -1049,7 +1049,7 @@ func workerCapacityPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var52 string
 		templ_7745c5c3_Var52, templ_7745c5c3_Err = templ.ResolveAttributeValue("VRAM " + itoa(d.UsedPct) + " percent in use")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 324, Col: 139}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 330, Col: 139}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var52)
 		if templ_7745c5c3_Err != nil {
@@ -1084,7 +1084,7 @@ func workerCapacityPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var55 string
 		templ_7745c5c3_Var55, templ_7745c5c3_Err = templruntime.SanitizeStyleAttributeValues(barWidth(d.UsedPct, 100))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 325, Col: 95}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 331, Col: 95}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var55))
 		if templ_7745c5c3_Err != nil {
@@ -1097,7 +1097,7 @@ func workerCapacityPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var56 string
 		templ_7745c5c3_Var56, templ_7745c5c3_Err = templ.JoinStringErrs(d.FreeVRAM)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 328, Col: 23}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 334, Col: 23}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var56))
 		if templ_7745c5c3_Err != nil {
@@ -1110,7 +1110,7 @@ func workerCapacityPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var57 string
 		templ_7745c5c3_Var57, templ_7745c5c3_Err = templ.JoinStringErrs(d.TotalVRAM)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 329, Col: 24}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 335, Col: 24}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var57))
 		if templ_7745c5c3_Err != nil {
@@ -1176,7 +1176,7 @@ func workerStatusPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var61 string
 		templ_7745c5c3_Var61, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(d.Load))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 346, Col: 92}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 352, Col: 92}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var61))
 		if templ_7745c5c3_Err != nil {
@@ -1197,7 +1197,7 @@ func workerStatusPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var62 string
 		templ_7745c5c3_Var62, templ_7745c5c3_Err = templ.JoinStringErrs(itoaU32(d.ActiveJobs))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 352, Col: 63}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 358, Col: 63}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var62))
 		if templ_7745c5c3_Err != nil {
@@ -1211,7 +1211,7 @@ func workerStatusPanel(d WorkerDetail) templ.Component {
 			var templ_7745c5c3_Var63 string
 			templ_7745c5c3_Var63, templ_7745c5c3_Err = templ.JoinStringErrs(d.Uptime)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 358, Col: 17}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 364, Col: 17}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var63))
 			if templ_7745c5c3_Err != nil {
@@ -1230,7 +1230,7 @@ func workerStatusPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var64 string
 		templ_7745c5c3_Var64, templ_7745c5c3_Err = templ.JoinStringErrs(d.LastSeen)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 366, Col: 37}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 372, Col: 37}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var64))
 		if templ_7745c5c3_Err != nil {
@@ -1275,7 +1275,7 @@ func workerModelsPanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var66 string
 		templ_7745c5c3_Var66, templ_7745c5c3_Err = templ.JoinStringErrs(itoa(len(d.Models)))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 380, Col: 69}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 386, Col: 69}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var66))
 		if templ_7745c5c3_Err != nil {
@@ -1311,7 +1311,7 @@ func workerModelsPanel(d WorkerDetail) templ.Component {
 				var templ_7745c5c3_Var67 string
 				templ_7745c5c3_Var67, templ_7745c5c3_Err = templ.JoinStringErrs(m)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 391, Col: 70}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 397, Col: 70}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var67))
 				if templ_7745c5c3_Err != nil {
@@ -1324,7 +1324,7 @@ func workerModelsPanel(d WorkerDetail) templ.Component {
 				var templ_7745c5c3_Var68 string
 				templ_7745c5c3_Var68, templ_7745c5c3_Err = templ.ResolveAttributeValue("/admin/workers/" + d.ID + "/models/" + m)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 395, Col: 61}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 401, Col: 61}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var68)
 				if templ_7745c5c3_Err != nil {
@@ -1337,7 +1337,7 @@ func workerModelsPanel(d WorkerDetail) templ.Component {
 				var templ_7745c5c3_Var69 string
 				templ_7745c5c3_Var69, templ_7745c5c3_Err = templ.ResolveAttributeValue("Unload " + m)
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 398, Col: 34}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 404, Col: 34}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var69)
 				if templ_7745c5c3_Err != nil {
@@ -1395,7 +1395,7 @@ func workerManagePanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var71 string
 		templ_7745c5c3_Var71, templ_7745c5c3_Err = templ.ResolveAttributeValue("/admin/workers/" + d.ID + "/models")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 421, Col: 50}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 427, Col: 50}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var71)
 		if templ_7745c5c3_Err != nil {
@@ -1413,7 +1413,7 @@ func workerManagePanel(d WorkerDetail) templ.Component {
 			var templ_7745c5c3_Var72 string
 			templ_7745c5c3_Var72, templ_7745c5c3_Err = templ.ResolveAttributeValue("/admin/workers/" + d.ID + "/drain")
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 447, Col: 52}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 453, Col: 52}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var72)
 			if templ_7745c5c3_Err != nil {
@@ -1436,7 +1436,7 @@ func workerManagePanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var73 string
 		templ_7745c5c3_Var73, templ_7745c5c3_Err = templ.JoinStringErrs(d.ID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 473, Col: 63}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 479, Col: 63}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var73))
 		if templ_7745c5c3_Err != nil {
@@ -1449,7 +1449,7 @@ func workerManagePanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var74 string
 		templ_7745c5c3_Var74, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.ID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 481, Col: 25}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 487, Col: 25}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var74)
 		if templ_7745c5c3_Err != nil {
@@ -1462,7 +1462,7 @@ func workerManagePanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var75 string
 		templ_7745c5c3_Var75, templ_7745c5c3_Err = templ.ResolveAttributeValue("/admin/workers/" + d.ID + "/evict")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 488, Col: 52}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 494, Col: 52}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var75)
 		if templ_7745c5c3_Err != nil {
@@ -1475,7 +1475,7 @@ func workerManagePanel(d WorkerDetail) templ.Component {
 		var templ_7745c5c3_Var76 string
 		templ_7745c5c3_Var76, templ_7745c5c3_Err = templ.ResolveAttributeValue("confirm !== '" + d.ID + "'")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 491, Col: 53}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 497, Col: 53}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var76)
 		if templ_7745c5c3_Err != nil {
@@ -1570,7 +1570,7 @@ func WorkerActionToast(res WorkerActionResult) templ.Component {
 		var templ_7745c5c3_Var82 string
 		templ_7745c5c3_Var82, templ_7745c5c3_Err = templ.JoinStringErrs(res.Title)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 519, Col: 45}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 525, Col: 45}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var82))
 		if templ_7745c5c3_Err != nil {
@@ -1583,7 +1583,7 @@ func WorkerActionToast(res WorkerActionResult) templ.Component {
 		var templ_7745c5c3_Var83 string
 		templ_7745c5c3_Var83, templ_7745c5c3_Err = templ.JoinStringErrs(res.Message)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 520, Col: 48}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 526, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var83))
 		if templ_7745c5c3_Err != nil {
@@ -1649,7 +1649,7 @@ func WorkerNotFound(shell ShellData) templ.Component {
 			var templ_7745c5c3_Var86 templ.SafeURL
 			templ_7745c5c3_Var86, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL("/admin/workers"))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 540, Col: 45}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/workers.templ`, Line: 546, Col: 45}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var86))
 			if templ_7745c5c3_Err != nil {

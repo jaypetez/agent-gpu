@@ -87,14 +87,14 @@ func Logs(d LogsData) templ.Component {
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
-				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, " <!-- Filtered buffer: the server-rendered point-in-time query. Applying a\n\t\t\t     filter re-fetches this region, visibly reducing the rows. --> <div id=\"log-table\" class=\"mt-4\" hx-get=\"")
+				templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 5, " <!-- Filtered buffer: the server-rendered point-in-time query. Applying a\n\t\t\t     filter re-fetches this region, visibly reducing the rows. The region\n\t\t\t     role + label name it as a landmark so tests (and assistive tech)\n\t\t\t     address it by role, not by its #id. --> <div id=\"log-table\" class=\"mt-4\" role=\"region\" aria-label=\"Buffered lines\" hx-get=\"")
 				if templ_7745c5c3_Err != nil {
 					return templ_7745c5c3_Err
 				}
 				var templ_7745c5c3_Var3 string
 				templ_7745c5c3_Var3, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Shell.AssetPath + "/../partials/logs")
 				if templ_7745c5c3_Err != nil {
-					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 39, Col: 52}
+					return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 43, Col: 52}
 				}
 				_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var3)
 				if templ_7745c5c3_Err != nil {
@@ -156,7 +156,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var5 string
 		templ_7745c5c3_Var5, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Shell.AssetPath + "/../partials/logs")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 59, Col: 50}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 63, Col: 50}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var5)
 		if templ_7745c5c3_Err != nil {
@@ -174,7 +174,7 @@ func logFilterBar(d LogsData) templ.Component {
 			var templ_7745c5c3_Var6 string
 			templ_7745c5c3_Var6, templ_7745c5c3_Err = templ.ResolveAttributeValue(lvl)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 68, Col: 25}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 72, Col: 25}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var6)
 			if templ_7745c5c3_Err != nil {
@@ -197,7 +197,7 @@ func logFilterBar(d LogsData) templ.Component {
 			var templ_7745c5c3_Var7 string
 			templ_7745c5c3_Var7, templ_7745c5c3_Err = templ.JoinStringErrs(lvl)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 68, Col: 69}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 72, Col: 69}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var7))
 			if templ_7745c5c3_Err != nil {
@@ -215,7 +215,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var8 string
 		templ_7745c5c3_Var8, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Filter.RequestID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 74, Col: 125}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 78, Col: 125}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var8)
 		if templ_7745c5c3_Err != nil {
@@ -228,7 +228,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var9 string
 		templ_7745c5c3_Var9, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Filter.SessionID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 78, Col: 125}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 82, Col: 125}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var9)
 		if templ_7745c5c3_Err != nil {
@@ -241,7 +241,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var10 string
 		templ_7745c5c3_Var10, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Filter.Worker)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 82, Col: 117}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 86, Col: 117}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var10)
 		if templ_7745c5c3_Err != nil {
@@ -254,7 +254,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var11 string
 		templ_7745c5c3_Var11, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Filter.Since)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 86, Col: 86}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 90, Col: 86}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var11)
 		if templ_7745c5c3_Err != nil {
@@ -267,7 +267,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var12 string
 		templ_7745c5c3_Var12, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Filter.Until)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 90, Col: 86}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 94, Col: 86}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var12)
 		if templ_7745c5c3_Err != nil {
@@ -280,7 +280,7 @@ func logFilterBar(d LogsData) templ.Component {
 		var templ_7745c5c3_Var13 templ.SafeURL
 		templ_7745c5c3_Var13, templ_7745c5c3_Err = templ.JoinURLErrs(templ.SafeURL(d.CSVHref))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 94, Col: 59}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 98, Col: 59}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var13))
 		if templ_7745c5c3_Err != nil {
@@ -346,7 +346,7 @@ func logTailPanel(d LogsData) templ.Component {
 		var templ_7745c5c3_Var15 string
 		templ_7745c5c3_Var15, templ_7745c5c3_Err = templ.ResolveAttributeValue(logTailState(d.StreamURL))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 117, Col: 36}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 121, Col: 36}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var15)
 		if templ_7745c5c3_Err != nil {
@@ -403,14 +403,14 @@ func LogTablePartial(t LogsTable) templ.Component {
 			templ_7745c5c3_Var16 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 28, "<div id=\"log-table\" class=\"mt-4\"><div class=\"panel\"><div class=\"panel-head\"><span class=\"panel-title\">Buffered lines</span> <span class=\"font-mono text-sm tnum text-fg\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 28, "<div id=\"log-table\" class=\"mt-4\" role=\"region\" aria-label=\"Buffered lines\"><div class=\"panel\"><div class=\"panel-head\"><span class=\"panel-title\">Buffered lines</span> <span class=\"font-mono text-sm tnum text-fg\" aria-label=\"Buffered line count\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var17 string
 		templ_7745c5c3_Var17, templ_7745c5c3_Err = templ.JoinStringErrs(itoa(t.Count))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 176, Col: 64}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 180, Col: 97}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var17))
 		if templ_7745c5c3_Err != nil {
@@ -489,7 +489,7 @@ func logRow(line LogLine) templ.Component {
 		var templ_7745c5c3_Var19 string
 		templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.JoinStringErrs(line.Time)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 203, Col: 46}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 207, Col: 46}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var19))
 		if templ_7745c5c3_Err != nil {
@@ -524,7 +524,7 @@ func logRow(line LogLine) templ.Component {
 		var templ_7745c5c3_Var22 string
 		templ_7745c5c3_Var22, templ_7745c5c3_Err = templ.JoinStringErrs(line.Level)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 204, Col: 92}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 208, Col: 92}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var22))
 		if templ_7745c5c3_Err != nil {
@@ -537,7 +537,7 @@ func logRow(line LogLine) templ.Component {
 		var templ_7745c5c3_Var23 string
 		templ_7745c5c3_Var23, templ_7745c5c3_Err = templ.JoinStringErrs(line.Message)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 205, Col: 71}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 209, Col: 71}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var23))
 		if templ_7745c5c3_Err != nil {
@@ -573,7 +573,7 @@ func logRow(line LogLine) templ.Component {
 			var templ_7745c5c3_Var26 string
 			templ_7745c5c3_Var26, templ_7745c5c3_Err = templ.JoinStringErrs(f.Key)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 207, Col: 110}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 211, Col: 110}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var26))
 			if templ_7745c5c3_Err != nil {
@@ -586,7 +586,7 @@ func logRow(line LogLine) templ.Component {
 			var templ_7745c5c3_Var27 string
 			templ_7745c5c3_Var27, templ_7745c5c3_Err = templ.JoinStringErrs(f.Value)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 207, Col: 122}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 211, Col: 122}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var27))
 			if templ_7745c5c3_Err != nil {
@@ -627,7 +627,7 @@ func LogTableLoading() templ.Component {
 			templ_7745c5c3_Var28 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 46, "<div id=\"log-table\" class=\"mt-4\" aria-busy=\"true\"><div class=\"panel\"><div class=\"panel-head\"><span class=\"panel-title\">Buffered lines</span></div><div class=\"panel-body\"><div class=\"skeleton h-40 w-full\"></div></div></div><span class=\"sr-only\">Loading log lines…</span></div>")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 46, "<div id=\"log-table\" class=\"mt-4\" role=\"region\" aria-label=\"Buffered lines\" aria-busy=\"true\"><div class=\"panel\"><div class=\"panel-head\"><span class=\"panel-title\">Buffered lines</span></div><div class=\"panel-body\"><div class=\"skeleton h-40 w-full\"></div></div></div><span class=\"sr-only\">Loading log lines…</span></div>")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -658,7 +658,7 @@ func LogTableError(assetPath, msg string) templ.Component {
 			templ_7745c5c3_Var29 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 47, "<div id=\"log-table\" class=\"mt-4\"><div class=\"panel\"><div class=\"panel-body flex flex-col items-center gap-3 py-10 text-center\"><span class=\"text-danger\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 47, "<div id=\"log-table\" class=\"mt-4\" role=\"region\" aria-label=\"Buffered lines\"><div class=\"panel\"><div class=\"panel-body flex flex-col items-center gap-3 py-10 text-center\"><span class=\"text-danger\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -673,7 +673,7 @@ func LogTableError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var30 string
 		templ_7745c5c3_Var30, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 234, Col: 48}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 238, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var30))
 		if templ_7745c5c3_Err != nil {
@@ -686,7 +686,7 @@ func LogTableError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var31 string
 		templ_7745c5c3_Var31, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/logs")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 239, Col: 45}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/logs.templ`, Line: 243, Col: 45}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var31)
 		if templ_7745c5c3_Err != nil {

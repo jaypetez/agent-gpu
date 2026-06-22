@@ -73,14 +73,14 @@ func Usage(d UsageData) templ.Component {
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
-			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span>Refresh</span></button></div><div id=\"usage-board\" hx-get=\"")
+			templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "<span>Refresh</span></button></div><!-- The region role + label name the board as a landmark so tests (and\n\t\t     assistive tech) address it by role, not by its #id. --> <div id=\"usage-board\" role=\"region\" aria-label=\"Usage\" hx-get=\"")
 			if templ_7745c5c3_Err != nil {
 				return templ_7745c5c3_Err
 			}
 			var templ_7745c5c3_Var4 string
 			templ_7745c5c3_Var4, templ_7745c5c3_Err = templ.ResolveAttributeValue(d.Shell.AssetPath + "/../partials/usage")
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 35, Col: 52}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 39, Col: 52}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var4)
 			if templ_7745c5c3_Err != nil {
@@ -132,14 +132,14 @@ func UsageBoardPartial(assetPath string, b UsageBoard) templ.Component {
 			templ_7745c5c3_Var5 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 6, "<div id=\"usage-board\" hx-get=\"")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 6, "<div id=\"usage-board\" role=\"region\" aria-label=\"Usage\" hx-get=\"")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
 		var templ_7745c5c3_Var6 string
 		templ_7745c5c3_Var6, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/usage")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 50, Col: 43}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 56, Col: 43}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var6)
 		if templ_7745c5c3_Err != nil {
@@ -170,7 +170,7 @@ func UsageBoardPartial(assetPath string, b UsageBoard) templ.Component {
 			var templ_7745c5c3_Var7 string
 			templ_7745c5c3_Var7, templ_7745c5c3_Err = templ.JoinStringErrs(itoa(b.KeyCount))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 64, Col: 68}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 70, Col: 68}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var7))
 			if templ_7745c5c3_Err != nil {
@@ -183,7 +183,7 @@ func UsageBoardPartial(assetPath string, b UsageBoard) templ.Component {
 			var templ_7745c5c3_Var8 string
 			templ_7745c5c3_Var8, templ_7745c5c3_Err = templ.JoinStringErrs(b.GlobalThrottled)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 69, Col: 76}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 75, Col: 76}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var8))
 			if templ_7745c5c3_Err != nil {
@@ -196,7 +196,7 @@ func UsageBoardPartial(assetPath string, b UsageBoard) templ.Component {
 			var templ_7745c5c3_Var9 string
 			templ_7745c5c3_Var9, templ_7745c5c3_Err = templ.JoinStringErrs(b.KeyThrottled)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 73, Col: 73}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 79, Col: 73}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var9))
 			if templ_7745c5c3_Err != nil {
@@ -275,7 +275,7 @@ func usageCard(r UsageRow) templ.Component {
 		var templ_7745c5c3_Var11 string
 		templ_7745c5c3_Var11, templ_7745c5c3_Err = templ.ResolveAttributeValue(r.KeyID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 101, Col: 53}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 107, Col: 53}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var11)
 		if templ_7745c5c3_Err != nil {
@@ -288,7 +288,7 @@ func usageCard(r UsageRow) templ.Component {
 		var templ_7745c5c3_Var12 string
 		templ_7745c5c3_Var12, templ_7745c5c3_Err = templ.JoinStringErrs(r.Name)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 101, Col: 64}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 107, Col: 64}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var12))
 		if templ_7745c5c3_Err != nil {
@@ -301,7 +301,7 @@ func usageCard(r UsageRow) templ.Component {
 		var templ_7745c5c3_Var13 string
 		templ_7745c5c3_Var13, templ_7745c5c3_Err = templ.ResolveAttributeValue(r.KeyID)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 102, Col: 71}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 108, Col: 71}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var13)
 		if templ_7745c5c3_Err != nil {
@@ -314,7 +314,7 @@ func usageCard(r UsageRow) templ.Component {
 		var templ_7745c5c3_Var14 string
 		templ_7745c5c3_Var14, templ_7745c5c3_Err = templ.JoinStringErrs(shortID(r.KeyID))
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 102, Col: 92}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 108, Col: 92}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var14))
 		if templ_7745c5c3_Err != nil {
@@ -332,7 +332,7 @@ func usageCard(r UsageRow) templ.Component {
 			var templ_7745c5c3_Var15 string
 			templ_7745c5c3_Var15, templ_7745c5c3_Err = templ.JoinStringErrs(ownerTeam(r.Owner, r.Team))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 105, Col: 68}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 111, Col: 68}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var15))
 			if templ_7745c5c3_Err != nil {
@@ -416,7 +416,7 @@ func usageMeter(m UsageMeter) templ.Component {
 		var templ_7745c5c3_Var17 string
 		templ_7745c5c3_Var17, templ_7745c5c3_Err = templ.JoinStringErrs(m.Label)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 131, Col: 40}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 137, Col: 40}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var17))
 		if templ_7745c5c3_Err != nil {
@@ -434,7 +434,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var18 string
 			templ_7745c5c3_Var18, templ_7745c5c3_Err = templ.JoinStringErrs(m.Used)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 133, Col: 49}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 139, Col: 49}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var18))
 			if templ_7745c5c3_Err != nil {
@@ -447,7 +447,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var19 string
 			templ_7745c5c3_Var19, templ_7745c5c3_Err = templ.JoinStringErrs(m.Limit)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 133, Col: 63}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 139, Col: 63}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var19))
 			if templ_7745c5c3_Err != nil {
@@ -465,7 +465,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var20 string
 			templ_7745c5c3_Var20, templ_7745c5c3_Err = templ.JoinStringErrs(m.Used)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 135, Col: 55}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 141, Col: 55}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var20))
 			if templ_7745c5c3_Err != nil {
@@ -478,7 +478,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var21 string
 			templ_7745c5c3_Var21, templ_7745c5c3_Err = templ.JoinStringErrs(m.Limit)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 135, Col: 70}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 141, Col: 70}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var21))
 			if templ_7745c5c3_Err != nil {
@@ -501,7 +501,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var22 string
 			templ_7745c5c3_Var22, templ_7745c5c3_Err = templ.ResolveAttributeValue(m.Label + ": " + m.Used + " of " + m.Limit + ", " + itoa(m.Pct) + " percent")
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 142, Col: 93}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 148, Col: 93}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var22)
 			if templ_7745c5c3_Err != nil {
@@ -536,7 +536,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var25 string
 			templ_7745c5c3_Var25, templ_7745c5c3_Err = templruntime.SanitizeStyleAttributeValues(barWidth(m.Pct, 100))
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 144, Col: 86}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 150, Col: 86}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var25))
 			if templ_7745c5c3_Err != nil {
@@ -554,7 +554,7 @@ func usageMeter(m UsageMeter) templ.Component {
 			var templ_7745c5c3_Var26 string
 			templ_7745c5c3_Var26, templ_7745c5c3_Err = templ.ResolveAttributeValue(m.Label + ": no limit set")
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 147, Col: 103}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 153, Col: 103}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var26)
 			if templ_7745c5c3_Err != nil {
@@ -606,7 +606,7 @@ func usageSpark(s Sparkline) templ.Component {
 			var templ_7745c5c3_Var28 string
 			templ_7745c5c3_Var28, templ_7745c5c3_Err = templ.ResolveAttributeValue("7-day token trend: latest " + s.Last + ", peak " + s.Peak)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 169, Col: 75}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 175, Col: 75}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var28)
 			if templ_7745c5c3_Err != nil {
@@ -619,7 +619,7 @@ func usageSpark(s Sparkline) templ.Component {
 			var templ_7745c5c3_Var29 string
 			templ_7745c5c3_Var29, templ_7745c5c3_Err = templ.ResolveAttributeValue(s.Points)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 171, Col: 31}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 177, Col: 31}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var29)
 			if templ_7745c5c3_Err != nil {
@@ -693,7 +693,7 @@ func usageForecast(f UsageForecast) templ.Component {
 			var templ_7745c5c3_Var33 string
 			templ_7745c5c3_Var33, templ_7745c5c3_Err = templ.JoinStringErrs(f.Phrase)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 187, Col: 73}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 193, Col: 73}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var33))
 			if templ_7745c5c3_Err != nil {
@@ -706,7 +706,7 @@ func usageForecast(f UsageForecast) templ.Component {
 			var templ_7745c5c3_Var34 string
 			templ_7745c5c3_Var34, templ_7745c5c3_Err = templ.JoinStringErrs(f.Dimension)
 			if templ_7745c5c3_Err != nil {
-				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 188, Col: 45}
+				return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 194, Col: 45}
 			}
 			_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var34))
 			if templ_7745c5c3_Err != nil {
@@ -749,7 +749,7 @@ func UsageLoading() templ.Component {
 			templ_7745c5c3_Var35 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 56, "<div id=\"usage-board\" aria-busy=\"true\"><div class=\"mb-4 panel\"><div class=\"panel-head\"><span class=\"panel-title\">Fleet throttling</span></div><div class=\"panel-body\"><div class=\"skeleton h-4 w-64\"></div></div></div><div class=\"grid grid-cols-1 gap-4 xl:grid-cols-2\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 56, "<div id=\"usage-board\" role=\"region\" aria-label=\"Usage\" aria-busy=\"true\"><div class=\"mb-4 panel\"><div class=\"panel-head\"><span class=\"panel-title\">Fleet throttling</span></div><div class=\"panel-body\"><div class=\"skeleton h-4 w-64\"></div></div></div><div class=\"grid grid-cols-1 gap-4 xl:grid-cols-2\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -790,7 +790,7 @@ func UsageError(assetPath, msg string) templ.Component {
 			templ_7745c5c3_Var36 = templ.NopComponent
 		}
 		ctx = templ.ClearChildren(ctx)
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 59, "<div id=\"usage-board\"><div class=\"panel\"><div class=\"panel-body flex flex-col items-center gap-3 py-10 text-center\"><span class=\"text-danger\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 59, "<div id=\"usage-board\" role=\"region\" aria-label=\"Usage\"><div class=\"panel\"><div class=\"panel-body flex flex-col items-center gap-3 py-10 text-center\"><span class=\"text-danger\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
@@ -805,7 +805,7 @@ func UsageError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var37 string
 		templ_7745c5c3_Var37, templ_7745c5c3_Err = templ.JoinStringErrs(msg)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 228, Col: 48}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 234, Col: 48}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var37))
 		if templ_7745c5c3_Err != nil {
@@ -818,7 +818,7 @@ func UsageError(assetPath, msg string) templ.Component {
 		var templ_7745c5c3_Var38 string
 		templ_7745c5c3_Var38, templ_7745c5c3_Err = templ.ResolveAttributeValue(assetPath + "/../partials/usage")
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 233, Col: 46}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/httpapi/webui/usage.templ`, Line: 239, Col: 46}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ_7745c5c3_Var38)
 		if templ_7745c5c3_Err != nil {
