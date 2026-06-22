@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestKeyQuotaCLIFlow exercises `key quota set` and `key quota <id>` against a
-// temp store: set limits, then show them, asserting the values round-trip and
-// no secret leaks.
-func TestKeyQuotaCLIFlow(t *testing.T) {
+// TestQuotaShowLocalReadOnly exercises the read-only --local quota inspection path
+// (runQuotaShowLocal) over a temp store: bootstrap a key, then `quota show --local`
+// reports its effective limits (global defaults, no per-key override) without
+// leaking a secret. Setting a quota in --local mode is forbidden by the #104
+// bootstrap guard (a populated store must be managed over the API) and is asserted
+// here too; the HTTP set/show round-trip lives in http_test.go.
+func TestQuotaShowLocalReadOnly(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "keys.json")
@@ -20,8 +24,6 @@ func TestKeyQuotaCLIFlow(t *testing.T) {
 	run := func(args ...string) string {
 		t.Helper()
 		var out bytes.Buffer
-		// --local exercises the on-disk store path; the HTTP (running-server) path
-		// is covered in http_test.go.
 		full := append(args, "--local")
 		if err := runKeyCmd(ctx, &out, full); err != nil {
 			t.Fatalf("runKeyCmd %v: %v", args, err)
@@ -34,34 +36,28 @@ func TestKeyQuotaCLIFlow(t *testing.T) {
 	id := strings.SplitN(token, "_", 3)[1]
 	secret := strings.SplitN(token, "_", 3)[2]
 
-	// Set per-key limits.
-	set := run("quota", "set", id, "--rpm", "60", "--tpm", "1000", "--daily-tokens", "100000", "--store", storePath)
-	if !strings.Contains(set, "Updated quota for key "+id) {
-		t.Fatalf("set output: %q", set)
-	}
-	if !strings.Contains(set, "RPM: 60") || !strings.Contains(set, "TPM: 1000") {
-		t.Fatalf("set did not echo limits: %q", set)
+	// quota set --local against the now-populated store is rejected by the guard.
+	var setOut bytes.Buffer
+	setErr := runKeyCmd(ctx, &setOut, []string{"quota", "set", id, "--rpm", "60", "--local", "--store", storePath})
+	if exitCode(setErr) != exitUsage {
+		t.Fatalf("quota set --local on a populated store should be a usage error, got exit %d (err: %v)", exitCode(setErr), setErr)
 	}
 
-	// Show usage vs limits.
+	// The read-only show path still works and reports the effective (default) limits.
 	show := run("quota", id, "--store", storePath, "--quota-path", quotaPath)
 	if !strings.Contains(show, "Quota for key "+id) {
 		t.Fatalf("show output: %q", show)
 	}
-	if !strings.Contains(show, "per-key override") {
-		t.Fatalf("show should report per-key override: %q", show)
+	if !strings.Contains(show, "global defaults") {
+		t.Fatalf("show should report global defaults (no per-key override): %q", show)
 	}
-	for _, want := range []string{"requests/min", "tokens/min", "tokens/day", "tokens/month", "60", "1000", "100000"} {
+	for _, want := range []string{"requests/min", "tokens/min", "tokens/day", "tokens/month", "unlimited"} {
 		if !strings.Contains(show, want) {
 			t.Fatalf("show missing %q: %q", want, show)
 		}
 	}
-	// monthly-tokens was left at 0 -> "unlimited".
-	if !strings.Contains(show, "unlimited") {
-		t.Fatalf("show should mark monthly as unlimited: %q", show)
-	}
-	if strings.Contains(show, secret) || strings.Contains(set, secret) {
-		t.Fatal("quota CLI leaked the secret")
+	if strings.Contains(show, secret) {
+		t.Fatal("quota show --local leaked the secret")
 	}
 }
 
@@ -87,33 +83,29 @@ func TestQuotaSetClearWithNumericIsUsageError(t *testing.T) {
 	}
 }
 
-// TestKeyQuotaClear verifies --clear removes the per-key override.
-func TestKeyQuotaClear(t *testing.T) {
+// TestKeyQuotaClearHTTP verifies `key quota set <id> --clear` routes through to the
+// quota endpoint with an empty body (the clear signal) and reports the cleared
+// override. It goes through runKeyCmd (the `key quota` alias) against the admin
+// stub, since clearing a per-key override is a runtime mutation that the #104
+// invariant requires to go over the API rather than --local.
+func TestKeyQuotaClearHTTP(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	storePath := filepath.Join(t.TempDir(), "keys.json")
+	a := newAdminStub(t, map[string]stubResponse{
+		"PUT /v1/admin/keys/k1/quota": {http.StatusOK,
+			`{"id":"k1","name":"app","roles":[],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":0,"created":1}`},
+	})
 
-	run := func(args ...string) string {
-		t.Helper()
-		var out bytes.Buffer
-		full := append(args, "--local")
-		if err := runKeyCmd(ctx, &out, full); err != nil {
-			t.Fatalf("runKeyCmd %v: %v", args, err)
-		}
-		return out.String()
+	out, err := runHTTP(t, a, runKeyCmd, "quota", "set", "k1", "--clear")
+	if err != nil {
+		t.Fatalf("key quota set --clear: %v", err)
 	}
-
-	created := run("create", "--name", "q-agent", "--store", storePath)
-	id := strings.SplitN(extractToken(t, created), "_", 3)[1]
-
-	run("quota", "set", id, "--rpm", "5", "--store", storePath)
-	cleared := run("quota", "set", id, "--clear", "--store", storePath)
-	if !strings.Contains(cleared, "Cleared quota override") {
-		t.Fatalf("clear output: %q", cleared)
+	if !strings.Contains(out, "Cleared quota override for key k1") {
+		t.Fatalf("clear output: %q", out)
 	}
-
-	show := run("quota", id, "--store", storePath)
-	if !strings.Contains(show, "global defaults") {
-		t.Fatalf("after clear, show should report global defaults: %q", show)
+	if a.lastReq.method != http.MethodPut || a.lastReq.path != "/v1/admin/keys/k1/quota" {
+		t.Fatalf("sent %s %s, want PUT /v1/admin/keys/k1/quota", a.lastReq.method, a.lastReq.path)
+	}
+	if len(a.lastReq.body) != 0 {
+		t.Fatalf("clear should send an empty body, got %v", a.lastReq.body)
 	}
 }

@@ -103,16 +103,22 @@ done
 ```
 
 There is no auto-seeded admin key, and before any key exists there is no token to
-authenticate with — so bootstrap the first keys directly into the on-disk store
-with `--local`, then **restart the server once** so it loads them at boot (the
-file store is read only at startup). The plaintext token is printed **once** —
-save it.
+authenticate with — so bootstrap the **first admin key** directly into the on-disk
+store with `--local`, then **restart the server once** so it loads at boot (the
+file store is read only at startup). Every subsequent key is created over the admin
+API (`--local` only bootstraps the first key on an empty store). The plaintext
+token is printed **once** — save it.
 
 ```bash
-# 3. Mint an admin key and a user key scoped to the demo model, then restart so they load.
+# 3a. Bootstrap the admin key into the on-disk store, then restart so the server loads it.
 docker compose exec -T server /agentgpu key create --name admin --role admin --local
-docker compose exec -T server /agentgpu key create --name app --role user --allow-model qwen2:0.5b --local
 docker compose restart server
+# Copy the "Token: ..." line from the admin-key output into ADMIN_TOKEN.
+export ADMIN_TOKEN=<the admin token printed above>
+
+# 3b. Create a user key scoped to the demo model over the admin API (the runtime path).
+docker compose exec -T server /agentgpu key create --name app --role user \
+  --allow-model qwen2:0.5b --server http://localhost:8080 --token "$ADMIN_TOKEN"
 # Copy the "Token: ..." line from the user-key output into USER_TOKEN below.
 export USER_TOKEN=<the user token printed above>
 ```

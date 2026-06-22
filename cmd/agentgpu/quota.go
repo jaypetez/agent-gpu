@@ -217,7 +217,7 @@ func runQuotaSetHTTP(ctx context.Context, out io.Writer, cf *clientFlags, id str
 }
 
 func runQuotaSetLocal(ctx context.Context, out io.Writer, cf *clientFlags, id string, clear bool, rpm, tpm, daily, monthly uint64) error {
-	svc, st, err := cf.localService()
+	svc, st, err := cf.localBootstrapService(ctx, "quota set")
 	if err != nil {
 		return err
 	}

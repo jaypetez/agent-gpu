@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -44,41 +45,39 @@ func TestKeyCreateWithPerms(t *testing.T) {
 	_ = id
 }
 
-// TestKeyPermsSubcommand verifies `key perms <id>` replaces a key's permissions,
-// including the trailing-positional flag ordering.
-func TestKeyPermsSubcommand(t *testing.T) {
+// TestKeyPermsSubcommandHTTP verifies `key perms <id>` replaces a key's permissions
+// (a full replace — the old admin role is gone), including the id-before-flags
+// ordering that exercises reorderFlagsFirst. Permission changes are a runtime
+// mutation, so under the #104 invariant they go over the admin API; the request is
+// asserted against the stub.
+func TestKeyPermsSubcommandHTTP(t *testing.T) {
 	t.Parallel()
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "keys.json")
-
-	run := func(args ...string) string {
-		t.Helper()
-		var out bytes.Buffer
-		full := append(args, "--local", "--store", path)
-		if err := runKeyCmd(ctx, &out, full); err != nil {
-			t.Fatalf("runKeyCmd %v: %v", args, err)
-		}
-		return out.String()
-	}
-
-	created := run("create", "--name", "agent", "--role", "admin")
-	id := strings.SplitN(extractToken(t, created), "_", 3)[1]
+	a := newAdminStub(t, map[string]stubResponse{
+		"PUT /v1/admin/keys/k1/permissions": {http.StatusOK,
+			`{"id":"k1","name":"agent","roles":["read-only"],"allow_models":["llama3"],"deny_models":[],"revoked":false,"usage_count":0,"created":1}`},
+	})
 
 	// id positional BEFORE the flags exercises reorderFlagsFirst.
-	out := run("perms", id, "--role", "read-only", "--allow-model", "llama3")
-	if !strings.Contains(out, "Updated permissions for key "+id) {
+	out, err := runHTTP(t, a, runKeyCmd, "perms", "k1", "--role", "read-only", "--allow-model", "llama3")
+	if err != nil {
+		t.Fatalf("key perms: %v", err)
+	}
+	if !strings.Contains(out, "Updated permissions for key k1") {
 		t.Fatalf("perms output: %q", out)
 	}
 	if !strings.Contains(out, "Roles: read-only") || !strings.Contains(out, "Allow: llama3") {
 		t.Fatalf("perms did not echo new perms: %q", out)
 	}
-
-	list := run("list")
-	if strings.Contains(list, "admin") {
-		t.Fatalf("perms should have replaced admin role: %q", list)
+	if strings.Contains(out, "admin") {
+		t.Fatalf("perms is a full replace; the admin role should be gone: %q", out)
 	}
-	if !strings.Contains(list, "read-only") {
-		t.Fatalf("list missing replaced role: %q", list)
+	// The replace was sent as a PUT carrying exactly the new role and allow list.
+	if a.lastReq.method != http.MethodPut || a.lastReq.path != "/v1/admin/keys/k1/permissions" {
+		t.Fatalf("sent %s %s", a.lastReq.method, a.lastReq.path)
+	}
+	roles, _ := a.lastReq.body["roles"].([]any)
+	if len(roles) != 1 || roles[0] != "read-only" {
+		t.Fatalf("body roles = %v, want [read-only]", a.lastReq.body["roles"])
 	}
 }
 

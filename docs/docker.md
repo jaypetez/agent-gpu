@@ -259,14 +259,14 @@ stack runs anywhere.
 ### Persistence across restarts
 
 Keys, quotas, and sessions are JSON files on the named `agentgpu-data` volume
-(atomic writes), so they survive a container restart. Because the server also
-loads that store at start, the restart that activates a CLI-created key is the
-same step that proves persistence:
+(atomic writes), so they survive a container restart. A key created over the admin
+API is persisted to that volume immediately; restarting the server proves it
+reloads the store from the volume rather than losing it:
 
 ```bash
-docker compose exec server /agentgpu key create --name persists --role admin --local  # save the token
+agentgpu key create --name persists --role admin   # over the admin API; save the token
 docker compose restart server
-# The same token now authenticates — the key came back from the volume on reload:
+# The same token still authenticates — the key came back from the volume on reload:
 curl -s -o /dev/null -w '%{http_code}\n' \
   -H "Authorization: Bearer $TOKEN" http://localhost:8080/v1/admin/workers      # -> 200
 ```

@@ -52,6 +52,22 @@ func dispatch(args []string) error {
 		return runQuotaCmd(ctx, os.Stdout, args[1:])
 	case "models":
 		return runModelsCmd(ctx, os.Stdout, args[1:])
+	case "config":
+		return runConfigCmd(ctx, os.Stdout, args[1:])
+	case "workers":
+		return runWorkersCmd(ctx, os.Stdout, args[1:])
+	case "audit":
+		return runAuditCmd(ctx, os.Stdout, args[1:])
+	case "usage":
+		return runUsageCmd(ctx, os.Stdout, args[1:])
+	case "users":
+		return runUsersCmd(ctx, os.Stdout, args[1:])
+	case "gpus":
+		return runGPUsCmd(ctx, os.Stdout, args[1:])
+	case "telemetry":
+		return runTelemetryCmd(ctx, os.Stdout, args[1:])
+	case "logs":
+		return runLogsCmd(ctx, os.Stdout, args[1:])
 	case "loadtest":
 		return runLoadtestCmd(ctx, logger, os.Stdout, args[1:])
 	default:
