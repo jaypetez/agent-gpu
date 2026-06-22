@@ -105,6 +105,17 @@ func (s *Server) registerUIRoutes(mux *http.ServeMux) {
 	// yields the full remainder.
 	mux.Handle("DELETE /admin/workers/{id}/models/{model...}", s.uiScopeAuth(authz.ScopeModelsWrite, http.HandlerFunc(s.handleUIWorkerUnload)))
 
+	// Keys / users / permissions (#102). Reads (the page + the masked-table partial)
+	// require keys:read; writes (create / rotate / revoke / set-permissions) require
+	// keys:write — the same scopes the JSON admin key routes use. Each write handler
+	// enforces the double-submit CSRF check (s.uiWriteGuard) before any side effect.
+	mux.Handle("GET /admin/keys", s.uiScopeAuth(authz.ScopeKeysRead, http.HandlerFunc(s.handleUIKeys)))
+	mux.Handle("GET /admin/partials/keys", s.uiScopeAuth(authz.ScopeKeysRead, http.HandlerFunc(s.handleUIKeyListPartial)))
+	mux.Handle("POST /admin/keys", s.uiScopeAuth(authz.ScopeKeysWrite, http.HandlerFunc(s.handleUIKeyCreate)))
+	mux.Handle("POST /admin/keys/{id}/rotate", s.uiScopeAuth(authz.ScopeKeysWrite, http.HandlerFunc(s.handleUIKeyRotate)))
+	mux.Handle("POST /admin/keys/{id}/revoke", s.uiScopeAuth(authz.ScopeKeysWrite, http.HandlerFunc(s.handleUIKeyRevoke)))
+	mux.Handle("POST /admin/keys/{id}/permissions", s.uiScopeAuth(authz.ScopeKeysWrite, http.HandlerFunc(s.handleUIKeyPermissions)))
+
 	assetFS := s.uiAssets
 	if assetFS == nil {
 		assetFS = webui.Assets()

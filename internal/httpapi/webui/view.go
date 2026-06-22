@@ -231,3 +231,86 @@ type WorkerActionResult struct {
 	Title   string
 	Message string
 }
+
+// --- Keys / users / permissions (#102) --------------------------------------
+
+// KeysData backs the API-keys screen's initial server render (#102). The shell
+// supplies the chrome; the screen carries the masked key rows plus the role and
+// admin-scope catalog (sourced from authz.AllRoles / authz.AllScopes) the create
+// and permissions editors populate their pickers from — so a picker can never
+// offer a role/scope the authorization engine doesn't recognize. No secret is
+// ever carried here: the rows are masked projections and the one-time plaintext
+// token is shown only in the reveal partial returned by create/rotate.
+type KeysData struct {
+	Shell ShellData
+	Keys  []KeyRow
+	Roles []RoleOption
+	// AdminScopes is the full admin-scope vocabulary, for the scope picker.
+	AdminScopes []string
+}
+
+// KeyRow is one row of the keys table (#102): the key's opaque id (NEVER the
+// token — the secret is shown once at creation and never again), its name, the
+// owner/team labels, the assigned roles + admin scopes, the created / last-used /
+// expiry strings, and a status (active / revoked / expired) conveyed by BOTH a
+// tone color AND a text word. MaskedSecret is a fixed visual placeholder making
+// it explicit the table shows no secret; it is the same for every row.
+type KeyRow struct {
+	ID          string
+	Name        string
+	Owner       string
+	Team        string
+	Roles       []string
+	AdminScopes []string
+	// AllowModels / DenyModels prefill the permissions editor's model textareas so a
+	// full-replace edit starts from the key's current lists rather than blank.
+	AllowModels  []string
+	DenyModels   []string
+	MaskedSecret string
+	Created      string
+	LastUsed     string
+	Expiry       string
+	// Status is the lifecycle word shown beside the colored badge: "active",
+	// "revoked", or "expired". Tone is its severity (ok/danger/warn).
+	Status string
+	Tone   string
+	// Revoked / Expired gate which write controls the row offers (a revoked or
+	// expired key cannot be rotated; a revoked key cannot be revoked again).
+	Revoked bool
+	Expired bool
+}
+
+// RoleOption is one selectable role in the create/permissions pickers (#102),
+// projected from authz.RoleInfo: the role name (the value submitted) plus a short
+// human description shown beside the checkbox so an operator understands what the
+// role grants without leaving the editor.
+type RoleOption struct {
+	Name        string
+	Description string
+}
+
+// KeyReveal backs the one-time token reveal returned by create and rotate (#102):
+// the just-minted plaintext token shown exactly once, with a copy affordance, and
+// never stored or shown again. Title/Message frame the reveal in the operator's
+// voice (e.g. "Copy it now — it won't be shown again"). It is its own fragment so
+// the create/rotate handlers can swap it into a modal/toast slot distinct from the
+// masked table.
+type KeyReveal struct {
+	KeyID   string
+	Name    string
+	Token   string
+	Title   string
+	Message string
+	// Rotated is true when the reveal is from a rotate (vs. a fresh create), so
+	// the copy is phrased as a replacement rather than a new key.
+	Rotated bool
+}
+
+// KeyActionResult backs the inline toast a key write (revoke / set-permissions)
+// swaps into #toasts on success or failure (#102), mirroring WorkerActionResult.
+// Status is conveyed by the tone AND the text.
+type KeyActionResult struct {
+	Tone    string
+	Title   string
+	Message string
+}
