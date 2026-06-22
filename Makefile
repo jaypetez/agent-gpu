@@ -5,10 +5,22 @@
 #   protoc-gen-go      v1.36.6
 #   protoc-gen-go-grpc v1.5.1
 #   goreleaser         v2.16.0
+#   templ              v0.3.1020   (admin console codegen, #100)
+#   tailwindcss        v4.1.16     (admin console CSS, #100; via internal/httpapi/webui/package.json)
 BUF_VERSION             := v1.50.0
 PROTOC_GEN_GO_VERSION   := v1.36.6
 PROTOC_GEN_GRPC_VERSION := v1.5.1
 GORELEASER_VERSION      := v2.16.0
+TEMPL_VERSION           := v0.3.1020
+
+# Admin console (#100) source/build locations. The Node toolchain (package.json,
+# lockfile, node_modules) lives INSIDE the console package dir so that node_modules
+# is an ancestor of assets/css/input.css — Tailwind v4 resolves `@import
+# "tailwindcss"` from the input file's directory walking up, so co-locating is what
+# makes a clean `npm ci` build resolve the package (it is NOT a separate ui/ dir).
+WEBUI_DIR  := internal/httpapi/webui
+UI_DIR     := $(WEBUI_DIR)
+TEMPL      ?= go run github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION)
 
 GORELEASER ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
@@ -43,6 +55,26 @@ proto: ## Regenerate Go stubs from proto/ (commit the result)
 .PHONY: proto-lint
 proto-lint: ## Lint the protobuf definitions
 	$(BUF) lint
+
+.PHONY: ui
+ui: ui-templ ui-css ## Regenerate the admin console: templ Go + Tailwind CSS (commit the result)
+
+.PHONY: ui-templ
+ui-templ: ## Regenerate *_templ.go from the .templ sources (#100)
+	$(TEMPL) generate ./$(WEBUI_DIR)
+
+.PHONY: ui-css
+ui-css: ## Build the admin console CSS from the design tokens (#100)
+	cd $(UI_DIR) && npm install --no-audit --no-fund && npm run build:css
+
+.PHONY: ui-verify
+ui-verify: ui ## Regenerate the console and FAIL if the committed artifacts drift
+	git diff --exit-code -- $(WEBUI_DIR)
+
+.PHONY: ui-e2e
+ui-e2e: ## Run the Playwright + axe-core accessibility E2E against a built binary (#100)
+	$(GO) build -o agentgpu ./cmd/agentgpu
+	cd $(UI_DIR) && npm install --no-audit --no-fund && npm run test:e2e:install && AGENTGPU_BIN="$(CURDIR)/agentgpu" npm run test:e2e
 
 .PHONY: openapi-lint
 openapi-lint: ## Validate openapi.yaml (OpenAPI 3.1 + recommended ruleset) via the pinned Redocly image

@@ -1,0 +1,18 @@
+{
+  "name": "agent-gpu-ui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dev/test/CI toolchain for the agent-gpu admin console. NOT a runtime dependency: the shipped binary embeds the built CSS + generated templ Go and needs no Node. Node is used only to (1) build the Tailwind CSS via `make ui` and (2) run the Playwright + axe-core accessibility E2E in CI. This project lives under internal/httpapi/webui/ so node_modules is an ANCESTOR of assets/css/input.css — Tailwind v4 resolves `@import \"tailwindcss\"` via Node module resolution from the input CSS file's directory walking up, so the tailwindcss package must be reachable from there in a clean `npm ci` (no global/hoisted node_modules).",
+  "scripts": {
+    "build:css": "tailwindcss -i assets/css/input.css -o assets/css/app.css --minify",
+    "watch:css": "tailwindcss -i assets/css/input.css -o assets/css/app.css --watch",
+    "test:e2e": "playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.10.2",
+    "@playwright/test": "1.56.0",
+    "@tailwindcss/cli": "4.1.16",
+    "tailwindcss": "4.1.16"
+  }
+}

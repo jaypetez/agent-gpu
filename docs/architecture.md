@@ -1093,4 +1093,55 @@ Stubs under `proto/agentgpu/v1/*.pb.go` are generated and **committed**. Regener
 
 Install them with `make tools`.
 
+### Admin console (web UI)
+
+The operator console (issue #100) is a server-rendered, embedded web UI: **templ**
+for HTML (compiled to Go), **HTMX** for partial updates, **Alpine** for small client
+interactions, and **TailwindCSS** for styling driven entirely by a design-token
+system. It is served by the existing HTTP API under `/admin/` and authenticates with
+the existing API keys (an admin token at a login form sets an HttpOnly session cookie
+that the console and the `/v1/admin` API both accept; API clients keep using
+`Authorization: Bearer` unchanged).
+
+**No runtime dependency, no Node in the binary.** The single thing the generated
+templates import into the binary is `github.com/a-h/templ`'s runtime root, which is
+stdlib-only (no third-party transitive deps reach the artifact). HTMX and Alpine are
+**vendored** (committed, self-hosted, version-pinned — see
+`internal/httpapi/webui/assets/js/VENDOR.md`) and served as static assets; nothing is
+loaded from a CDN. Node is used **only** in dev/test/CI.
+
+**Committed generated artifacts.** Both the generated `*_templ.go` and the built
+Tailwind CSS (`internal/httpapi/webui/assets/css/app.css`) are committed and embedded
+via `go:embed`, so `go build` (and the goreleaser cross-compile, `CGO_ENABLED=0`, no
+codegen step) needs no Node. Regenerate both with `make ui` (templ generate +
+tailwind build) and commit the result; the CI `ui` job runs `make ui` then
+`git diff --exit-code` and fails on drift — the stricter up-to-date check the proto
+flow lacks. The design tokens themselves live once in `assets/css/input.css`; a
+committed test fails the build on a raw hex or arbitrary Tailwind `[...]` value in a
+`.templ` file. `--ui-path` serves the assets from disk for live iteration in dev.
+
+Pinned tool versions:
+
+| Tool                   | Version    |
+| ---------------------- | ---------- |
+| `templ`                | v0.3.1020  |
+| `tailwindcss`          | v4.1.16    |
+| `@playwright/test`     | v1.56.0    |
+| `@axe-core/playwright` | v4.10.2    |
+
+The Node toolchain lives in `internal/httpapi/webui/package.json` (pinned + lockfile),
+co-located with the console source so a clean `npm ci` resolves `tailwindcss`:
+Tailwind v4 resolves `@import "tailwindcss"` via Node module resolution starting from
+the input CSS file's directory (`assets/css/input.css`) and walking up, so its
+`node_modules` must be an ancestor — which it is when the project sits at the package
+root rather than in a separate top-level `ui/` dir. `make ui` builds the CSS and
+`make ui-e2e` runs the Playwright + axe-core accessibility E2E (the CI `e2e` job is
+the WCAG AA arbiter). HTMX and Alpine versions + hashes are in
+`internal/httpapi/webui/assets/js/VENDOR.md`.
+
+> **Production TLS.** The in-process HTTP server speaks plain HTTP, so the session
+> cookie is marked `Secure` only when the request arrives over TLS (`r.TLS`, or an
+> `X-Forwarded-Proto: https` from a terminating proxy). Production deployments MUST
+> terminate TLS in front of the server so the session cookie is `Secure` end to end.
+
 <!-- ci: ruleset + admin-merge verification -->

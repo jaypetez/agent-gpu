@@ -20,6 +20,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/config"
 	"github.com/jaypetez/agent-gpu/internal/httpapi"
+	"github.com/jaypetez/agent-gpu/internal/httpapi/webui"
 	"github.com/jaypetez/agent-gpu/internal/metrics"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
@@ -89,6 +90,7 @@ func runServerCmd(ctx context.Context, lh *logHandle, args []string) error {
 	maxSessionContextTokens := fs.Int("max-session-context-tokens", 0, "per-session cumulative context-token cap (0 = unlimited or $AGENTGPU_MAX_SESSION_CONTEXT_TOKENS)")
 	sessionOverflow := fs.String("session-overflow-policy", "", "history over-cap policy: trim (drop oldest, default) or reject (default trim or $AGENTGPU_SESSION_OVERFLOW_POLICY)")
 	modelWarmMax := fs.Duration("model-warm-max", 0, "max model-warmth keep_alive window for session-bound jobs; keep_alive = min(session TTL, this) (default 1h or $AGENTGPU_MODEL_WARM_MAX)")
+	uiPath := fs.String("ui-path", "", "serve the admin console's static assets from this directory instead of the embedded copy (dev only; point at internal/httpapi/webui). Empty uses the assets compiled into the binary.")
 	setUsage(fs, "Usage: agentgpu server start [--listen host:port] [--http-listen host:port] [flags]")
 	// The server/worker commands have no caller-injected writer; their help goes to
 	// stdout (a success), matching the informational top-level help.
@@ -130,7 +132,7 @@ func runServerCmd(ctx context.Context, lh *logHandle, args []string) error {
 	// resolution in dispatch) so the admin config endpoint (#92) can report the
 	// effective level/format/output and hot-reload the level.
 	lcfg := config.ResolveLog(config.LogConfig{}, nil)
-	return serveControlPlane(ctx, lh, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout, lcfg)
+	return serveControlPlane(ctx, lh, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout, lcfg, *uiPath)
 }
 
 // metricsListenOff reports whether the operator explicitly turned the metrics
@@ -160,7 +162,7 @@ func metricsListenOff(fs *flag.FlagSet, flagValue string) bool {
 // serveControlPlane starts the gRPC control-plane server and blocks until ctx
 // is cancelled (SIGINT/SIGTERM), then shuts down gracefully, checkpointing the
 // quota counters on the way out.
-func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, scfg config.SessionConfig, heartbeatTimeout time.Duration, lcfg config.LogConfig) error {
+func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, scfg config.SessionConfig, heartbeatTimeout time.Duration, lcfg config.LogConfig, uiPath string) error {
 	logger := lh.Logger
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -364,13 +366,27 @@ func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConf
 	// audit log records every admin write, and the runtime-config holder backs the
 	// settings/config endpoints (#92).
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen,
+	httpOpts := []httpapi.Option{
 		httpapi.WithAuditLog(auditLog),
 		httpapi.WithUsageSeries(usageStore),
 		// Live log query + SSE tail (#99): read the in-memory ring (#90) through a
 		// thin cmd-side adapter so the HTTP layer never depends on the logging setup.
 		httpapi.WithLogSource(newLogRingSource(lh.Ring)),
-		httpapi.WithRuntimeConfig(configInitial, configBoot, configAppliers, configPath))
+		httpapi.WithRuntimeConfig(configInitial, configBoot, configAppliers, configPath),
+	}
+	// Admin console (#100): with --ui-path set, serve the console's static assets
+	// from disk so an operator can iterate on the CSS/vendored JS live; otherwise
+	// the assets compiled into the binary (go:embed) are used. A bad --ui-path
+	// fails startup loudly rather than silently serving 404s.
+	if uiPath != "" {
+		assets, err := webui.DiskAssets(uiPath)
+		if err != nil {
+			return fmt.Errorf("ui-path %q: %w", uiPath, err)
+		}
+		httpOpts = append(httpOpts, httpapi.WithUIAssets(assets))
+		logger.Info("serving admin console assets from disk", "ui_path", uiPath)
+	}
+	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen, httpOpts...)
 
 	// Re-apply any persisted PUT overrides on top of the freshly-resolved config, so
 	// an operator's prior config change survives this restart and wins over the boot

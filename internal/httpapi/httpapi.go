@@ -48,6 +48,7 @@ package httpapi
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -239,6 +240,14 @@ type Server struct {
 	// no window where Shutdown sees nil and silently no-ops while the listener is
 	// still being brought up.
 	httpSrv *http.Server
+
+	// uiAssets is the filesystem the embedded admin console (#100) serves its
+	// static assets from. It is nil by default, in which case registerUIRoutes
+	// falls back to the assets compiled into the binary via go:embed (the
+	// production path). WithUIPath sets it to a disk-rooted FS so an operator can
+	// iterate on the CSS/vendored JS live without rebuilding (the --ui-path dev
+	// mode). The compiled templates are Go either way; only assets are switchable.
+	uiAssets fs.FS
 }
 
 // Option configures optional dependencies on an HTTP API Server that are not
@@ -275,6 +284,22 @@ func WithUsageSeries(u *usagepkg.Store) Option {
 // are already redacted at capture.
 func WithLogSource(src LogSource) Option {
 	return func(s *Server) { s.logs = src }
+}
+
+// WithUIAssets wires a custom filesystem for the embedded admin console's static
+// assets (#100). It backs the --ui-path development mode: cmd resolves a disk FS
+// rooted at the UI directory's assets and passes it here, so an operator iterating
+// on the CSS or vendored JS sees changes live without rebuilding the binary. When
+// the option is not supplied (production), registerUIRoutes serves the assets
+// compiled into the binary via go:embed. A nil fs.FS is treated as "not supplied"
+// (the embedded assets are used), so passing a failed disk-FS lookup never strands
+// the console without assets.
+func WithUIAssets(assets fs.FS) Option {
+	return func(s *Server) {
+		if assets != nil {
+			s.uiAssets = assets
+		}
+	}
 }
 
 // NewServer constructs an HTTP API Server. grpcSrv supplies the fleet snapshot,
@@ -346,6 +371,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
 	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
 	s.registerAdminRoutes(mux)
+	// Embedded admin console (#100). Mounted via a function call, NOT via
+	// route-registration string literals in THIS file, so the OpenAPI route-sync
+	// test (which parses those literals here and pins the public-API count) does
+	// not count the console's HTML/static routes against the API contract: the GUI
+	// is not part of the OpenAPI surface. The routes still mount on this same mux
+	// and inherit the metrics→requestID→recover chain below. See webui.go.
+	s.registerUIRoutes(mux)
 	// Middleware order (outermost first): metrics → requestID → recover → mux.
 	// Correlation id is established before auth so every response — including
 	// unauthenticated 401s short-circuited by authMiddleware — gets a request_id

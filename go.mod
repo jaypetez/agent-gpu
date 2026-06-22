@@ -3,6 +3,7 @@ module github.com/jaypetez/agent-gpu
 go 1.25.11
 
 require (
+	github.com/a-h/templ v0.3.1020
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	google.golang.org/grpc v1.81.1
