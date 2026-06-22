@@ -2,6 +2,7 @@ package webui
 
 import (
 	"strconv"
+	"strings"
 )
 
 // Tone names a status severity used across the console's status language. Status
@@ -175,3 +176,76 @@ func barWidth(n, total int) string {
 func itoa(n int) string { return strconv.Itoa(n) }
 
 func itoaU32(n uint32) string { return strconv.FormatUint(uint64(n), 10) }
+
+func itoaU64(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// logFieldTone maps a log field's first-class-ness to its badge text color class:
+// the primary filter fields (request_id/session_id/worker) are tinted with the
+// accent so they stand out from incidental attrs (muted). Both are token-derived
+// classes, so no raw color appears in a template.
+func logFieldTone(primary bool) string {
+	if primary {
+		return "text-accent"
+	}
+	return "text-fg-muted"
+}
+
+// UsageTone maps a consumption percentage (0-100) to a status tone using the usage
+// thresholds of #103: ok below 75%, watch from 75-90%, alert above 90%. It is
+// exported because the httpapi layer projects quota snapshots into usage meters and
+// needs the SAME thresholds the bars render, so a meter's color and the row's
+// warning never diverge.
+func UsageTone(pct int) string {
+	switch {
+	case pct >= 90:
+		return ToneDanger
+	case pct >= 75:
+		return ToneWarn
+	default:
+		return ToneOK
+	}
+}
+
+// Sparkpoints renders a polyline `points` attribute for a sparkline over a fixed
+// 100x28 viewBox from a series of values (oldest→newest). The x axis is evenly
+// spaced across the width; the y axis is inverted (SVG y grows downward) and scaled
+// so the series max touches the top padding and a flat/zero series sits on the
+// baseline. It is the data-driven geometry of the usage sparkline; the value is an
+// SVG attribute string (NOT a Tailwind arbitrary value), so it never trips the
+// token-lint guard. Fewer than two points yields an empty string (the caller draws
+// no line). The returned string has space-separated "x,y" pairs.
+func Sparkpoints(values []uint64) string {
+	if len(values) < 2 {
+		return ""
+	}
+	const (
+		w   = 100.0
+		h   = 28.0
+		pad = 2.0
+	)
+	var max uint64
+	for _, v := range values {
+		if v > max {
+			max = v
+		}
+	}
+	stepX := w / float64(len(values)-1)
+	usableH := h - 2*pad
+	var b strings.Builder
+	for i, v := range values {
+		x := float64(i) * stepX
+		var y float64
+		if max == 0 {
+			y = h - pad // flat baseline when every day is zero
+		} else {
+			y = pad + (1-float64(v)/float64(max))*usableH
+		}
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(strconv.FormatFloat(x, 'f', 1, 64))
+		b.WriteByte(',')
+		b.WriteString(strconv.FormatFloat(y, 'f', 1, 64))
+	}
+	return b.String()
+}

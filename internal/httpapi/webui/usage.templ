@@ -1,0 +1,240 @@
+package webui
+
+// usage.templ — the Usage screen (issue 103): per-key consumption against quota, shown
+// as horizontal progress METERS (never pie charts), each with a 7-day token
+// SPARKLINE and a best-effort exhaustion FORECAST, drillable per key. The static
+// header sits above an HTMX-polled board that loads after first paint and refreshes
+// on a calm cadence; only the data region updates. All styling is token-derived
+// utility classes from app.css; no raw hex and no arbitrary [...] values (the
+// token-lint test fails the build on either). Severity is ALWAYS color AND text (a
+// meter's tone is paired with its values; the forecast carries a word).
+
+// Usage is the usage screen. The board (#usage-board) loads on first paint, then
+// refreshes every 15s — usage moves slowly, so a calm cadence avoids needless churn.
+templ Usage(d UsageData) {
+	@Shell(d.Shell) {
+		<div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+			<div>
+				<h1 class="text-2xl font-semibold text-fg">Usage</h1>
+				<p class="mt-1 text-sm text-fg-muted">Per-key consumption against quota, with a 7-day trend and a run-out estimate.</p>
+			</div>
+			<button
+				type="button"
+				class="btn btn-ghost"
+				hx-get={ d.Shell.AssetPath + "/../partials/usage" }
+				hx-target="#usage-board"
+				hx-swap="outerHTML"
+				title="Refresh now"
+			>
+				@iconRefresh()
+				<span>Refresh</span>
+			</button>
+		</div>
+		<div
+			id="usage-board"
+			hx-get={ d.Shell.AssetPath + "/../partials/usage" }
+			hx-trigger="load, every 15s"
+			hx-swap="outerHTML"
+		>
+			@UsageLoading()
+		</div>
+	}
+}
+
+// UsageBoardPartial is the loaded usage board: a fleet-wide throttle summary over the
+// per-key cards. It keeps its poll attributes so it re-refreshes itself. When the
+// quota engine is off it renders a clear notice; with no keys, a calm empty state.
+templ UsageBoardPartial(assetPath string, b UsageBoard) {
+	<div
+		id="usage-board"
+		hx-get={ assetPath + "/../partials/usage" }
+		hx-trigger="every 15s"
+		hx-swap="outerHTML"
+	>
+		if !b.Enabled {
+			<div class="panel">
+				<div class="panel-body">
+					@emptyState("Usage reporting is off", "Quota isn't enabled on this server, so there are no per-key usage figures to show.")
+				</div>
+			</div>
+		} else {
+			<div class="mb-4 panel">
+				<div class="panel-head">
+					<span class="panel-title">Fleet throttling</span>
+					<span class="font-mono text-sm tnum text-fg">{ itoa(b.KeyCount) } keys</span>
+				</div>
+				<div class="panel-body flex flex-wrap items-center gap-x-8 gap-y-2 text-sm">
+					<div class="flex items-baseline gap-2">
+						<span class="text-fg-faint">Global throttled</span>
+						<span class="font-mono tnum font-semibold text-fg">{ b.GlobalThrottled }</span>
+					</div>
+					<div class="flex items-baseline gap-2">
+						<span class="text-fg-faint">Per-key throttled</span>
+						<span class="font-mono tnum font-semibold text-fg">{ b.KeyThrottled }</span>
+					</div>
+				</div>
+			</div>
+			if len(b.Rows) == 0 {
+				<div class="panel">
+					<div class="panel-body">
+						@emptyState("No keys yet", "Create an API key and its usage appears here as requests flow.")
+					</div>
+				</div>
+			} else {
+				<div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+					for _, row := range b.Rows {
+						@usageCard(row)
+					}
+				</div>
+			}
+		}
+	</div>
+}
+
+// usageCard is one key's usage drill-down: identity, the four consumption meters,
+// the 7-day sparkline, and the exhaustion forecast. The whole card is the per-key
+// drill-down the AC asks for (a key's complete usage in one place).
+templ usageCard(r UsageRow) {
+	<div class="panel">
+		<div class="panel-head">
+			<div class="min-w-0">
+				<span class="font-medium text-fg" title={ r.KeyID }>{ r.Name }</span>
+				<span class="block font-mono text-xs text-fg-faint" title={ r.KeyID }>{ shortID(r.KeyID) }</span>
+			</div>
+			if r.Owner != "" || r.Team != "" {
+				<span class="text-xs text-fg-muted">{ ownerTeam(r.Owner, r.Team) }</span>
+			}
+		</div>
+		<div class="panel-body flex flex-col gap-4">
+			<div class="flex flex-col gap-3">
+				@usageMeter(r.DailyTokens)
+				@usageMeter(r.MonthlyTokens)
+				@usageMeter(r.Requests)
+				@usageMeter(r.TokensPerMin)
+			</div>
+			<div class="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-3">
+				@usageSpark(r.Spark)
+				@usageForecast(r.Forecast)
+			</div>
+		</div>
+	</div>
+}
+
+// usageMeter renders one consumption-vs-limit bar. The fill width is live data (a
+// percentage), so it is an inline width style — deliberately NOT a Tailwind
+// arbitrary value (forbidden by the token-lint test). An unlimited dimension shows a
+// calm "no limit" track instead of a meter. The aria-label states the dimension and
+// the used/limit in words so the bar never reads by color alone.
+templ usageMeter(m UsageMeter) {
+	<div>
+		<div class="mb-1 flex items-center justify-between text-xs">
+			<span class="text-fg-muted">{ m.Label }</span>
+			if m.Limited {
+				<span class="font-mono tnum text-fg">{ m.Used } / { m.Limit }</span>
+			} else {
+				<span class="font-mono tnum text-fg-faint">{ m.Used } · { m.Limit }</span>
+			}
+		</div>
+		if m.Limited {
+			<div
+				class="h-2 w-full overflow-hidden rounded-full bg-surface-2"
+				role="img"
+				aria-label={ m.Label + ": " + m.Used + " of " + m.Limit + ", " + itoa(m.Pct) + " percent" }
+			>
+				<div class={ "h-full rounded-full", toneBar(m.Tone) } style={ barWidth(m.Pct, 100) }></div>
+			</div>
+		} else {
+			<div class="h-2 w-full rounded-full bg-surface-2" role="img" aria-label={ m.Label + ": no limit set" }></div>
+		}
+	</div>
+}
+
+// usageSpark renders the 7-day token sparkline as an inline SVG polyline. The points
+// are generated server-side (no client charting library, CSP-clean). It carries an
+// aria-label stating the latest and peak values so the trend is not shape-only. When
+// there is too little history to draw a line it shows a calm "no history yet" note.
+templ usageSpark(s Sparkline) {
+	if s.Has {
+		<div class="flex items-center gap-2">
+			<svg
+				class="h-7 w-24 text-accent"
+				viewBox="0 0 100 28"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="1.5"
+				stroke-linecap="round"
+				stroke-linejoin="round"
+				preserveAspectRatio="none"
+				role="img"
+				aria-label={ "7-day token trend: latest " + s.Last + ", peak " + s.Peak }
+			>
+				<polyline points={ s.Points }></polyline>
+			</svg>
+			<span class="font-mono text-xs text-fg-faint">7d</span>
+		</div>
+	} else {
+		<span class="text-xs text-fg-faint">No 7-day history yet</span>
+	}
+}
+
+// usageForecast renders the exhaustion estimate as a toned word + phrase, or a calm
+// "no forecast" note when no budget is projected to run out. The tone is reinforced
+// by the dimension + phrase text, never color alone.
+templ usageForecast(f UsageForecast) {
+	if f.Has {
+		<div class="flex items-center gap-2 text-xs">
+			<span class="text-fg-faint">Runs out</span>
+			<span class={ "font-mono font-semibold", toneText(f.Tone) }>{ f.Phrase }</span>
+			<span class="text-fg-muted">({ f.Dimension })</span>
+		</div>
+	} else {
+		<span class="text-xs text-fg-faint">No run-out forecast</span>
+	}
+}
+
+// UsageLoading is the board's first-paint skeleton (loading state): the card shapes
+// with shimmering placeholders, so the operator sees structure immediately.
+templ UsageLoading() {
+	<div id="usage-board" aria-busy="true">
+		<div class="mb-4 panel">
+			<div class="panel-head"><span class="panel-title">Fleet throttling</span></div>
+			<div class="panel-body"><div class="skeleton h-4 w-64"></div></div>
+		</div>
+		<div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+			for range 2 {
+				<div class="panel panel-body">
+					<div class="skeleton h-4 w-40"></div>
+					<div class="skeleton mt-4 h-2 w-full"></div>
+					<div class="skeleton mt-3 h-2 w-full"></div>
+					<div class="skeleton mt-3 h-2 w-full"></div>
+				</div>
+			}
+		</div>
+		<span class="sr-only">Loading usage…</span>
+	</div>
+}
+
+// UsageError is the board's error state: an in-voice notice with a retry that
+// re-fetches the region. Status is conveyed by the icon AND the text.
+templ UsageError(assetPath, msg string) {
+	<div id="usage-board">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load usage</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get={ assetPath + "/../partials/usage" }
+					hx-target="#usage-board"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}

@@ -1,0 +1,215 @@
+package webui
+
+// settings.templ — the Settings screen (issue 103): a tabbed editor over the runtime-
+// tunable config (General / Quotas / Sessions / Advanced) with the boot-only fields
+// surfaced READ-ONLY. The form PUTs the changes via HTMX; the server validates and
+// applies them LIVE, returning either the re-rendered editor + a success toast or an
+// inline field error (nothing applied). Behavior-changing fields carry a consequence
+// warning. All styling is token-derived utility classes; no raw hex and no arbitrary
+// [...] values. A config:read-only viewer (no config:write) sees the values with the
+// editor disabled and a note. The tabs are an Alpine island (no inline handlers,
+// CSP-clean).
+
+// Settings is the screen. The tabbed editor and the read-only boot section sit under
+// the header. The whole thing is one Alpine component owning the active tab + the
+// PUT lifecycle (so an inline error or a success toast swaps in place).
+templ Settings(d SettingsData) {
+	@Shell(d.Shell) {
+		<div class="mb-5">
+			<h1 class="text-2xl font-semibold text-fg">Settings</h1>
+			<p class="mt-1 text-sm text-fg-muted">Runtime configuration, applied live. Boot-only settings are shown read-only.</p>
+		</div>
+		if !d.Enabled {
+			<div class="panel">
+				<div class="panel-body">
+					@emptyState("Settings are unavailable", "Runtime configuration isn't enabled on this server, so there's nothing to edit here.")
+				</div>
+			</div>
+		} else {
+			<div id="settings-editor">
+				@SettingsEditor(d)
+			</div>
+			@settingsReadOnly(d.ReadOnly)
+		}
+	}
+}
+
+// SettingsEditor is the editable tabbed form (its own fragment so the PUT can
+// re-render it in place with the new effective values). It is an Alpine island
+// holding the active tab and a "dirty"-aware submit. When the viewer lacks
+// config:write the inputs are disabled and a note explains why. The form PUTs to
+// /admin/config; the response swaps into #settings-feedback (inline error) and, on
+// success, re-renders #settings-editor with a toast.
+templ SettingsEditor(d SettingsData) {
+	<div class="panel" x-data={ settingsTabState(d.Tabs) }>
+		<div class="panel-head">
+			<span class="panel-title">Configuration</span>
+			if !d.CanWrite {
+				<span class="font-mono text-xs text-fg-faint">read-only — needs config:write</span>
+			}
+		</div>
+		<!-- Tab strip. Each tab is a button toggling the active panel (Alpine). -->
+		<div class="flex flex-wrap gap-1 border-b border-line px-4 pt-3" role="tablist" aria-label="Settings groups">
+			for _, tab := range d.Tabs {
+				<button
+					type="button"
+					class="settings-tab"
+					role="tab"
+					x-bind:aria-selected={ tabSelectedExpr(tab.ID) }
+					x-bind:class={ tabActiveClassExpr(tab.ID) }
+					x-on:click={ tabSetExpr(tab.ID) }
+				>{ tab.Title }</button>
+			}
+		</div>
+		<form
+			class="panel-body flex flex-col gap-5"
+			hx-put="/admin/config"
+			hx-target="#settings-editor"
+			hx-swap="innerHTML"
+		>
+			@csrfField(d.Shell.CSRFToken)
+			for _, tab := range d.Tabs {
+				<div role="tabpanel" x-show={ "active === '" + tab.ID + "'" }>
+					<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+						for _, f := range tab.Fields {
+							@settingsField(f, d.CanWrite)
+						}
+					</div>
+				</div>
+			}
+			<!-- Inline validation feedback target: a field error (HTTP 400) swaps here;
+			     a success toast is appended to #toasts by the response. -->
+			<div id="settings-feedback"></div>
+			if d.CanWrite {
+				<div class="flex items-center justify-end gap-2 border-t border-line pt-4">
+					<button type="submit" class="btn btn-primary">Apply changes</button>
+				</div>
+			}
+		</form>
+	</div>
+}
+
+// settingsField renders one editable (or disabled) field with a persistent label,
+// helper text, the typed input, and — for a behavior-changing field — a consequence
+// warning so the operator understands the live effect before applying. disabled is
+// set when the viewer lacks config:write.
+templ settingsField(f SettingsField, canWrite bool) {
+	<div class="flex flex-col gap-1.5">
+		<label for={ "set-" + f.Name } class="text-sm font-medium text-fg">{ f.Label }</label>
+		switch f.Kind {
+			case FieldSelect:
+				<select id={ "set-" + f.Name } name={ f.Name } class="field" disabled?={ !canWrite }>
+					for _, opt := range f.Options {
+						<option value={ opt } selected?={ opt == f.Value }>{ opt }</option>
+					}
+				</select>
+			case FieldNumber:
+				<input
+					id={ "set-" + f.Name }
+					name={ f.Name }
+					type="number"
+					min={ f.Min }
+					inputmode="numeric"
+					autocomplete="off"
+					value={ f.Value }
+					class="field font-mono"
+					disabled?={ !canWrite }
+				/>
+			default:
+				<input
+					id={ "set-" + f.Name }
+					name={ f.Name }
+					type="text"
+					autocomplete="off"
+					spellcheck="false"
+					value={ f.Value }
+					class="field font-mono"
+					disabled?={ !canWrite }
+				/>
+		}
+		if f.Help != "" {
+			<p class="text-xs text-fg-faint">{ f.Help }</p>
+		}
+		if f.Warning != "" {
+			<p class="flex items-start gap-1.5 text-xs text-warn">
+				<span class="mt-0.5">@iconAlert()</span>
+				<span>{ f.Warning }</span>
+			</p>
+		}
+	</div>
+}
+
+// settingsReadOnly renders the boot-only settings, disabled, with a "restart to
+// change" note so an operator can see the effective values without consulting flags
+// — and understands why they can't be edited here. The PUT rejects any attempt to
+// change them (server-side guard), so this is both informative and honest.
+templ settingsReadOnly(fields []SettingsField) {
+	<div class="mt-4 panel">
+		<div class="panel-head">
+			<span class="panel-title">Boot-only (read-only)</span>
+			<span class="font-mono text-xs text-fg-faint">restart to change</span>
+		</div>
+		<div class="panel-body">
+			<dl class="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2">
+				for _, f := range fields {
+					<div class="flex flex-col gap-0.5">
+						<dt class="text-xs text-fg-faint">{ f.Label }</dt>
+						<dd class="break-words font-mono text-sm text-fg-muted">
+							if f.Value != "" {
+								{ f.Value }
+							} else {
+								<span class="text-fg-faint">—</span>
+							}
+						</dd>
+					</div>
+				}
+			</dl>
+		</div>
+	</div>
+}
+
+// SettingsApplied is the success response to a PUT: the re-rendered editor (with the
+// new effective values) plus a success toast appended out-of-band to #toasts. The
+// editor is re-rendered interactive (the viewer reached this via config:write).
+templ SettingsApplied(d SettingsData, res SettingsResult) {
+	@SettingsEditor(d)
+	<div id="toasts" hx-swap-oob="beforeend">
+		@SettingsToast(res)
+	</div>
+}
+
+// SettingsError is the inline validation error returned on a rejected PUT (HTTP
+// 400): nothing was applied, so the operator sees exactly which field was rejected
+// and why, in place under the form. Status is conveyed by the icon AND the text.
+templ SettingsError(msg string) {
+	<div id="settings-feedback" hx-swap-oob="true">
+		<div class="flex items-start gap-2 rounded-md border border-line bg-danger-soft px-3 py-2 text-sm" role="alert">
+			<span class="text-danger">@iconAlert()</span>
+			<div>
+				<p class="font-medium text-fg">That change wasn't applied</p>
+				<p class="mt-0.5 text-fg-muted">{ msg }</p>
+			</div>
+		</div>
+	</div>
+}
+
+// SettingsToast is the toast a settings PUT swaps in on success or a framing failure
+// (403/503). Status is conveyed by the tone AND the text; it is announced via the
+// toast region's aria-live and auto-dismisses. Mirrors KeyActionToast.
+templ SettingsToast(res SettingsResult) {
+	<div
+		class={ "toast pointer-events-auto", toastTone(res.Tone) }
+		role="status"
+		x-data="{ show: true }"
+		x-show="show"
+		x-init="setTimeout(() => show = false, 6000)"
+	>
+		<span class={ toneText(res.Tone) }>
+			@iconAlert()
+		</span>
+		<div class="min-w-0">
+			<p class="font-medium text-fg">{ res.Title }</p>
+			<p class="mt-0.5 text-fg-muted">{ res.Message }</p>
+		</div>
+	</div>
+}

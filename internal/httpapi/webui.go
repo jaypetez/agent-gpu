@@ -116,6 +116,24 @@ func (s *Server) registerUIRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /admin/keys/{id}/revoke", s.uiScopeAuth(authz.ScopeKeysWrite, http.HandlerFunc(s.handleUIKeyRevoke)))
 	mux.Handle("POST /admin/keys/{id}/permissions", s.uiScopeAuth(authz.ScopeKeysWrite, http.HandlerFunc(s.handleUIKeyPermissions)))
 
+	// Usage + telemetry + logs + settings (#103). The Usage and Telemetry reads are
+	// gated on telemetry:read (the scope GET /v1/admin/usage + /telemetry require);
+	// the Logs reads + the live-tail SSE proxy on logs:read; the Settings READ page
+	// on config:read. The Settings PUT is the console's settings WRITE: gated on
+	// config:write and CSRF-checked in the handler (uiWriteGuard FIRST) before any
+	// mutation, then audited under config.update — exactly like the #101/#102 writes.
+	mux.Handle("GET /admin/usage", s.uiScopeAuth(authz.ScopeTelemetryRead, http.HandlerFunc(s.handleUIUsage)))
+	mux.Handle("GET /admin/partials/usage", s.uiScopeAuth(authz.ScopeTelemetryRead, http.HandlerFunc(s.handleUIUsagePartial)))
+	mux.Handle("GET /admin/telemetry", s.uiScopeAuth(authz.ScopeTelemetryRead, http.HandlerFunc(s.handleUITelemetry)))
+	mux.Handle("GET /admin/partials/telemetry", s.uiScopeAuth(authz.ScopeTelemetryRead, http.HandlerFunc(s.handleUITelemetryPartial)))
+	mux.Handle("GET /admin/logs", s.uiScopeAuth(authz.ScopeLogsRead, http.HandlerFunc(s.handleUILogs)))
+	mux.Handle("GET /admin/partials/logs", s.uiScopeAuth(authz.ScopeLogsRead, http.HandlerFunc(s.handleUILogsPartial)))
+	// The live tail is a GET SSE proxy (the cookie authenticates it; no CSRF needed
+	// for a read), reusing the shared stream machinery — see handleUILogsStream.
+	mux.Handle("GET /admin/logs/stream", s.uiScopeAuth(authz.ScopeLogsRead, http.HandlerFunc(s.handleUILogsStream)))
+	mux.Handle("GET /admin/config", s.uiScopeAuth(authz.ScopeConfigRead, http.HandlerFunc(s.handleUIConfig)))
+	mux.Handle("PUT /admin/config", s.uiScopeAuth(authz.ScopeConfigWrite, http.HandlerFunc(s.handleUIConfigUpdate)))
+
 	assetFS := s.uiAssets
 	if assetFS == nil {
 		assetFS = webui.Assets()
@@ -434,6 +452,7 @@ func (s *Server) buildShell(r *http.Request, key store.APIKey, active webui.Sect
 		{Section: webui.SectionWorkers, Label: "Workers", Href: uiBasePath + "workers", Scope: authz.ScopeWorkersRead, Icon: "workers"},
 		{Section: webui.SectionKeys, Label: "API keys", Href: uiBasePath + "keys", Scope: authz.ScopeKeysRead, Icon: "keys"},
 		{Section: webui.SectionUsage, Label: "Usage", Href: uiBasePath + "usage", Scope: authz.ScopeTelemetryRead, Icon: "usage"},
+		{Section: webui.SectionTelemetry, Label: "Telemetry", Href: uiBasePath + "telemetry", Scope: authz.ScopeTelemetryRead, Icon: "telemetry"},
 		{Section: webui.SectionLogs, Label: "Logs", Href: uiBasePath + "logs", Scope: authz.ScopeLogsRead, Icon: "logs"},
 		{Section: webui.SectionAudit, Label: "Audit", Href: uiBasePath + "audit", Scope: authz.ScopeAuditRead, Icon: "audit"},
 		{Section: webui.SectionConfig, Label: "Settings", Href: uiBasePath + "config", Scope: authz.ScopeConfigRead, Icon: "config"},
@@ -619,6 +638,8 @@ func sectionTitle(sec webui.Section) string {
 		return "API keys"
 	case webui.SectionUsage:
 		return "Usage"
+	case webui.SectionTelemetry:
+		return "Telemetry"
 	case webui.SectionLogs:
 		return "Logs"
 	case webui.SectionAudit:
