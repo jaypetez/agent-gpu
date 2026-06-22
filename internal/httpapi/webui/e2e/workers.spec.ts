@@ -1,15 +1,16 @@
 import { test, expect, type Page } from "@playwright/test";
-import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { SHOT_DIR, expectNoAxeViolations, resolveToken, signIn as sharedSignIn } from "./helpers";
+import { WORKER_ID } from "./global-setup";
 
 // workers.spec.ts — end-to-end coverage of the Workers + GPU management screens
-// (issue 101), driving the REAL built binary. It seeds a live worker by spawning
-// `agentgpu worker start` against the same server the Playwright config started, so
-// the fleet has one connected worker to list, open, and manage. It then asserts the
-// AC flows with role/label locators (never CSS/XPath) and WCAG 2 AA accessibility
-// (axe-core) on each new screen, saving a screenshot per screen as a CI artifact:
+// (issue 101), driving the REAL built binary. The connected worker it manages is
+// seeded ONCE by the Playwright globalSetup (e2e/global-setup.ts) against the same
+// server the config started, so the fleet already has one connected worker to list,
+// open, and manage. It then asserts the AC flows with role/label locators (never
+// CSS/XPath) and WCAG 2 AA accessibility (axe-core) on each new screen, saving a
+// screenshot per screen as a CI artifact:
 //
 //   - the worker list is visible + accessible, with the seeded worker as a link;
 //   - clicking the worker opens its detail (1 click from the list);
@@ -19,90 +20,26 @@ import { join } from "node:path";
 //     worker id is typed verbatim, then ENABLES (AC3 typed-name gating);
 //   - pull and unload are reachable and produce a toast.
 //
-// The worker runs without a reachable Ollama, which is fine: it still registers and
-// heartbeats (the --models fallback seeds its model set), so it appears in the fleet
-// and on the detail page. Model pull/unload DISPATCH to the worker, so those toasts
-// may report a failure (no Ollama) — the test asserts the interaction produces a
-// toast, not a specific success, since the control-plane wiring is covered by the Go
-// handler tests.
-
-const httpPort = process.env.AGENTGPU_E2E_HTTP_PORT || "18080";
-const grpcPort = process.env.AGENTGPU_E2E_GRPC_PORT || "18111";
-const isWindows = process.platform === "win32";
-const binaryName = isWindows ? "agentgpu.exe" : "agentgpu";
-const repoRoot = join(__dirname, "..", "..", "..", "..");
-const binary = process.env.AGENTGPU_BIN || join(repoRoot, binaryName);
-
-// The worker id is deterministic so the spec can type it into the force-evict
-// confirm and target it directly. It is long enough to exercise the shortID
-// truncation in the UI while remaining a single path segment.
-const WORKER_ID = "e2e-worker-0001";
-
-const SHOT_DIR = join(__dirname, "..", "test-results");
-
-function resolveToken(): string {
-  if (process.env.AGENTGPU_E2E_TOKEN) {
-    return process.env.AGENTGPU_E2E_TOKEN;
-  }
-  const stateFile = process.env.AGENTGPU_E2E_STATE_FILE;
-  if (stateFile && existsSync(stateFile)) {
-    return (JSON.parse(readFileSync(stateFile, "utf-8")) as { token: string }).token;
-  }
-  return "";
-}
+// The seeded worker runs without a reachable Ollama, which is fine: it still
+// registers and heartbeats every 1s (the --models fallback seeds its model set), so
+// it appears in the fleet and on the detail page — and re-registers within a poll
+// after the force-evict test deregisters it, so no later test sees a missing worker.
+// Model pull/unload DISPATCH to the worker, so those toasts may report a failure (no
+// Ollama) — the test asserts the interaction produces a toast, not a specific
+// success, since the control-plane wiring is covered by the Go handler tests.
 
 const TOKEN = resolveToken();
 
-async function axeAAViolations(page: Page) {
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
-    .analyze();
-  return results.violations;
-}
-
-function formatViolations(violations: Awaited<ReturnType<typeof axeAAViolations>>) {
-  return violations
-    .map((v) => `  [${v.impact ?? "n/a"}] ${v.id}: ${v.help} (${v.nodes.length} node(s))`)
-    .join("\n");
-}
-
-// signIn runs the real login form and lands on the console root.
+// signIn binds the shared helper to this spec's resolved token.
 async function signIn(page: Page) {
-  await page.goto("/admin/login");
-  await page.getByLabel("Admin API token").fill(TOKEN);
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await page.waitForURL("**/admin/");
+  await sharedSignIn(page, TOKEN);
 }
 
-let worker: ChildProcess | undefined;
-
-test.beforeAll(async () => {
+test.beforeAll(() => {
   mkdirSync(SHOT_DIR, { recursive: true });
   if (!TOKEN) {
     throw new Error("AGENTGPU_E2E_TOKEN was not set by the Playwright config global seed");
   }
-  // Spawn a worker that registers with the running server. GPU detection is off and
-  // a manual GPU type + VRAM are supplied so the worker reports stable capacity
-  // without needing real hardware or a reachable Ollama.
-  worker = spawn(
-    binary,
-    [
-      "worker", "start",
-      "--server", `127.0.0.1:${grpcPort}`,
-      "--id", WORKER_ID,
-      "--models", "llama3",
-      "--gpu-detect=false",
-      "--gpu-type", "NVIDIA RTX 4090",
-      "--total-vram", `${24 * 1024 * 1024 * 1024}`,
-      "--heartbeat-interval", "1s",
-    ],
-    { stdio: "ignore" },
-  );
-  worker.unref?.();
-});
-
-test.afterAll(() => {
-  worker?.kill();
 });
 
 // waitForWorkerRow polls the workers page until the seeded worker's row link is
@@ -123,15 +60,15 @@ test("workers list is accessible and lists the connected worker", async ({ page 
   await expect(page.getByRole("heading", { name: "Workers" })).toBeVisible();
 
   // The GPU heatmap region renders a cell linking to the worker, with a band word.
-  const heatmapLink = page
-    .locator("#gpu-heatmap")
-    .getByRole("link", { name: new RegExp(WORKER_ID.slice(0, 8)) });
+  // The region is addressed by its accessible role + name (role="region",
+  // aria-label="GPU utilization"), never by its #id.
+  const heatmap = page.getByRole("region", { name: "GPU utilization" });
+  const heatmapLink = heatmap.getByRole("link", { name: new RegExp(WORKER_ID.slice(0, 8)) });
   await expect(heatmapLink.first()).toBeVisible();
 
   await page.screenshot({ path: join(SHOT_DIR, "workers-list.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on the workers list:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "the workers list");
 });
 
 test("clicking a worker opens its accessible detail screen", async ({ page }) => {
@@ -151,8 +88,7 @@ test("clicking a worker opens its accessible detail screen", async ({ page }) =>
 
   await page.screenshot({ path: join(SHOT_DIR, "worker-detail.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on the worker detail:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "the worker detail");
 });
 
 test("drain is a medium-friction explicit confirm", async ({ page }) => {

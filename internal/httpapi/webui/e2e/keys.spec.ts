@@ -1,15 +1,16 @@
 import { test, expect, type Page } from "@playwright/test";
-import AxeBuilder from "@axe-core/playwright";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { SHOT_DIR, expectNoAxeViolations, resolveToken, signIn as sharedSignIn, uniqueName } from "./helpers";
 
 // keys.spec.ts — end-to-end coverage of the API keys, users, and permissions
 // screens (issue 102), driving the REAL built binary. Keys live in the in-process
 // store the seeded admin key was minted into, so — unlike the workers spec — no live
-// worker is needed: the spec creates throwaway keys through the UI and manages those,
-// leaving the seeded admin key (which the rest of the run authenticates with)
-// untouched. It asserts the AC flows with role/label locators (never CSS/XPath) and
-// WCAG 2 AA accessibility (axe-core) on the screen and the open create form, saving a
+// worker is needed: the spec creates throwaway keys through the UI (with unique
+// names — the per-spec half of the isolation model) and manages those, leaving the
+// seeded admin key (which the rest of the run authenticates with) untouched. It
+// asserts the AC flows with role/label locators (never CSS/XPath) and WCAG 2 AA
+// accessibility (axe-core) on the screen and the open create form, saving a
 // screenshot per flow as a CI artifact:
 //
 //   - the keys table is visible + accessible, showing a MASK and never a token;
@@ -19,46 +20,11 @@ import { join } from "node:path";
 //     typed verbatim, then ENABLES (AC1 typed-name gating);
 //   - the permissions editor picks roles/scopes from the catalog and saves (AC2).
 
-const SHOT_DIR = join(__dirname, "..", "test-results");
-
-function resolveToken(): string {
-  if (process.env.AGENTGPU_E2E_TOKEN) {
-    return process.env.AGENTGPU_E2E_TOKEN;
-  }
-  const stateFile = process.env.AGENTGPU_E2E_STATE_FILE;
-  if (stateFile && existsSync(stateFile)) {
-    return (JSON.parse(readFileSync(stateFile, "utf-8")) as { token: string }).token;
-  }
-  return "";
-}
-
 const TOKEN = resolveToken();
 
-async function axeAAViolations(page: Page) {
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
-    .analyze();
-  return results.violations;
-}
-
-function formatViolations(violations: Awaited<ReturnType<typeof axeAAViolations>>) {
-  return violations
-    .map((v) => `  [${v.impact ?? "n/a"}] ${v.id}: ${v.help} (${v.nodes.length} node(s))`)
-    .join("\n");
-}
-
-// signIn runs the real login form and lands on the console root.
+// signIn binds the shared helper to this spec's resolved token.
 async function signIn(page: Page) {
-  await page.goto("/admin/login");
-  await page.getByLabel("Admin API token").fill(TOKEN);
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await page.waitForURL("**/admin/");
-}
-
-// uniqueName returns a per-test unique key name so each test's row is unambiguous and
-// tests never collide on the shared store.
-function uniqueName(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  await sharedSignIn(page, TOKEN);
 }
 
 // createKey drives the create modal end-to-end and returns the revealed one-time
@@ -111,8 +77,7 @@ test("keys screen is accessible and shows a mask, never a token", async ({ page 
 
   await page.screenshot({ path: join(SHOT_DIR, "keys-list.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on the keys screen:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "the keys screen");
 });
 
 test("create reveals the new token exactly once with a copy affordance", async ({ page }) => {
@@ -122,8 +87,7 @@ test("create reveals the new token exactly once with a copy affordance", async (
   await page.goto("/admin/keys");
   await page.getByRole("button", { name: "New key" }).click();
   await expect(page.getByRole("dialog", { name: "New API key" })).toBeVisible();
-  const formViolations = await axeAAViolations(page);
-  expect(formViolations, `axe AA violations on the create form:\n${formatViolations(formViolations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "the create form");
   // Close it and run the full create via the helper.
   await page.getByRole("button", { name: "Cancel" }).click();
 
