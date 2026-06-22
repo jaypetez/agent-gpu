@@ -141,3 +141,93 @@ type EventRow struct {
 	Tone    string
 	Message string
 }
+
+// WorkersData backs the Workers screen's initial server render (#101). The shell
+// supplies the chrome; the live worker list + GPU heatmap are loaded by HTMX
+// after first paint from their partials (so the page is instant and the data is
+// always one fresh pull), then refreshed on a calm cadence.
+type WorkersData struct {
+	Shell ShellData
+}
+
+// WorkerListItem is one row of the live worker list (#101): the worker id, its
+// lifecycle status shown as a text-labeled badge plus tone, in-flight jobs, coarse
+// load (0-100), the reported GPU type, free/total VRAM rendered for humans, and a
+// last-seen relative string. Status is ALWAYS conveyed by the text label beside
+// the colored badge, never color alone.
+type WorkerListItem struct {
+	ID         string
+	Status     string
+	Tone       string
+	ActiveJobs uint32
+	Load       uint32
+	GPUType    string
+	VRAM       string
+	LastSeen   string
+}
+
+// WorkerDetail backs the per-worker detail screen (#101). It is the rich
+// projection an operator needs on one worker — the same fields GET
+// /v1/admin/workers/{id} exposes — plus the derived presentation strings (status
+// tone/word, human VRAM, uptime, last-seen) and the loaded model list the
+// pull/unload controls act on. Draining gates which write controls are offered.
+type WorkerDetail struct {
+	ID         string
+	Status     string
+	Tone       string
+	Draining   bool
+	ActiveJobs uint32
+	Load       uint32
+	LoadTone   string
+	GPUType    string
+	TotalVRAM  string
+	FreeVRAM   string
+	UsedPct    int
+	LastSeen   string
+	Uptime     string
+	Models     []string
+	// LogsHref is the deep link to this worker's logs (the logs page lands in
+	// #103); the detail screen offers it as a "View logs" affordance so an operator
+	// reaches a stalled worker's logs within ~3 clicks from the dashboard (AC1).
+	LogsHref string
+}
+
+// HeatCell is one cell of the GPU utilization heatmap (#101): one WORKER (the
+// fleet snapshot tracks GPU capacity per worker, not per device — see admin_gpu.go).
+// It carries the worker id, the coarse load 0-100, a load BAND (ok/watch/hot —
+// the green<60 / yellow 60-85 / red>85 thresholds of AC2) conveyed by both a tone
+// color AND a text label, the human VRAM usage, and the link to the worker's
+// detail (one click from a cell, AC2).
+type HeatCell struct {
+	ID       string
+	Load     uint32
+	Band     string
+	BandWord string
+	Tone     string
+	VRAM     string
+	Href     string
+}
+
+// HeatmapData backs the GPU heatmap partial (#101): the per-worker cells plus the
+// fleet roll-up an operator reads above the grid (worker count, mean/max load,
+// free/total VRAM). It is computed from the same aggregation behind GET
+// /v1/admin/gpus so the console and the API never disagree.
+type HeatmapData struct {
+	Cells       []HeatCell
+	WorkerCount int
+	MeanLoad    uint32
+	MaxLoad     uint32
+	MeanTone    string
+	TotalVRAM   string
+	FreeVRAM    string
+}
+
+// WorkerActionResult backs the inline toast a write action (drain/evict/pull/
+// unload) swaps in on success or failure (#101). Status is conveyed by the tone
+// AND the text, and the message is in the operator's voice. It is announced via
+// the toast region's aria-live.
+type WorkerActionResult struct {
+	Tone    string
+	Title   string
+	Message string
+}

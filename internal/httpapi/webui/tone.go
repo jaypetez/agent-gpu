@@ -68,6 +68,70 @@ func toneBar(tone string) string {
 	}
 }
 
+// LoadTone maps a coarse worker load (0-100) to a status tone using the heatmap
+// thresholds of issue #101 AC2: green (ok) below 60, yellow (warn) 60-85, red
+// (danger) above 85. It is exported because the httpapi layer projects fleet
+// snapshots into heatmap cells and needs the SAME thresholds the cells render, so
+// the band color and the band word never diverge.
+func LoadTone(load uint32) string {
+	switch {
+	case load > 85:
+		return ToneDanger
+	case load >= 60:
+		return ToneWarn
+	default:
+		return ToneOK
+	}
+}
+
+// LoadBandWord is the text label that rides ALONGSIDE the heatmap cell's color so
+// the band reads in grayscale and to a screen reader (AC2: text labels, not color
+// alone). It uses operator vocabulary for utilization: "ok" / "busy" / "hot".
+func LoadBandWord(load uint32) string {
+	switch {
+	case load > 85:
+		return "hot"
+	case load >= 60:
+		return "busy"
+	default:
+		return "ok"
+	}
+}
+
+// toastTone maps a tone to the toast variant class (.toast-ok / …), which colors
+// the toast's left rule. The toast always carries a text title + message, so the
+// tone is reinforcement, never the sole signal (AC3/AC4). An unknown tone falls
+// back to the informational variant.
+func toastTone(tone string) string {
+	switch tone {
+	case ToneOK:
+		return "toast-ok"
+	case ToneWarn:
+		return "toast-warn"
+	case ToneDanger:
+		return "toast-danger"
+	default:
+		return "toast-info"
+	}
+}
+
+// heatCell maps a tone to the heatmap cell's fill + text classes. The fill is a
+// soft, low-chroma tint of the tone (so a wall of cells is calm, not garish) and
+// the foreground is the full-strength tone for the load number — both
+// token-derived, so no raw color appears in a template.
+func heatCell(tone string) string {
+	switch tone {
+	case ToneOK:
+		return "bg-ok-soft text-ok"
+	case ToneWarn:
+		return "bg-warn-soft text-warn"
+	case ToneDanger:
+		return "bg-danger-soft text-danger"
+	default:
+		return "bg-surface-2 text-fg-muted"
+	}
+}
+
 // toneWord is the short status word shown beside a KPI value, so the KPI's health
 // is stated in words and not only in the value's color (AC3). It deliberately uses
 // operator vocabulary: "ok" / "watch" / "alert".
