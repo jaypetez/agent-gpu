@@ -19,10 +19,14 @@ import { join } from "node:path";
 // seeded {storePath, token} is persisted to a fixed state file under the OS temp
 // dir; the first eval seeds and writes it, every later eval reads it.
 
-const repoRoot = join(__dirname, "..");
+// This config lives at internal/httpapi/webui/ (co-located with the console source
+// so the Tailwind build resolves tailwindcss from node_modules — see package.json),
+// so the repo root is three levels up.
+const repoRoot = join(__dirname, "..", "..", "..");
 const isWindows = process.platform === "win32";
 const binaryName = isWindows ? "agentgpu.exe" : "agentgpu";
-// `make ui-e2e` / CI builds the binary at the repo root; allow an override.
+// `make ui-e2e` / CI builds the binary at the repo root and passes AGENTGPU_BIN;
+// the repoRoot fallback covers a bare `npx playwright test` from this dir.
 const binary = process.env.AGENTGPU_BIN || join(repoRoot, binaryName);
 
 const httpPort = process.env.AGENTGPU_E2E_HTTP_PORT || "18080";

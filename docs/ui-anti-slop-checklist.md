@@ -15,10 +15,10 @@ Status key: `[x]` met · `[~]` partially/deferred (with note) · `[ ]` not met.
   `[...]` in `.templ`), AA-contrast computation over the committed tokens.
 - `go test ./internal/httpapi/...` — login, cookie auth, CSRF, logout, role-based
   sidebar gating, `tokenFromRequest` precedence, route-sync stays at 31.
-- `ui/` Playwright + `@axe-core/playwright` — login → dashboard → logout against the
-  real binary, with **WCAG AA axe assertions** on login + shell + dashboard (the CI
-  `e2e` job fails on any violation). A dashboard screenshot is archived as an
-  artifact.
+- `internal/httpapi/webui/` Playwright + `@axe-core/playwright` — login → dashboard →
+  logout against the real binary, with **WCAG AA axe assertions** on login + shell +
+  dashboard (the CI `e2e` job fails on any violation). A dashboard screenshot is
+  archived as an artifact.
 
 ## Design system & tokens
 

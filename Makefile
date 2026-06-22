@@ -6,16 +6,20 @@
 #   protoc-gen-go-grpc v1.5.1
 #   goreleaser         v2.16.0
 #   templ              v0.3.1020   (admin console codegen, #100)
-#   tailwindcss        v4.1.16     (admin console CSS, #100; via ui/package.json)
+#   tailwindcss        v4.1.16     (admin console CSS, #100; via internal/httpapi/webui/package.json)
 BUF_VERSION             := v1.50.0
 PROTOC_GEN_GO_VERSION   := v1.36.6
 PROTOC_GEN_GRPC_VERSION := v1.5.1
 GORELEASER_VERSION      := v2.16.0
 TEMPL_VERSION           := v0.3.1020
 
-# Admin console (#100) source/build locations.
+# Admin console (#100) source/build locations. The Node toolchain (package.json,
+# lockfile, node_modules) lives INSIDE the console package dir so that node_modules
+# is an ancestor of assets/css/input.css — Tailwind v4 resolves `@import
+# "tailwindcss"` from the input file's directory walking up, so co-locating is what
+# makes a clean `npm ci` build resolve the package (it is NOT a separate ui/ dir).
 WEBUI_DIR  := internal/httpapi/webui
-UI_DIR     := ui
+UI_DIR     := $(WEBUI_DIR)
 TEMPL      ?= go run github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION)
 
 GORELEASER ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
@@ -70,7 +74,7 @@ ui-verify: ui ## Regenerate the console and FAIL if the committed artifacts drif
 .PHONY: ui-e2e
 ui-e2e: ## Run the Playwright + axe-core accessibility E2E against a built binary (#100)
 	$(GO) build -o agentgpu ./cmd/agentgpu
-	cd $(UI_DIR) && npm install --no-audit --no-fund && npm run test:e2e:install && npm run test:e2e
+	cd $(UI_DIR) && npm install --no-audit --no-fund && npm run test:e2e:install && AGENTGPU_BIN="$(CURDIR)/agentgpu" npm run test:e2e
 
 .PHONY: openapi-lint
 openapi-lint: ## Validate openapi.yaml (OpenAPI 3.1 + recommended ruleset) via the pinned Redocly image

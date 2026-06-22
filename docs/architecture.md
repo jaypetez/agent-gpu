@@ -1129,9 +1129,14 @@ Pinned tool versions:
 | `@playwright/test`     | v1.56.0    |
 | `@axe-core/playwright` | v4.10.2    |
 
-The Node toolchain lives in `ui/package.json` (pinned + lockfile); `make ui` builds
-the CSS and `make ui-e2e` runs the Playwright + axe-core accessibility E2E (the CI
-`e2e` job is the WCAG AA arbiter). HTMX and Alpine versions + hashes are in
+The Node toolchain lives in `internal/httpapi/webui/package.json` (pinned + lockfile),
+co-located with the console source so a clean `npm ci` resolves `tailwindcss`:
+Tailwind v4 resolves `@import "tailwindcss"` via Node module resolution starting from
+the input CSS file's directory (`assets/css/input.css`) and walking up, so its
+`node_modules` must be an ancestor — which it is when the project sits at the package
+root rather than in a separate top-level `ui/` dir. `make ui` builds the CSS and
+`make ui-e2e` runs the Playwright + axe-core accessibility E2E (the CI `e2e` job is
+the WCAG AA arbiter). HTMX and Alpine versions + hashes are in
 `internal/httpapi/webui/assets/js/VENDOR.md`.
 
 > **Production TLS.** The in-process HTTP server speaks plain HTTP, so the session

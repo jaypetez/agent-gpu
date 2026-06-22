@@ -18,7 +18,18 @@
  * and `templ generate`; both outputs are committed so `go build` needs no Node.
  */
 
-@import "tailwindcss";
+/* `source(none)` disables Tailwind v4's automatic content detection so the build
+ * scans ONLY the explicit @source globs below — never the rest of the directory
+ * tree. This is load-bearing: the npm project (and node_modules) is co-located at
+ * the package root internal/httpapi/webui/ so that Tailwind can resolve this
+ * `@import "tailwindcss"` (v4 resolves it from the input file's directory walking
+ * up). With auto-detection ON, that same co-location would also scan the package's
+ * .go files — including token_lint_test.go, whose fixtures contain forbidden
+ * arbitrary-value classes (bg-[rgb(1,2,3)], w-[37px], …) — and leak them into the
+ * shipped app.css, violating the token-only design system (AC3). Pinning the
+ * sources explicitly keeps the output deterministic and independent of what else
+ * lives alongside the project. */
+@import "tailwindcss" source(none);
 
 /* templ output is compiled Go, but Tailwind must still scan the .templ SOURCES to
  * know which utilities are used. Point the content scanner at them explicitly.
