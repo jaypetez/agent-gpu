@@ -540,6 +540,13 @@
   .tnum {
     font-variant-numeric: tabular-nums;
   }
+  /* x-cloak hides an Alpine island until Alpine initializes, so an element that
+   * defaults to x-show="false" (the drain confirm, the force-evict modal) never
+   * flashes visible on first paint before the script boots. Alpine removes the
+   * attribute once ready. */
+  [x-cloak] {
+    display: none !important;
+  }
   /* Skeleton block for loading states. */
   .skeleton {
     background: linear-gradient(

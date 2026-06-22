@@ -88,6 +88,23 @@ func (s *Server) registerUIRoutes(mux *http.ServeMux) {
 	// collectOverview).
 	mux.Handle("GET /admin/partials/overview", s.uiScopeAuth(authz.ScopeTelemetryRead, http.HandlerFunc(s.handleUIOverviewPartial)))
 
+	// Workers + GPU management (#101). Reads are gated on workers:read; the live
+	// heatmap + worker-list partials refresh under the same scope. Writes mirror the
+	// JSON admin scopes exactly: drain/evict on workers:write, pull/unload on
+	// models:write. Every write handler additionally enforces the double-submit CSRF
+	// check (s.csrfOK via uiWriteGuard) before touching the control plane.
+	mux.Handle("GET /admin/workers", s.uiScopeAuth(authz.ScopeWorkersRead, http.HandlerFunc(s.handleUIWorkers)))
+	mux.Handle("GET /admin/workers/{id}", s.uiScopeAuth(authz.ScopeWorkersRead, http.HandlerFunc(s.handleUIWorkerDetail)))
+	mux.Handle("GET /admin/partials/gpu-heatmap", s.uiScopeAuth(authz.ScopeWorkersRead, http.HandlerFunc(s.handleUIHeatmapPartial)))
+	mux.Handle("GET /admin/partials/worker-list", s.uiScopeAuth(authz.ScopeWorkersRead, http.HandlerFunc(s.handleUIWorkerListPartial)))
+	mux.Handle("POST /admin/workers/{id}/drain", s.uiScopeAuth(authz.ScopeWorkersWrite, http.HandlerFunc(s.handleUIWorkerDrain)))
+	mux.Handle("POST /admin/workers/{id}/evict", s.uiScopeAuth(authz.ScopeWorkersWrite, http.HandlerFunc(s.handleUIWorkerEvict)))
+	mux.Handle("POST /admin/workers/{id}/models", s.uiScopeAuth(authz.ScopeModelsWrite, http.HandlerFunc(s.handleUIWorkerPull)))
+	// {model...} is a trailing wildcard (matching the JSON unload route) because a
+	// model ref can contain slashes (e.g. "library/llama3:8b"); r.PathValue("model")
+	// yields the full remainder.
+	mux.Handle("DELETE /admin/workers/{id}/models/{model...}", s.uiScopeAuth(authz.ScopeModelsWrite, http.HandlerFunc(s.handleUIWorkerUnload)))
+
 	assetFS := s.uiAssets
 	if assetFS == nil {
 		assetFS = webui.Assets()

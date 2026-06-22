@@ -3,6 +3,8 @@ package httpapi
 import (
 	"net/http"
 	"sort"
+
+	"github.com/jaypetez/agent-gpu/internal/types"
 )
 
 // GPU/fleet capacity inventory (#94): an aggregated, read-only view over the
@@ -80,8 +82,18 @@ type adminGPUCell struct {
 // 401 before this runs. This is a pure read and is not audited (matching the
 // other admin read endpoints).
 func (s *Server) handleAdminGPUs(w http.ResponseWriter, r *http.Request) {
-	fleet := s.fleet.Fleet()
+	writeJSON(w, http.StatusOK, aggregateGPUs(s.fleet.Fleet()))
+}
 
+// aggregateGPUs reduces a fleet snapshot into the GPU capacity inventory: a fleet
+// roll-up (worker count, summed total/free VRAM, mean/max load), a per-GPU-type
+// grouping (sorted by gpu_type), and the per-worker heatmap cells (sorted by id).
+// It performs NO probing — it folds the existing heartbeat capacity fields — and
+// is deterministic over a given snapshot. Extracted so BOTH the JSON endpoint
+// (#94) and the console's GPU heatmap (#101) reduce the fleet identically and can
+// never disagree. An empty fleet yields zero aggregates and empty (non-null)
+// arrays.
+func aggregateGPUs(fleet []types.Worker) adminGPUsResponse {
 	// Fleet roll-up: sum VRAM and load, track the max load, over a single pass.
 	var totalVRAM, freeVRAM uint64
 	var loadSum uint64
@@ -136,7 +148,7 @@ func (s *Server) handleAdminGPUs(w http.ResponseWriter, r *http.Request) {
 	// Cells sorted by worker id for a stable heatmap layout across calls.
 	sort.Slice(cells, func(i, j int) bool { return cells[i].ID < cells[j].ID })
 
-	writeJSON(w, http.StatusOK, adminGPUsResponse{
+	return adminGPUsResponse{
 		Fleet: adminGPUFleet{
 			WorkerCount: len(fleet),
 			TotalVRAM:   totalVRAM,
@@ -146,5 +158,5 @@ func (s *Server) handleAdminGPUs(w http.ResponseWriter, r *http.Request) {
 		},
 		ByType:  byTypeRows,
 		Workers: cells,
-	})
+	}
 }
