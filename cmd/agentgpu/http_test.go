@@ -24,6 +24,7 @@ type adminStub struct {
 type recordedReq struct {
 	method string
 	path   string
+	query  string // raw URL query string (RawQuery), for asserting filter encoding
 	auth   string
 	body   map[string]any
 }
@@ -39,7 +40,7 @@ func newAdminStub(t *testing.T, routes map[string]stubResponse) *adminStub {
 	t.Helper()
 	a := &adminStub{response: routes}
 	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a.lastReq = recordedReq{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization")}
+		a.lastReq = recordedReq{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery, auth: r.Header.Get("Authorization")}
 		if b, _ := io.ReadAll(r.Body); len(b) > 0 {
 			a.lastReq.body = map[string]any{}
 			_ = json.Unmarshal(b, &a.lastReq.body)

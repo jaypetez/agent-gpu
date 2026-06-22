@@ -3,16 +3,24 @@
 //
 //	agentgpu server start
 //	agentgpu worker start --server host:port
+//	agentgpu key create --name <name> --local --role admin   # one-time bootstrap
 //	agentgpu key create --name <name>            # manage a running server
-//	agentgpu key create --name <name> --local --role admin   # offline bootstrap
 //	agentgpu quota set <id> --rpm N
 //	agentgpu models list
+//	agentgpu config get
+//	agentgpu workers list
+//	agentgpu audit --op key.create
+//	agentgpu usage --team platform
+//	agentgpu users --by owner
 //
-// The key/quota/models commands act against a RUNNING server over its public
-// HTTP admin API by default (so a revoke or quota change takes effect
-// immediately); --local switches key/quota to the on-disk store for offline
-// bootstrap. See mode.go for the selection rules and exitCode below for the exit
-// codes.
+// The management commands (key, quota, models, config, workers, audit, usage,
+// users, gpus, telemetry, logs) act against a RUNNING server over its public HTTP
+// admin API, so a change takes effect immediately. --local is the API-first
+// exception: it is restricted to ONE-TIME BOOTSTRAP — minting the first admin key
+// into an empty on-disk store before any server runs. Once the store has keys,
+// every mutating --local operation is rejected and directs the operator to the
+// --server HTTP path. See mode.go for the selection rules and the bootstrap guard,
+// and exitCode below for the exit codes.
 package main
 
 import (
@@ -133,30 +141,43 @@ func usage(w io.Writer) {
 Usage:
   agentgpu server start [--listen host:port] [--http-listen host:port] [flags]
   agentgpu worker start --server host:port [--id worker-id] [flags]
-  agentgpu key    <create|list|revoke|rotate|perms|quota> [flags]
-  agentgpu quota  <set|show> <id> [flags]
-  agentgpu models list [--json|--openai]
-  agentgpu loadtest [--mode remote|inproc] [flags]
+  agentgpu key       <create|list|revoke|rotate|perms|quota> [flags]
+  agentgpu quota     <set|show> <id> [flags]
+  agentgpu models    list [--json|--openai]
+  agentgpu config    <get|set field=value ...>
+  agentgpu workers   <list|detail|drain|pull|unload> [args]
+  agentgpu audit     [--actor id] [--op name] [--since when] [flags]
+  agentgpu usage     [--key id] [--owner label] [--team label]
+  agentgpu users     [--by owner|team]
+  agentgpu gpus
+  agentgpu telemetry
+  agentgpu logs      [--level lvl] [--since when] [flags]
+  agentgpu loadtest  [--mode remote|inproc] [flags]
   agentgpu version
 
-The key, quota, and models commands act against a RUNNING server over its public
-HTTP admin API, so changes (revoke, quota updates) take effect immediately. Pass
-an admin token via --token or AGENTGPU_TOKEN and the server URL via --server or
-AGENTGPU_HTTP_ADDR (default http://127.0.0.1:8080).
+The management commands (key, quota, models, config, workers, audit, usage, users,
+gpus, telemetry, logs) act against a RUNNING server over its public HTTP admin API,
+so changes take effect immediately. Pass an admin token via --token or
+AGENTGPU_TOKEN and the server URL via --server or AGENTGPU_HTTP_ADDR (default
+http://127.0.0.1:8080).
 
   agentgpu key create --name app --token <admin-token>
-  agentgpu key revoke <id> --token <admin-token>
   agentgpu quota set <id> --rpm 60 --token <admin-token>
-  agentgpu models list --token <admin-token>
+  agentgpu config set log_level=debug --token <admin-token>
+  agentgpu workers list --token <admin-token>
+  agentgpu audit --op key.create --since 24h --token <admin-token>
 
-Offline bootstrap (no server running): mint the first admin key directly into the
-on-disk store with --local, then start the server (it loads the store at boot):
+One-time bootstrap (no server running): mint the FIRST admin key directly into an
+empty on-disk store with --local, then start the server (it loads the store at
+boot):
 
   agentgpu key create --name bootstrap --role admin --local
   # ...start the server, then export AGENTGPU_TOKEN=<that token>...
 
-Note: --local writes the store file; a running server does not see the change
-until it is restarted. Use the HTTP mode (a --token) to manage a live server.
+Note: --local is restricted to this bootstrap. It writes the store file (a running
+server does not see the change until it restarts), and once the store has keys
+every mutating --local operation is rejected — use the HTTP mode (a --token) to
+manage a live server.
 
 Global configuration (flag > environment > default):
   --server / --url   AGENTGPU_HTTP_ADDR   HTTP API base URL (default http://127.0.0.1:8080)

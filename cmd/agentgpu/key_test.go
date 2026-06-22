@@ -8,10 +8,13 @@ import (
 	"testing"
 )
 
-// TestKeyCLIFlow exercises the key subcommand end-to-end against a temp store:
-// create -> list -> rotate -> revoke. It also asserts the one-time token notice
-// is printed and that list never prints a secret.
-func TestKeyCLIFlow(t *testing.T) {
+// TestKeyCLILocalBootstrap exercises the --local BOOTSTRAP path (#104): minting the
+// first admin key into an empty on-disk store succeeds (the one-time token notice
+// is printed), and `key list` reads the store back without leaking a secret.
+// Runtime mutations against the now-populated store are forbidden in --local mode
+// and are covered by TestLocalBootstrapGuard; the create -> rotate -> revoke
+// lifecycle against a running server is covered by http_test.go.
+func TestKeyCLILocalBootstrap(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "keys.json")
@@ -28,7 +31,7 @@ func TestKeyCLIFlow(t *testing.T) {
 		return out.String()
 	}
 
-	created := run("create", "--name", "cli-agent")
+	created := run("create", "--name", "cli-agent", "--role", "admin")
 	if !strings.Contains(created, "Token: agpu_") {
 		t.Fatalf("create did not print a token: %q", created)
 	}
@@ -47,22 +50,6 @@ func TestKeyCLIFlow(t *testing.T) {
 	secret := strings.SplitN(token, "_", 3)[2]
 	if strings.Contains(list, secret) {
 		t.Fatal("list leaked the secret")
-	}
-
-	rotated := run("rotate", id)
-	if !strings.Contains(rotated, "Token: agpu_") {
-		t.Fatalf("rotate did not print a token: %q", rotated)
-	}
-	if extractToken(t, rotated) == token {
-		t.Fatal("rotate returned the same token")
-	}
-
-	revoked := run("revoke", id)
-	if !strings.Contains(revoked, "Revoked key "+id) {
-		t.Fatalf("revoke output: %q", revoked)
-	}
-	if after := run("list"); !strings.Contains(after, "true") {
-		t.Fatalf("list should show revoked=true: %q", after)
 	}
 }
 
