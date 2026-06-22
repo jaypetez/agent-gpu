@@ -101,6 +101,51 @@ cover: ## Run tests with coverage and print the total (mirrors CI; no -race so i
 cover-html: cover ## Render the coverage profile to coverage.html and open it
 	$(GO) tool cover -html=coverage.out -o coverage.html
 
+# ---------------------------------------------------------------------------
+# Layered agentic E2E gate (#105)
+#
+# test-e2e and test-all are the single-command, single-exit-code gates an agent
+# (or a developer) runs to know the whole suite is green before pushing. Both emit
+# machine-parseable JSON artifacts under $(TEST_RESULTS_DIR) (gitignored) AND keep
+# the human-readable stream, so a failure is legible enough to fix in one loop.
+#
+# The recipes need bash for `set -o pipefail` — so the pipeline's exit status
+# reflects `go test` (not the tee/printf it is piped through). The shell override
+# is target-scoped so the rest of the Makefile keeps its default shell. CI runs
+# these on ubuntu (bash present); the full -race+coverage gate is evaluated there.
+TEST_RESULTS_DIR := test-results
+GO_TEST_JSON     := $(TEST_RESULTS_DIR)/go-test.json
+GO_RACE_JSON     := $(TEST_RESULTS_DIR)/go-test-race.json
+
+.PHONY: test-e2e
+test-e2e: SHELL := bash
+test-e2e: .SHELLFLAGS := -eu -o pipefail -c
+test-e2e: ## Layered E2E: Go unit+httptest (JSON) + Playwright+axe, ONE pass/fail exit code (#105)
+	@mkdir -p $(TEST_RESULTS_DIR)
+	@echo ">> Go unit + httptest (machine-parseable JSON -> $(GO_TEST_JSON))"
+	$(GO) test -json ./... | tee $(GO_TEST_JSON) | $(GO) run ./internal/cmd/testsummary
+	@echo ">> Playwright + axe accessibility E2E (JSON -> $(WEBUI_DIR)/test-results/results.json)"
+	$(MAKE) ui-e2e
+
+.PHONY: test-all
+test-all: SHELL := bash
+test-all: .SHELLFLAGS := -eu -o pipefail -c
+test-all: ## Full gate: Go -race+coverage (JSON) + Playwright+axe + compose smoke, ONE exit code (#105)
+	@mkdir -p $(TEST_RESULTS_DIR)
+	@echo ">> Go -race + coverage (mirrors CI; needs cgo — Linux/CI or a Windows box with gcc)"
+	@echo "   (machine-parseable JSON -> $(GO_RACE_JSON))"
+	$(GO) test -race -covermode=atomic -coverprofile=coverage.out -json ./... \
+		| tee $(GO_RACE_JSON) | $(GO) run ./internal/cmd/testsummary
+	$(GO) tool cover -func=coverage.out | tail -1
+	@echo ">> Playwright + axe accessibility E2E"
+	$(MAKE) ui-e2e
+	@echo ">> Compose infra smoke (build + register + persist + infer); set SKIP_COMPOSE=1 to skip"
+	@if [ "$${SKIP_COMPOSE:-0}" = "1" ]; then \
+		echo "   SKIP_COMPOSE=1 — skipping the Docker/inference smoke"; \
+	else \
+		$(MAKE) compose-e2e; \
+	fi
+
 .PHONY: vet
 vet: ## Run go vet
 	$(GO) vet ./...
