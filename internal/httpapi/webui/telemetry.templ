@@ -30,8 +30,12 @@ templ Telemetry(d TelemetryData) {
 				<span>Refresh</span>
 			</button>
 		</div>
+		<!-- The region role + label name the board as a landmark so tests (and
+		     assistive tech) address it by role, not by its #id. -->
 		<div
 			id="telemetry-board"
+			role="region"
+			aria-label="Telemetry"
 			hx-get={ d.Shell.AssetPath + "/../partials/telemetry" }
 			hx-trigger="load, every 10s"
 			hx-swap="outerHTML"
@@ -47,6 +51,8 @@ templ Telemetry(d TelemetryData) {
 templ TelemetryBoardPartial(assetPath string, b TelemetryBoard) {
 	<div
 		id="telemetry-board"
+		role="region"
+		aria-label="Telemetry"
 		hx-get={ assetPath + "/../partials/telemetry" }
 		hx-trigger="every 10s"
 		hx-swap="outerHTML"
@@ -172,7 +178,7 @@ templ affinityPanel(a TelemetryAffinity) {
 
 // TelemetryLoading is the board's first-paint skeleton (loading state).
 templ TelemetryLoading() {
-	<div id="telemetry-board" aria-busy="true">
+	<div id="telemetry-board" role="region" aria-label="Telemetry" aria-busy="true">
 		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
 			for range 3 {
 				<div class="panel panel-body">
@@ -196,7 +202,7 @@ templ TelemetryLoading() {
 // TelemetryError is the board's error state: an in-voice notice with a retry that
 // re-fetches the region.
 templ TelemetryError(assetPath, msg string) {
-	<div id="telemetry-board">
+	<div id="telemetry-board" role="region" aria-label="Telemetry">
 		<div class="panel">
 			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
 				<span class="text-danger">

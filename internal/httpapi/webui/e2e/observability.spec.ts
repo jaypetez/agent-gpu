@@ -1,13 +1,15 @@
 import { test, expect, type Page } from "@playwright/test";
-import AxeBuilder from "@axe-core/playwright";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { BASE_URL, SHOT_DIR, expectNoAxeViolations, resolveToken, signIn as sharedSignIn } from "./helpers";
 
 // observability.spec.ts — end-to-end coverage of the Usage, Telemetry, Logs, and
 // Settings screens (issue 103), driving the REAL built binary the Playwright config
-// started. It asserts the AC flows with role/label locators (never CSS/XPath) and
-// WCAG 2 AA accessibility (axe-core) on each screen, saving a screenshot per screen
-// as a CI artifact:
+// started. The globalSetup already seeded a connected worker + sample stats traffic,
+// so these screens render populated, deterministic data on a clean run. It asserts
+// the AC flows with role/label locators (never CSS/XPath) and WCAG 2 AA
+// accessibility (axe-core) on each screen, saving a screenshot per screen as a CI
+// artifact:
 //
 //   - Usage renders consumption METERS (progress bars) and, for a key with history,
 //     a 7-day sparkline + a run-out forecast — never a pie chart.
@@ -20,44 +22,15 @@ import { join } from "node:path";
 //
 // The admin key the config seeds holds the admin role, so it satisfies every read
 // scope plus config:write. Usage/telemetry/logs all read live in-process state; to
-// give the buffered log view something to filter, the spec first generates a little
-// traffic against the public API (which logs request lines).
-
-const httpPort = process.env.AGENTGPU_E2E_HTTP_PORT || "18080";
-const SHOT_DIR = join(__dirname, "..", "test-results");
-
-function resolveToken(): string {
-  if (process.env.AGENTGPU_E2E_TOKEN) {
-    return process.env.AGENTGPU_E2E_TOKEN;
-  }
-  const stateFile = process.env.AGENTGPU_E2E_STATE_FILE;
-  if (stateFile && existsSync(stateFile)) {
-    return (JSON.parse(readFileSync(stateFile, "utf-8")) as { token: string }).token;
-  }
-  return "";
-}
+// give the buffered log view extra lines to filter on top of the global seed, the
+// log spec generates a little more traffic against the admin API (which logs request
+// lines) before asserting.
 
 const TOKEN = resolveToken();
 
-async function axeAAViolations(page: Page) {
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
-    .analyze();
-  return results.violations;
-}
-
-function formatViolations(violations: Awaited<ReturnType<typeof axeAAViolations>>) {
-  return violations
-    .map((v) => `  [${v.impact ?? "n/a"}] ${v.id}: ${v.help} (${v.nodes.length} node(s))`)
-    .join("\n");
-}
-
-// signIn runs the real login form and lands on the console root.
+// signIn binds the shared helper to this spec's resolved token.
 async function signIn(page: Page) {
-  await page.goto("/admin/login");
-  await page.getByLabel("Admin API token").fill(TOKEN);
-  await page.getByRole("button", { name: "Sign in" }).click();
-  await page.waitForURL("**/admin/");
+  await sharedSignIn(page, TOKEN);
 }
 
 // generateLogTraffic makes a few authenticated API calls so the in-memory log ring
@@ -66,7 +39,7 @@ async function signIn(page: Page) {
 async function generateLogTraffic(page: Page) {
   for (let i = 0; i < 6; i++) {
     await page
-      .request.get(`http://127.0.0.1:${httpPort}/v1/admin/stats`, {
+      .request.get(`${BASE_URL}/v1/admin/stats`, {
         headers: { Authorization: `Bearer ${TOKEN}` },
       })
       .catch(() => undefined);
@@ -86,18 +59,23 @@ test("usage screen shows progress meters, not pies, and is accessible", async ({
   await expect(page.getByRole("heading", { name: "Usage" })).toBeVisible();
 
   // The board loads via HTMX; the admin key's own row appears with consumption
-  // meters (progress bars labeled by dimension), never a pie chart.
-  const board = page.locator("#usage-board");
+  // meters (progress bars labeled by dimension), never a pie chart. The board is
+  // addressed by its accessible role + name (role="region", aria-label="Usage"),
+  // never by its #id.
+  const board = page.getByRole("region", { name: "Usage" });
   await expect(board.getByText("Daily tokens").first()).toBeVisible({ timeout: 15_000 });
   // The meters are role=img bars with an accessible label naming the dimension.
   await expect(board.getByRole("img", { name: /Daily tokens/ }).first()).toBeVisible();
-  // No pie/canvas charting — the screen is bar-based by design.
+  // No pie/canvas charting — the screen is bar-based by design. This is a structural
+  // ABSENCE assertion (a forbidden element must not exist), not a control selector,
+  // so it is expressed as an element-count check rather than a role query: there is
+  // no ARIA role for "a canvas that should not be here". The role-based meter
+  // assertions above are what verify the affordances themselves.
   await expect(page.locator("canvas")).toHaveCount(0);
 
   await page.screenshot({ path: join(SHOT_DIR, "usage.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on usage:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "usage");
 });
 
 test("telemetry dashboard renders the metric panels and is accessible", async ({ page }) => {
@@ -105,7 +83,9 @@ test("telemetry dashboard renders the metric panels and is accessible", async ({
   await page.goto("/admin/telemetry");
   await expect(page.getByRole("heading", { name: "Telemetry" })).toBeVisible();
 
-  const board = page.locator("#telemetry-board");
+  // The board is addressed by its accessible role + name (role="region",
+  // aria-label="Telemetry"), never by its #id.
+  const board = page.getByRole("region", { name: "Telemetry" });
   // The KPI strip + the named panels render from the live collectors.
   await expect(board.getByText("Requests").first()).toBeVisible({ timeout: 15_000 });
   await expect(board.getByText("Request latency")).toBeVisible();
@@ -114,8 +94,7 @@ test("telemetry dashboard renders the metric panels and is accessible", async ({
 
   await page.screenshot({ path: join(SHOT_DIR, "telemetry.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on telemetry:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "telemetry");
 });
 
 test("logs filtering reduces the buffered line volume", async ({ page }) => {
@@ -125,14 +104,17 @@ test("logs filtering reduces the buffered line volume", async ({ page }) => {
   // A wide view first: level=debug shows the most lines (the warn floor is widened).
   await page.goto("/admin/logs?level=debug");
   await expect(page.getByRole("heading", { name: "Logs" })).toBeVisible();
-  const table = page.locator("#log-table");
+  // The buffered-line table is addressed by its accessible role + name
+  // (role="region", aria-label="Buffered lines"), never by its #id.
+  const table = page.getByRole("region", { name: "Buffered lines" });
   await expect(table.getByText("Buffered lines")).toBeVisible({ timeout: 15_000 });
 
   // Read the wide count, then tighten to ERROR-only and assert the count does not
-  // grow (filters reduce volume). The exact numbers depend on traffic, so the
-  // assertion is the monotonic reduction, which is the AC's guarantee.
-  const countLocator = table.locator("span.tnum").first();
-  const wideText = (await countLocator.textContent())?.trim() ?? "0";
+  // grow (filters reduce volume). The count carries an accessible label
+  // ("Buffered line count") so it is read by label, not by a CSS class. The exact
+  // numbers depend on traffic, so the assertion is the monotonic reduction, which is
+  // the AC's guarantee.
+  const wideText = (await table.getByLabel("Buffered line count").textContent())?.trim() ?? "0";
   const wide = parseInt(wideText, 10) || 0;
 
   await page.getByLabel("Level (minimum)").selectOption("error");
@@ -140,7 +122,7 @@ test("logs filtering reduces the buffered line volume", async ({ page }) => {
   // Give HTMX a moment to swap the table.
   await expect(table.getByText("Buffered lines")).toBeVisible();
   await page.waitForTimeout(500);
-  const narrowText = (await table.locator("span.tnum").first().textContent())?.trim() ?? "0";
+  const narrowText = (await table.getByLabel("Buffered line count").textContent())?.trim() ?? "0";
   const narrow = parseInt(narrowText, 10) || 0;
 
   expect(narrow).toBeLessThanOrEqual(wide);
@@ -153,8 +135,7 @@ test("logs filtering reduces the buffered line volume", async ({ page }) => {
 
   await page.screenshot({ path: join(SHOT_DIR, "logs.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on logs:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "logs");
 });
 
 test("settings edits a tunable live and shows a boot-only field read-only", async ({ page }) => {
@@ -181,6 +162,5 @@ test("settings edits a tunable live and shows a boot-only field read-only", asyn
 
   await page.screenshot({ path: join(SHOT_DIR, "settings.png"), fullPage: true });
 
-  const violations = await axeAAViolations(page);
-  expect(violations, `axe AA violations on settings:\n${formatViolations(violations)}`).toEqual([]);
+  await expectNoAxeViolations(page, "settings");
 });

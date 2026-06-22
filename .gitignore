@@ -32,6 +32,10 @@ coverage.out
 coverage.gate.out
 coverage.func.txt
 coverage.html
+# Machine-parseable test artifacts from `make test-e2e` / `make test-all` (#105):
+# the tee'd `go test -json` streams. The Playwright JSON lives under
+# internal/httpapi/webui/test-results/ (ignored separately below).
+/test-results/
 # We use Go modules, not vendoring
 /vendor/
 

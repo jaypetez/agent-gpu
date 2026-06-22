@@ -19,6 +19,23 @@ Work is tracked as GitHub Issues on the **agent-gpu roadmap** Projects v2 board
   enforced by the PR-title check. Reference the issue (`Closes #N`).
 - Every change ships with tests; CI must be green before merge.
 
+## Testing
+
+Run the tests yourself and self-correct — do not hand work back red.
+
+- Before pushing, run **`make test-e2e`**: it runs the Go unit + httptest suite and the
+  Playwright + axe accessibility E2E as one command with a single pass/fail exit code. It writes
+  machine-parseable JSON (`test-results/go-test.json` and
+  `internal/httpapi/webui/test-results/results.json`) alongside the human output. Read the JSON on a
+  failure, fix the cause, and re-run until it is green — in one loop, before escalating.
+- Use **`make test-all`** for the full gate: the Go `-race` + coverage run (mirrors CI; `-race` needs
+  cgo, so a Linux/CI box or a Windows box with gcc), the Playwright + axe E2E, and the Compose infra
+  smoke (`SKIP_COMPOSE=1` skips the Docker/inference step). Single exit code, same JSON artifacts.
+- Playwright locators are role/label based (`getByRole`/`getByLabel`); never add CSS or XPath
+  selectors. Deterministic state is seeded once by the Playwright global setup
+  (`internal/httpapi/webui/e2e/global-setup.ts`); mutating specs use unique names and clean up.
+- See [docs/testing.md](docs/testing.md) for the layout, the coverage ratchet, and the flake-avoidance rules.
+
 ## Autonomous burndown workflow
 
 This repo is set up to be driven to completion mostly autonomously with the built-in **`/goal`**

@@ -32,10 +32,14 @@ templ Logs(d LogsData) {
 			@logFilterBar(d)
 			@logTailPanel(d)
 			<!-- Filtered buffer: the server-rendered point-in-time query. Applying a
-			     filter re-fetches this region, visibly reducing the rows. -->
+			     filter re-fetches this region, visibly reducing the rows. The region
+			     role + label name it as a landmark so tests (and assistive tech)
+			     address it by role, not by its #id. -->
 			<div
 				id="log-table"
 				class="mt-4"
+				role="region"
+				aria-label="Buffered lines"
 				hx-get={ d.Shell.AssetPath + "/../partials/logs" }
 				hx-trigger="load"
 				hx-include="#log-filter"
@@ -169,11 +173,11 @@ templ logTailPanel(d LogsData) {
 // does not poll (the live tail covers new lines); the count is shown so a tightened
 // filter's effect is legible.
 templ LogTablePartial(t LogsTable) {
-	<div id="log-table" class="mt-4">
+	<div id="log-table" class="mt-4" role="region" aria-label="Buffered lines">
 		<div class="panel">
 			<div class="panel-head">
 				<span class="panel-title">Buffered lines</span>
-				<span class="font-mono text-sm tnum text-fg">{ itoa(t.Count) }</span>
+				<span class="font-mono text-sm tnum text-fg" aria-label="Buffered line count">{ itoa(t.Count) }</span>
 			</div>
 			<div class="panel-body p-0">
 				if len(t.Lines) == 0 {
@@ -211,7 +215,7 @@ templ logRow(line LogLine) {
 
 // LogTableLoading is the table's first-paint skeleton (loading state).
 templ LogTableLoading() {
-	<div id="log-table" class="mt-4" aria-busy="true">
+	<div id="log-table" class="mt-4" role="region" aria-label="Buffered lines" aria-busy="true">
 		<div class="panel">
 			<div class="panel-head"><span class="panel-title">Buffered lines</span></div>
 			<div class="panel-body"><div class="skeleton h-40 w-full"></div></div>
@@ -223,7 +227,7 @@ templ LogTableLoading() {
 // LogTableError is the table's error state: an in-voice notice with a retry that
 // re-fetches the region with the current filters.
 templ LogTableError(assetPath, msg string) {
-	<div id="log-table" class="mt-4">
+	<div id="log-table" class="mt-4" role="region" aria-label="Buffered lines">
 		<div class="panel">
 			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
 				<span class="text-danger">
