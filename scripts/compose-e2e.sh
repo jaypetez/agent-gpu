@@ -86,29 +86,26 @@ wait_for "server up" 90 server_up || {
 # parse_token <key-create-output> -> prints the one-time plaintext token.
 parse_token() { printf '%s\n' "$1" | sed -n 's/^Token: //p'; }
 
-# ---- 3. key bootstrap ------------------------------------------------------
-# The file-backed key store is loaded into memory ONCE at server start and is not
-# hot-reloaded, so a key created with `exec ... key create` is written to the
-# /data volume but is not seen by the ALREADY-RUNNING server until it reloads.
-# We therefore create BOTH keys now and restart the server once (next step) so it
-# picks them up — which doubles as the persistence proof. See docs/docker.md.
-log "create admin + user keys with --local (written to the /data volume)"
+# ---- 3. admin key bootstrap (--local, empty store only) --------------------
+# `--local` is restricted to bootstrapping the FIRST admin key on an empty store
+# (it writes keys.json directly to the /data volume). The file-backed store is
+# loaded into memory ONCE at server start and is not hot-reloaded, so this key is
+# not seen by the ALREADY-RUNNING server until it reloads — we restart once in the
+# next step, which doubles as the persistence proof. Every subsequent key is
+# created over the admin API (step 4b), the same runtime path the CLI (`--server`)
+# and GUI use. See docs/docker.md.
+log "bootstrap the admin key with --local (written to the /data volume)"
 admin_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-admin --role admin --local)"
 printf '%s\n' "$admin_out"
 ADMIN_TOKEN="$(parse_token "$admin_out")"
 [ -n "$ADMIN_TOKEN" ] || fail "could not parse admin token from key create output"
 
-user_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-user --role user --allow-model "$MODEL" --local)"
-printf '%s\n' "$user_out"
-USER_TOKEN="$(parse_token "$user_out")"
-[ -n "$USER_TOKEN" ] || fail "could not parse user token from key create output"
-
-# ---- 4. AC#2: persistence across a restart (also activates the new keys) ----
+# ---- 4. AC#2: persistence across a restart (also activates the admin key) ---
 # Restart ONLY the server (keep the agentgpu-data volume). It reloads keys.json
-# from the volume, so afterward the keys created above authenticate — proving both
-# that state lives on the volume (survives a restart) and that it is the same file
-# the CLI wrote. A token rejected before the restart and accepted after is the
-# proof.
+# from the volume, so afterward the admin key bootstrapped above authenticates —
+# proving both that state lives on the volume (survives a restart) and that it is
+# the same file the CLI wrote. A token rejected before the restart and accepted
+# after is the proof.
 log "admin token BEFORE restart (expected 401 — server has not loaded it yet)"
 echo "  -> HTTP $(code "$BASE_URL/v1/admin/workers" "$ADMIN_TOKEN")"
 log "restart the server so it reloads the key store from the volume"
@@ -118,6 +115,18 @@ auth_ok() { [ "$(code "$BASE_URL/v1/admin/workers" "$ADMIN_TOKEN")" = "200" ]; }
 wait_for "admin key valid after restart" 30 auth_ok \
   || fail "admin key did not authenticate after restart — persistence/reload broken"
 log "PERSISTENCE OK: a key written to the volume authenticated after a server restart"
+
+# ---- 4b. create the user key over the admin API (the runtime path) ---------
+# With the admin key active, every other key is created through the running
+# server's admin API — exactly as an operator would via the CLI (`--server`) or
+# GUI. This is immediately live (no restart needed) and is persisted to the volume
+# by the server. `--local` is intentionally NOT usable here: the store is no longer
+# empty, so the CLI rejects it and directs the operator to `--server`.
+log "create the user key over the admin API (agentgpu key create --server)"
+user_out="$($COMPOSE exec -T server /agentgpu key create --name e2e-user --role user --allow-model "$MODEL" --server "$BASE_URL" --token "$ADMIN_TOKEN")"
+printf '%s\n' "$user_out"
+USER_TOKEN="$(parse_token "$user_out")"
+[ -n "$USER_TOKEN" ] || fail "could not parse user token from key create output"
 
 # ---- 5. AC#1: at least one registered worker -------------------------------
 # The worker re-establishes its control stream after the server restart (reconnect
