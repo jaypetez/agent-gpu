@@ -11,3 +11,7 @@ https://github.com/users/jaypetez/projects/
 https://jaypetez.github.io/agent-gpu
 # OpenSSF Scorecard badge endpoint intermittently returns 503 to the link checker (valid in-browser)
 https://api.scorecard.dev
+# CHANGELOG version links 404 until the matching tag/release is published (they resolve once the
+# release workflow runs); the release-prep PR is necessarily merged before the tag exists.
+https://github.com/jaypetez/agent-gpu/releases/tag/
+https://github.com/jaypetez/agent-gpu/compare/
