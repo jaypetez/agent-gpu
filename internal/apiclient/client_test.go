@@ -7,7 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"testing"
+	"time"
 )
 
 // newTestClient returns a Client pointed at srv with a fixed token. The httptest
@@ -77,10 +80,87 @@ func TestCreateKey(t *testing.T) {
 	}
 }
 
+// TestCreateKeyEnrichment proves #96 (client side): the new owner/team/expires_at
+// request fields are sent on the wire, and owner/team/created_by/expires_at in the
+// response decode into CreateKeyResponse.
+func TestCreateKeyEnrichment(t *testing.T) {
+	t.Parallel()
+	var cap capture
+	srv := httptest.NewServer(recordingHandler(&cap, http.StatusCreated,
+		`{"id":"abc","name":"app","owner":"alice","team":"platform","token":"agpu_abc_secret","roles":[],"allow_models":[],"deny_models":[],"created":100,"created_by":"admin1","expires_at":2000}`))
+	defer srv.Close()
+
+	exp := int64(2000)
+	resp, err := newTestClient(t, srv).CreateKey(context.Background(), CreateKeyRequest{
+		Name:      "app",
+		Owner:     "alice",
+		Team:      "platform",
+		ExpiresAt: &exp,
+	})
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	if resp.Owner != "alice" || resp.Team != "platform" || resp.CreatedBy != "admin1" {
+		t.Errorf("response enrichment wrong: %+v", resp)
+	}
+	if resp.ExpiresAt == nil || *resp.ExpiresAt != 2000 {
+		t.Errorf("response expires_at = %v, want 2000", resp.ExpiresAt)
+	}
+	// The request carried the new fields.
+	if cap.body["owner"] != "alice" || cap.body["team"] != "platform" {
+		t.Errorf("request body labels missing: %v", cap.body)
+	}
+	if got, _ := cap.body["expires_at"].(float64); int64(got) != 2000 {
+		t.Errorf("request body expires_at = %v, want 2000", cap.body["expires_at"])
+	}
+}
+
+// TestCreateKeyOmitsUnsetEnrichment proves #96 backward-compat (client side): a
+// request without owner/team/expires_at omits them from the wire body entirely.
+func TestCreateKeyOmitsUnsetEnrichment(t *testing.T) {
+	t.Parallel()
+	var cap capture
+	srv := httptest.NewServer(recordingHandler(&cap, http.StatusCreated,
+		`{"id":"abc","name":"app","token":"agpu_abc_secret","roles":[],"allow_models":[],"deny_models":[],"created":100}`))
+	defer srv.Close()
+
+	if _, err := newTestClient(t, srv).CreateKey(context.Background(), CreateKeyRequest{Name: "app"}); err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	for _, k := range []string{"owner", "team", "expires_at"} {
+		if _, present := cap.body[k]; present {
+			t.Errorf("request body should omit %q when unset: %v", k, cap.body)
+		}
+	}
+}
+
+// TestGetKeyDecodesEnrichment proves #96 (client side): owner/team/created_by/
+// expires_at on a GET key view decode into KeyView.
+func TestGetKeyDecodesEnrichment(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"abc","name":"app","owner":"bob","team":"infra","roles":[],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":7,"created":10,"created_by":"admin2","expires_at":3000}`)
+	}))
+	defer srv.Close()
+
+	key, err := newTestClient(t, srv).GetKey(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("GetKey: %v", err)
+	}
+	if key.Owner != "bob" || key.Team != "infra" || key.CreatedBy != "admin2" {
+		t.Errorf("key view enrichment wrong: %+v", key)
+	}
+	if key.ExpiresAt == nil || *key.ExpiresAt != 3000 {
+		t.Errorf("key view expires_at = %v, want 3000", key.ExpiresAt)
+	}
+}
+
 func TestListKeys(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"keys":[{"id":"a","name":"one","roles":["admin"],"revoked":false,"usage_count":3,"created":10},{"id":"b","name":"two","roles":[],"revoked":true,"usage_count":0,"created":20}]}`)
+		// The server returns the cursor-paginated list envelope; a single page with
+		// a null next_cursor terminates the client's follow loop.
+		_, _ = io.WriteString(w, `{"data":[{"id":"a","name":"one","roles":["admin"],"revoked":false,"usage_count":3,"created":10},{"id":"b","name":"two","roles":[],"revoked":true,"usage_count":0,"created":20}],"pagination":{"next_cursor":null,"has_more":false}}`)
 	}))
 	defer srv.Close()
 
@@ -90,6 +170,32 @@ func TestListKeys(t *testing.T) {
 	}
 	if len(keys) != 2 || keys[0].ID != "a" || !keys[1].Revoked {
 		t.Fatalf("unexpected keys: %+v", keys)
+	}
+}
+
+// TestListKeysFollowsCursor proves the client walks multiple pages: the stub
+// hands out one key per page with a next_cursor until exhausted, and the client
+// assembles the full list across requests.
+func TestListKeysFollowsCursor(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = io.WriteString(w, `{"data":[{"id":"a"}],"pagination":{"next_cursor":"MQ","has_more":true}}`)
+		case "MQ":
+			_, _ = io.WriteString(w, `{"data":[{"id":"b"}],"pagination":{"next_cursor":"Mg","has_more":true}}`)
+		default:
+			_, _ = io.WriteString(w, `{"data":[{"id":"c"}],"pagination":{"next_cursor":null,"has_more":false}}`)
+		}
+	}))
+	defer srv.Close()
+
+	keys, err := newTestClient(t, srv).ListKeys(context.Background())
+	if err != nil {
+		t.Fatalf("ListKeys: %v", err)
+	}
+	if len(keys) != 3 || keys[0].ID != "a" || keys[1].ID != "b" || keys[2].ID != "c" {
+		t.Fatalf("cursor follow assembled wrong list: %+v", keys)
 	}
 }
 
@@ -229,7 +335,7 @@ func TestListModels(t *testing.T) {
 func TestListWorkers(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"workers":[{"id":"w1","models":["llama3"],"status":"online","active_jobs":1,"load":2}]}`)
+		_, _ = io.WriteString(w, `{"data":[{"id":"w1","models":["llama3"],"status":"online","active_jobs":1,"load":2}],"pagination":{"next_cursor":null,"has_more":false}}`)
 	}))
 	defer srv.Close()
 
@@ -239,6 +345,112 @@ func TestListWorkers(t *testing.T) {
 	}
 	if len(workers) != 1 || workers[0].ID != "w1" {
 		t.Fatalf("unexpected workers: %+v", workers)
+	}
+}
+
+// TestListAudit proves the client decodes the typed audit entries from the
+// shared list envelope and sends the request to the audit endpoint with the
+// maximum page size.
+func TestListAudit(t *testing.T) {
+	t.Parallel()
+	var cap capture
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.method = r.Method
+		cap.path = r.URL.Path
+		_, _ = io.WriteString(w, `{"data":[`+
+			`{"time":"2026-01-02T03:04:45Z","actor":"key_a","op":"key.quota","target":"key_y","request_id":"r4","outcome":"success"},`+
+			`{"time":"2026-01-02T03:04:15Z","actor":"key_a","op":"key.create","target":"key_x","after":{"id":"key_x"},"request_id":"r1","outcome":"success"}`+
+			`],"pagination":{"next_cursor":null,"has_more":false}}`)
+	}))
+	defer srv.Close()
+
+	entries, err := newTestClient(t, srv).ListAudit(context.Background(), AuditFilter{})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	// Newest first, with the typed projection decoded.
+	if entries[0].Op != "key.quota" || entries[0].Actor != "key_a" || entries[0].Outcome != "success" {
+		t.Errorf("entry[0] wrong: %+v", entries[0])
+	}
+	if entries[1].Op != "key.create" || entries[1].After["id"] != "key_x" || entries[1].RequestID != "r1" {
+		t.Errorf("entry[1] wrong: %+v", entries[1])
+	}
+	if entries[0].Time.IsZero() {
+		t.Errorf("entry[0] time did not decode")
+	}
+	if cap.method != http.MethodGet || cap.path != "/v1/admin/audit" {
+		t.Fatalf("sent %s %s, want GET /v1/admin/audit", cap.method, cap.path)
+	}
+}
+
+// TestListAuditSendsFilter proves the filter fields (string fields and the time
+// bounds as unix seconds) are encoded as query parameters, and that the page
+// limit is preserved alongside them.
+func TestListAuditSendsFilter(t *testing.T) {
+	t.Parallel()
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		_, _ = io.WriteString(w, `{"data":[],"pagination":{"next_cursor":null,"has_more":false}}`)
+	}))
+	defer srv.Close()
+
+	since := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	until := since.Add(time.Hour)
+	_, err := newTestClient(t, srv).ListAudit(context.Background(), AuditFilter{
+		Actor:  "key_a",
+		Op:     "key.create",
+		Target: "key_x",
+		Since:  since,
+		Until:  until,
+	})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if gotQuery.Get("actor") != "key_a" || gotQuery.Get("op") != "key.create" || gotQuery.Get("target") != "key_x" {
+		t.Errorf("string filters not sent: %v", gotQuery)
+	}
+	if gotQuery.Get("since") != strconv.FormatInt(since.Unix(), 10) {
+		t.Errorf("since = %q, want %d", gotQuery.Get("since"), since.Unix())
+	}
+	if gotQuery.Get("until") != strconv.FormatInt(until.Unix(), 10) {
+		t.Errorf("until = %q, want %d", gotQuery.Get("until"), until.Unix())
+	}
+	if gotQuery.Get("limit") != strconv.Itoa(maxPageSize) {
+		t.Errorf("limit = %q, want %d", gotQuery.Get("limit"), maxPageSize)
+	}
+}
+
+// TestListAuditFollowsCursor proves the client walks multiple pages of audit
+// entries while carrying the filter on every request.
+func TestListAuditFollowsCursor(t *testing.T) {
+	t.Parallel()
+	var sawActorEachPage = true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("actor") != "key_a" {
+			sawActorEachPage = false
+		}
+		switch r.URL.Query().Get("cursor") {
+		case "":
+			_, _ = io.WriteString(w, `{"data":[{"op":"key.create"}],"pagination":{"next_cursor":"MQ","has_more":true}}`)
+		default:
+			_, _ = io.WriteString(w, `{"data":[{"op":"key.revoke"}],"pagination":{"next_cursor":null,"has_more":false}}`)
+		}
+	}))
+	defer srv.Close()
+
+	entries, err := newTestClient(t, srv).ListAudit(context.Background(), AuditFilter{Actor: "key_a"})
+	if err != nil {
+		t.Fatalf("ListAudit: %v", err)
+	}
+	if len(entries) != 2 || entries[0].Op != "key.create" || entries[1].Op != "key.revoke" {
+		t.Fatalf("cursor follow assembled wrong list: %+v", entries)
+	}
+	if !sawActorEachPage {
+		t.Errorf("filter actor was not carried on every paged request")
 	}
 }
 
@@ -338,7 +550,7 @@ func TestTransportErrorNotAPIError(t *testing.T) {
 func TestNoTokenOmitsAuthHeader(t *testing.T) {
 	t.Parallel()
 	var cap capture
-	srv := httptest.NewServer(recordingHandler(&cap, http.StatusOK, `{"keys":[]}`))
+	srv := httptest.NewServer(recordingHandler(&cap, http.StatusOK, `{"data":[],"pagination":{"next_cursor":null,"has_more":false}}`))
 	defer srv.Close()
 
 	c := New(srv.URL, "", WithHTTPClient(srv.Client()))

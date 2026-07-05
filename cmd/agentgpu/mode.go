@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -84,7 +85,9 @@ func (cf *clientFlags) client() (*apiclient.Client, error) {
 
 // localService opens the on-disk store and returns an auth.Service over it (the
 // offline path). It is only reachable when --local is set. The caller must Close
-// the returned store.
+// the returned store. This is the READ-side opener (key list, quota show): it does
+// NOT enforce the bootstrap guard, because inspecting an offline store is harmless.
+// Mutating local handlers must use localBootstrapService instead.
 func (cf *clientFlags) localService() (*auth.Service, store.Store, error) {
 	storeFlag := ""
 	if cf.store != nil {
@@ -95,6 +98,45 @@ func (cf *clientFlags) localService() (*auth.Service, store.Store, error) {
 		return nil, nil, err
 	}
 	return auth.NewService(st), st, nil
+}
+
+// localBootstrapService is the MUTATING-side opener for --local (#104). It opens
+// the store like localService but enforces the API-first invariant: --local is a
+// one-time BOOTSTRAP path for minting the first admin key into an empty store, not
+// a runtime-management channel. If the store already holds at least one key, the
+// store is closed and a usageError is returned directing the operator to the
+// --server HTTP path — so that revoke/rotate/perms/quota changes against a
+// populated (and likely running) deployment go through the live admin API, which a
+// running server observes immediately, rather than silently editing a file the
+// server will not re-read until it restarts.
+//
+// On success the caller owns the returned store and must Close it (mirroring
+// localService); on the guard rejection the store is already closed.
+func (cf *clientFlags) localBootstrapService(ctx context.Context, op string) (*auth.Service, store.Store, error) {
+	svc, st, err := cf.localService()
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := svc.List(ctx)
+	if err != nil {
+		_ = st.Close()
+		return nil, nil, err
+	}
+	if len(keys) > 0 {
+		_ = st.Close()
+		return nil, nil, errLocalNotEmpty(op)
+	}
+	return svc, st, nil
+}
+
+// errLocalNotEmpty is the rejection returned when a mutating --local operation is
+// attempted against a store that already has keys (#104). It is a usageError (exit
+// 2) whose message names the operation and points the operator at the --server
+// HTTP path, where runtime management takes effect immediately. The wording is the
+// single source of truth for the guard message asserted in tests.
+func errLocalNotEmpty(op string) error {
+	return usagef("%s: --local is only for bootstrapping the first admin key on an empty store; "+
+		"the store already has keys, so use --server <addr> (with --token) to manage a running server", op)
 }
 
 // aliasValue is a flag.Value that writes through to an existing *string target,

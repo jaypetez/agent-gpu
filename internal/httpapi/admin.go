@@ -3,20 +3,28 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"sort"
+	"time"
 
+	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
+	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/queue"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/store"
+	"github.com/jaypetez/agent-gpu/internal/types"
 )
 
-// The admin API (#4): admin-only HTTP endpoints to manage API keys (CRUD),
-// per-key quotas, roles + per-model allow/deny lists, and to list/inspect/drain
-// workers. Every route is gated by authMiddleware + adminMiddleware (registered
-// via s.admin in httpapi.go), so a non-admin key gets 403 and an unauthenticated
-// request 401 on every endpoint before any handler runs.
+// The admin API (#4, scoped in #90): admin-only HTTP endpoints to manage API
+// keys (CRUD), per-key quotas, roles + per-model allow/deny lists, and to
+// list/inspect/drain workers. Every route is gated by authMiddleware + the scope
+// middleware (registered via s.requireScope / s.requireScopeWrite in
+// httpapi.go), so a key lacking the route's admin scope gets 403 and an
+// unauthenticated request 401 before any handler runs. The RoleAdmin superuser
+// holds every scope, so an admin key passes every route exactly as before.
 //
 // This package only adds the HTTP surface; the underlying key/quota/permission
 // and worker implementations live in internal/auth, internal/quota, and
@@ -36,17 +44,24 @@ import (
 // adminKeyView is the metadata-only projection of a store.APIKey returned by the
 // admin API. It deliberately omits SecretHash and Salt so a secret can never be
 // serialized. Revoked is a convenience boolean; LastUsed is omitted (0) when the
-// key has never authenticated.
+// key has never authenticated. The enrichment fields (Owner/Team/ExpiresAt/
+// CreatedBy, #96) are omitted when unset so a key created without them renders
+// exactly as before.
 type adminKeyView struct {
 	ID          string      `json:"id"`
 	Name        string      `json:"name"`
+	Owner       string      `json:"owner,omitempty"`
+	Team        string      `json:"team,omitempty"`
 	Roles       []string    `json:"roles"`
+	AdminScopes []string    `json:"admin_scopes"`
 	AllowModels []string    `json:"allow_models"`
 	DenyModels  []string    `json:"deny_models"`
 	Revoked     bool        `json:"revoked"`
 	UsageCount  uint64      `json:"usage_count"`
 	Created     int64       `json:"created"`
+	CreatedBy   string      `json:"created_by,omitempty"`
 	LastUsed    int64       `json:"last_used,omitempty"`
+	ExpiresAt   *int64      `json:"expires_at,omitempty"`
 	Limits      *limitsView `json:"limits,omitempty"`
 }
 
@@ -65,15 +80,23 @@ func newAdminKeyView(k store.APIKey) adminKeyView {
 	v := adminKeyView{
 		ID:          k.ID,
 		Name:        k.Name,
+		Owner:       k.Owner,
+		Team:        k.Team,
 		Roles:       orEmpty(k.Roles),
+		AdminScopes: orEmpty(k.AdminScopes),
 		AllowModels: orEmpty(k.AllowModels),
 		DenyModels:  orEmpty(k.DenyModels),
 		Revoked:     k.Revoked(),
 		UsageCount:  k.UsageCount,
 		Created:     k.CreatedAt.Unix(),
+		CreatedBy:   k.CreatedBy,
 	}
 	if !k.LastUsedAt.IsZero() {
 		v.LastUsed = k.LastUsedAt.Unix()
+	}
+	if k.ExpiresAt != nil {
+		exp := k.ExpiresAt.Unix()
+		v.ExpiresAt = &exp
 	}
 	if k.Limits != nil {
 		v.Limits = &limitsView{
@@ -101,11 +124,16 @@ func orEmpty(xs []string) []string {
 type adminCreateKeyResponse struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Token       string   `json:"token"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Created     int64    `json:"created"`
+	CreatedBy   string   `json:"created_by,omitempty"`
+	ExpiresAt   *int64   `json:"expires_at,omitempty"`
 }
 
 // adminRotateKeyResponse is the POST /v1/admin/keys/{id}/rotate response: the key
@@ -127,6 +155,60 @@ type adminWorkerView struct {
 	Load       uint32   `json:"load"`
 	GPUType    string   `json:"gpu_type"`
 	LastSeen   int64    `json:"last_seen"`
+}
+
+// adminWorkerDetailView is the richer per-worker projection returned by GET
+// /v1/admin/workers/{id} (#93). It extends the list view's capacity/status fields
+// with the registration timestamp and a derived uptime so an operator can inspect
+// one worker fully. Draining is a convenience boolean (also implied by
+// Status == "draining"). GPU detail is reported at the aggregate level the
+// control plane tracks (GPUType + TotalVRAM/FreeVRAM); there is no per-GPU
+// breakdown in the fleet snapshot. RegisteredAt/UptimeSeconds are omitted (0)
+// when the worker has no recorded registration time.
+type adminWorkerDetailView struct {
+	ID            string   `json:"id"`
+	Models        []string `json:"models"`
+	Status        string   `json:"status"`
+	Draining      bool     `json:"draining"`
+	ActiveJobs    uint32   `json:"active_jobs"`
+	TotalVRAM     uint64   `json:"total_vram"`
+	FreeVRAM      uint64   `json:"free_vram"`
+	Load          uint32   `json:"load"`
+	GPUType       string   `json:"gpu_type"`
+	LastSeen      int64    `json:"last_seen"`
+	RegisteredAt  int64    `json:"registered_at,omitempty"`
+	UptimeSeconds int64    `json:"uptime_seconds,omitempty"`
+}
+
+// newAdminWorkerDetailView projects a fleet snapshot into the detail view. Uptime
+// is derived from RegisteredAt against the snapshot's LastSeen (the most recent
+// server-observed time for the worker) rather than wall-clock now, so it stays
+// consistent with the timestamps in the same response and needs no clock here; it
+// is clamped at 0. Models is emitted as [] (never null).
+func newAdminWorkerDetailView(wk types.Worker) adminWorkerDetailView {
+	models := make([]string, len(wk.Models))
+	for i, m := range wk.Models {
+		models[i] = m.Name
+	}
+	v := adminWorkerDetailView{
+		ID:         wk.ID,
+		Models:     models,
+		Status:     wk.Status.String(),
+		Draining:   wk.Status == types.WorkerDraining,
+		ActiveJobs: wk.ActiveJobs,
+		TotalVRAM:  wk.TotalVRAM,
+		FreeVRAM:   wk.FreeVRAM,
+		Load:       wk.Load,
+		GPUType:    wk.GPUType,
+		LastSeen:   wk.LastSeen.Unix(),
+	}
+	if !wk.RegisteredAt.IsZero() {
+		v.RegisteredAt = wk.RegisteredAt.Unix()
+		if up := wk.LastSeen.Sub(wk.RegisteredAt); up > 0 {
+			v.UptimeSeconds = int64(up.Seconds())
+		}
+	}
+	return v
 }
 
 // adminStatsResponse is the GET /v1/admin/stats response (#10): a consolidated,
@@ -193,8 +275,9 @@ func priorityName(p queue.Priority) string {
 
 // handleAdminStats serves GET /v1/admin/stats. It reads queue depth, the fleet
 // snapshot, and the time-in-queue distribution live (no caching) and returns
-// them as one consolidated JSON document. Gated to admin keys (s.admin), so a
-// non-admin gets 403 and an unauthenticated request 401 before this runs.
+// them as one consolidated JSON document. Gated to the telemetry:read scope
+// (s.requireScope), so a key lacking it gets 403 and an unauthenticated request
+// 401 before this runs.
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	qs := s.fleet.QueueStats()
 	byPriority := make(map[string]int, len(qs.ByPriority))
@@ -256,19 +339,37 @@ type adminQuotaUsageResponse struct {
 // ---- request shapes ----
 
 // adminCreateKeyRequest is the POST /v1/admin/keys body. Name is a human label;
-// the role and allow/deny lists set the new key's initial permissions.
+// the role, admin-scope, and allow/deny lists set the new key's initial
+// permissions. Roles are validated against the known vocabulary (authz.ValidRole,
+// #95) and AdminScopes grants the fine-grained management scopes (#90); an unknown
+// role or scope is rejected with 400 (no key is created).
+//
+// Owner/Team are optional free-form labels (descriptive metadata only — they
+// grant nothing). ExpiresAt is an optional TTL as unix seconds: after it the key
+// fails authentication. It must be in the future; a past or zero ExpiresAt is
+// rejected with 400 (a key born already-expired is almost certainly a mistake).
+// Omit it for a non-expiring key — the pre-existing behavior (#96).
 type adminCreateKeyRequest struct {
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
+	ExpiresAt   *int64   `json:"expires_at,omitempty"`
 }
 
 // adminPermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body. It is
-// a full replace (not a merge): the supplied lists become the key's roles and
-// allow/deny lists; an omitted/null list clears that dimension.
+// a full replace (not a merge): the supplied lists become the key's roles,
+// admin scopes, and allow/deny lists; an omitted/null list clears that
+// dimension. Both the role names and the admin scopes are validated against the
+// known vocabularies (authz.ValidRole / authz.ValidScope) BEFORE any mutation, so
+// an unknown role or scope is rejected with 400 and the key is left unchanged
+// (#95). GET /v1/admin/roles enumerates the valid roles + scopes for a GUI editor.
 type adminPermissionsRequest struct {
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 }
@@ -284,6 +385,21 @@ type adminQuotaRequest struct {
 	MonthlyTokens *uint64 `json:"monthly_tokens"`
 }
 
+// adminDrainRequest is the optional POST /v1/admin/workers/{id}/drain body (#93).
+// DeadlineSeconds, when > 0, turns the soft drain into a timed forced drain: the
+// worker is evicted once its in-flight jobs finish OR the deadline elapses. An
+// absent or 0 deadline (including an empty body) is the pure soft drain — the
+// preserved original behavior. A negative value is rejected with 400.
+type adminDrainRequest struct {
+	DeadlineSeconds int64 `json:"deadline_seconds"`
+}
+
+// adminPullModelRequest is the POST /v1/admin/workers/{id}/models body (#93): the
+// model to pull onto the worker. An empty Model is rejected with 400.
+type adminPullModelRequest struct {
+	Model string `json:"model"`
+}
+
 // ---- handlers ----
 
 // handleAdminCreateKey serves POST /v1/admin/keys. It mints a new key with the
@@ -293,29 +409,87 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if !validateRoles(w, req.Roles) {
+		return
+	}
+	if !validateScopes(w, req.AdminScopes) {
+		return
+	}
+	// An optional TTL is validated up front: it must be a positive unix timestamp
+	// strictly in the future. A non-positive or already-past value is rejected
+	// with 400 (and no key is created) rather than silently minting a key that can
+	// never authenticate. An omitted expires_at leaves the key non-expiring.
+	expiresAt, ok := parseExpiresAt(w, req.ExpiresAt)
+	if !ok {
+		return
+	}
+	// Record the creating actor (the authenticated admin key's id) for provenance.
+	// Empty when the handler is invoked outside the auth middleware (some unit
+	// tests), preserving the pre-existing behavior of an unattributed key.
+	actor := ""
+	if k, ok := keyFromContext(r.Context()); ok {
+		actor = k.ID
+	}
 	token, key, err := s.auth.CreateWithPermissions(r.Context(), req.Name, auth.Permissions{
 		Roles:       req.Roles,
+		AdminScopes: req.AdminScopes,
 		AllowModels: req.AllowModels,
 		DenyModels:  req.DenyModels,
+		Owner:       req.Owner,
+		Team:        req.Team,
+		ExpiresAt:   expiresAt,
+		CreatedBy:   actor,
 	})
 	if err != nil {
+		s.recordAudit(r, auditOpKeyCreate, "", audit.OutcomeFailure, nil, nil)
 		s.reqLog(r.Context()).Error("admin create key failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create key")
 		return
 	}
-	writeJSON(w, http.StatusCreated, adminCreateKeyResponse{
+	// Audit the create: there is no Before (the key did not exist); the After is
+	// the redacted projection of the new key. The one-time token is NEVER recorded.
+	s.recordAudit(r, auditOpKeyCreate, key.ID, audit.OutcomeSuccess, nil, auditKeyValues(key))
+	resp := adminCreateKeyResponse{
 		ID:          key.ID,
 		Name:        key.Name,
+		Owner:       key.Owner,
+		Team:        key.Team,
 		Token:       token,
 		Roles:       orEmpty(key.Roles),
+		AdminScopes: orEmpty(key.AdminScopes),
 		AllowModels: orEmpty(key.AllowModels),
 		DenyModels:  orEmpty(key.DenyModels),
 		Created:     key.CreatedAt.Unix(),
-	})
+		CreatedBy:   key.CreatedBy,
+	}
+	if key.ExpiresAt != nil {
+		exp := key.ExpiresAt.Unix()
+		resp.ExpiresAt = &exp
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// parseExpiresAt validates the optional create-key TTL. A nil pointer (omitted
+// field) means "no expiry" and yields (nil, true). A present value must be a
+// positive unix-seconds timestamp strictly in the future; otherwise it writes a
+// 400 and returns ok=false so the handler aborts before any key is minted. On
+// success it returns the corresponding UTC *time.Time.
+func parseExpiresAt(w http.ResponseWriter, expiresAt *int64) (*time.Time, bool) {
+	if expiresAt == nil {
+		return nil, true
+	}
+	if *expiresAt <= 0 || !time.Unix(*expiresAt, 0).After(time.Now()) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "expires_at must be a unix timestamp in the future")
+		return nil, false
+	}
+	t := time.Unix(*expiresAt, 0).UTC()
+	return &t, true
 }
 
 // handleAdminListKeys serves GET /v1/admin/keys. It returns metadata for every
-// key (never any secret).
+// key (never any secret), in the shared cursor-paginated list envelope
+// ({"data":[...],"pagination":{...}}). Keys are stably sorted by id so a cursor
+// names a stable position across requests. Honors ?limit= and ?cursor=.
 func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.auth.List(r.Context())
 	if err != nil {
@@ -323,11 +497,13 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list keys")
 		return
 	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
 	views := make([]adminKeyView, len(keys))
 	for i, k := range keys {
 		views[i] = newAdminKeyView(k)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"keys": views})
+	limit, offset := parsePageParams(r)
+	writeList(w, views, limit, offset)
 }
 
 // handleAdminGetKey serves GET /v1/admin/keys/{id}. It returns one key's
@@ -343,12 +519,17 @@ func (s *Server) handleAdminGetKey(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminRevokeKey serves DELETE /v1/admin/keys/{id}. It revokes the key
 // (subsequent authentication fails immediately) and returns 204, or 404 if
-// unknown.
+// unknown. The revoke is audited with the key's before/after state.
 func (s *Server) handleAdminRevokeKey(w http.ResponseWriter, r *http.Request) {
-	if err := s.auth.Revoke(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	before, _ := s.auth.Get(r.Context(), id)
+	if err := s.auth.Revoke(r.Context(), id); err != nil {
+		s.recordAudit(r, auditOpKeyRevoke, id, audit.OutcomeFailure, auditKeyValues(before), nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	after, _ := s.auth.Get(r.Context(), id)
+	s.recordAudit(r, auditOpKeyRevoke, id, audit.OutcomeSuccess, auditKeyValues(before), auditKeyValues(after))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -359,9 +540,14 @@ func (s *Server) handleAdminRotateKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	token, err := s.auth.Rotate(r.Context(), id)
 	if err != nil {
+		s.recordAudit(r, auditOpKeyRotate, id, audit.OutcomeFailure, nil, nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	// The rotation changes only the secret (which is never recorded), so there is
+	// no meaningful before/after metadata to capture — the op + target + outcome
+	// is the audit trail. The new token is NEVER recorded.
+	s.recordAudit(r, auditOpKeyRotate, id, audit.OutcomeSuccess, nil, nil)
 	writeJSON(w, http.StatusOK, adminRotateKeyResponse{ID: id, Token: token})
 }
 
@@ -373,15 +559,29 @@ func (s *Server) handleAdminSetPermissions(w http.ResponseWriter, r *http.Reques
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	key, err := s.auth.SetPermissions(r.Context(), r.PathValue("id"), auth.Permissions{
+	// Validate both vocabularies BEFORE any mutation, so a rejected request (400)
+	// leaves the key entirely unchanged (the full-replace SetPermissions never
+	// runs). Roles are validated here (#95); admin scopes were validated since #90.
+	if !validateRoles(w, req.Roles) {
+		return
+	}
+	if !validateScopes(w, req.AdminScopes) {
+		return
+	}
+	id := r.PathValue("id")
+	before, _ := s.auth.Get(r.Context(), id)
+	key, err := s.auth.SetPermissions(r.Context(), id, auth.Permissions{
 		Roles:       req.Roles,
+		AdminScopes: req.AdminScopes,
 		AllowModels: req.AllowModels,
 		DenyModels:  req.DenyModels,
 	})
 	if err != nil {
+		s.recordAudit(r, auditOpKeyPermissions, id, audit.OutcomeFailure, auditKeyValues(before), nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	s.recordAudit(r, auditOpKeyPermissions, id, audit.OutcomeSuccess, auditKeyValues(before), auditKeyValues(key))
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
 }
 
@@ -405,11 +605,15 @@ func (s *Server) handleAdminSetQuota(w http.ResponseWriter, r *http.Request) {
 			MonthlyTokens: deref(req.MonthlyTokens),
 		}
 	}
-	key, err := s.auth.SetLimits(r.Context(), r.PathValue("id"), limits)
+	id := r.PathValue("id")
+	before, _ := s.auth.Get(r.Context(), id)
+	key, err := s.auth.SetLimits(r.Context(), id, limits)
 	if err != nil {
+		s.recordAudit(r, auditOpKeyQuota, id, audit.OutcomeFailure, auditKeyValues(before), nil)
 		s.writeAdminKeyError(r, w, err)
 		return
 	}
+	s.recordAudit(r, auditOpKeyQuota, id, audit.OutcomeSuccess, auditKeyValues(before), auditKeyValues(key))
 	writeJSON(w, http.StatusOK, newAdminKeyView(key))
 }
 
@@ -455,9 +659,12 @@ func newQuotaUsageResponse(s quota.Snapshot) adminQuotaUsageResponse {
 }
 
 // handleAdminListWorkers serves GET /v1/admin/workers. It returns a point-in-time
-// snapshot of every worker in the fleet.
+// snapshot of every worker in the fleet, in the shared cursor-paginated list
+// envelope. Workers are stably sorted by id so a cursor names a stable position.
+// Honors ?limit= and ?cursor=.
 func (s *Server) handleAdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	fleet := s.fleet.Fleet()
+	sort.Slice(fleet, func(i, j int) bool { return fleet[i].ID < fleet[j].ID })
 	views := make([]adminWorkerView, len(fleet))
 	for i, wk := range fleet {
 		models := make([]string, len(wk.Models))
@@ -476,14 +683,49 @@ func (s *Server) handleAdminListWorkers(w http.ResponseWriter, r *http.Request) 
 			LastSeen:   wk.LastSeen.Unix(),
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"workers": views})
+	limit, offset := parsePageParams(r)
+	writeList(w, views, limit, offset)
+}
+
+// handleAdminGetWorker serves GET /v1/admin/workers/{id} (#93). It returns the
+// rich per-worker detail projection (models, status/draining, GPU type + VRAM
+// aggregate, load, active jobs, last_seen, registered_at + derived uptime), or
+// 404 if no such worker is connected. Gated to workers:read (s.requireScope).
+func (s *Server) handleAdminGetWorker(w http.ResponseWriter, r *http.Request) {
+	wk, ok := s.fleet.WorkerByID(r.PathValue("id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "worker not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, newAdminWorkerDetailView(wk))
 }
 
 // handleAdminDrainWorker serves POST /v1/admin/workers/{id}/drain. It marks the
 // worker draining (no new jobs; in-flight jobs finish) and returns 204, or 404 if
-// no such worker is connected.
+// no such worker is connected. The drain is audited.
+//
+// An optional body {"deadline_seconds": N} (#93) turns the soft drain into a
+// timed forced drain: with N > 0 the worker is evicted once its in-flight jobs
+// finish OR N seconds elapse, whichever first. An absent/empty body or N == 0 is
+// the pure soft drain (preserved original behavior); a negative N is 400.
 func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) {
-	if err := s.fleet.DrainWorker(r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+
+	// The body is optional: an empty body is the pure soft drain. Decode only when
+	// one is present, tolerating io.EOF (no body) but rejecting malformed JSON.
+	var req adminDrainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+		return
+	}
+	if req.DeadlineSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "deadline_seconds must be >= 0")
+		return
+	}
+	deadline := time.Duration(req.DeadlineSeconds) * time.Second
+
+	if err := s.fleet.DrainWorkerWithDeadline(id, deadline); err != nil {
+		s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeFailure, nil, nil)
 		if errors.Is(err, server.ErrWorkerNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "worker not found")
 			return
@@ -492,6 +734,71 @@ func (s *Server) handleAdminDrainWorker(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not drain worker")
 		return
 	}
+	// The after-snapshot records whether a forced deadline was attached, so the
+	// audit trail distinguishes a soft drain from a timed/forced one.
+	after := audit.RedactedValues{"status": "draining"}
+	if deadline > 0 {
+		after["deadline_seconds"] = req.DeadlineSeconds
+	}
+	s.recordAudit(r, auditOpWorkerDrain, id, audit.OutcomeSuccess, nil, after)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleAdminPullModel serves POST /v1/admin/workers/{id}/models (#93). It
+// dispatches a pull of the requested model onto the worker (fire-and-forget; the
+// model surfaces on the worker's next heartbeat) and returns 202 Accepted, 404 if
+// no such worker is connected, or 400 for an empty model. Gated to models:write
+// (s.requireScopeWrite, which also layers idempotency); the pull is audited.
+func (s *Server) handleAdminPullModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req adminPullModelRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "model is required")
+		return
+	}
+	target := id + "/" + req.Model
+	if err := s.fleet.AdminPullModel(r.Context(), id, req.Model); err != nil {
+		s.recordAudit(r, auditOpModelPull, target, audit.OutcomeFailure, nil, nil)
+		if errors.Is(err, server.ErrWorkerNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "worker not found")
+			return
+		}
+		s.reqLog(r.Context()).Error("admin pull model failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not pull model")
+		return
+	}
+	s.recordAudit(r, auditOpModelPull, target, audit.OutcomeSuccess, nil,
+		audit.RedactedValues{"worker": id, "model": req.Model})
+	// The pull is asynchronous on the worker; 202 communicates "accepted, not yet
+	// complete" — the model appears in the worker detail after its next heartbeat.
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleAdminUnloadModel serves DELETE /v1/admin/workers/{id}/models/{model}
+// (#93). It dispatches a best-effort unload of the model from the worker's Ollama
+// and returns 204; a model that is not currently loaded is a worker-side no-op
+// and still reported as success (the "missing model is success" contract). Returns
+// 404 only when no such worker is connected. Gated to models:write
+// (s.requireScopeWrite); the unload is audited.
+func (s *Server) handleAdminUnloadModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	model := r.PathValue("model")
+	target := id + "/" + model
+	if err := s.fleet.AdminUnloadModel(r.Context(), id, model); err != nil {
+		s.recordAudit(r, auditOpModelUnload, target, audit.OutcomeFailure, nil, nil)
+		if errors.Is(err, server.ErrWorkerNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "worker not found")
+			return
+		}
+		s.reqLog(r.Context()).Error("admin unload model failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not unload model")
+		return
+	}
+	s.recordAudit(r, auditOpModelUnload, target, audit.OutcomeSuccess, nil,
+		audit.RedactedValues{"worker": id, "model": model})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -513,6 +820,37 @@ func deref(p *uint64) uint64 {
 		return 0
 	}
 	return *p
+}
+
+// validateScopes checks every requested admin scope against the known scope
+// vocabulary (authz.ValidScope), writing a 400 and returning false on the first
+// unknown scope so a key is never granted a string that gates nothing. An empty
+// or nil set is valid (no scopes granted). A handler returns immediately when it
+// returns false.
+func validateScopes(w http.ResponseWriter, scopes []string) bool {
+	for _, sc := range scopes {
+		if !authz.ValidScope(sc) {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "unknown admin scope")
+			return false
+		}
+	}
+	return true
+}
+
+// validateRoles checks every requested role against the known role vocabulary
+// (authz.ValidRole), writing a 400 and returning false on the first unknown role
+// so a key is never assigned a role string that grants nothing (the editor GUI
+// can enumerate the valid roles via GET /v1/admin/roles). An empty or nil set is
+// valid (no roles granted — an opt-in, do-nothing key). It mirrors
+// validateScopes; a handler returns immediately when it returns false.
+func validateRoles(w http.ResponseWriter, roles []string) bool {
+	for _, role := range roles {
+		if !authz.ValidRole(role) {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "unknown role")
+			return false
+		}
+	}
+	return true
 }
 
 // writeAdminKeyError maps an auth/store error from a key operation to its HTTP

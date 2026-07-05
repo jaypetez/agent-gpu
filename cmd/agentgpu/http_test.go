@@ -24,6 +24,7 @@ type adminStub struct {
 type recordedReq struct {
 	method string
 	path   string
+	query  string // raw URL query string (RawQuery), for asserting filter encoding
 	auth   string
 	body   map[string]any
 }
@@ -39,7 +40,7 @@ func newAdminStub(t *testing.T, routes map[string]stubResponse) *adminStub {
 	t.Helper()
 	a := &adminStub{response: routes}
 	a.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a.lastReq = recordedReq{method: r.Method, path: r.URL.Path, auth: r.Header.Get("Authorization")}
+		a.lastReq = recordedReq{method: r.Method, path: r.URL.Path, query: r.URL.RawQuery, auth: r.Header.Get("Authorization")}
 		if b, _ := io.ReadAll(r.Body); len(b) > 0 {
 			a.lastReq.body = map[string]any{}
 			_ = json.Unmarshal(b, &a.lastReq.body)
@@ -109,7 +110,7 @@ func TestKeyListHTTPNoSecretLeak(t *testing.T) {
 	t.Parallel()
 	a := newAdminStub(t, map[string]stubResponse{
 		"GET /v1/admin/keys": {http.StatusOK,
-			`{"keys":[{"id":"k1","name":"app","roles":["admin"],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":7,"created":1700000000,"last_used":1700000100}]}`},
+			`{"data":[{"id":"k1","name":"app","roles":["admin"],"admin_scopes":[],"allow_models":[],"deny_models":[],"revoked":false,"usage_count":7,"created":1700000000,"last_used":1700000100}],"pagination":{"next_cursor":null,"has_more":false}}`},
 	})
 
 	out, err := runHTTP(t, a, runKeyCmd, "list")

@@ -41,6 +41,15 @@ func keyFromContext(ctx context.Context) (store.APIKey, bool) {
 	return k, ok
 }
 
+// withKey returns a context carrying the authenticated API key under the same
+// unexported key keyFromContext reads. Both authMiddleware (Bearer) and the
+// console's uiAuth (session cookie) stash the resolved key through it, so a
+// downstream handler reads keyFromContext identically regardless of how the caller
+// authenticated.
+func withKey(ctx context.Context, key store.APIKey) context.Context {
+	return context.WithValue(ctx, apiKeyContextKey, key)
+}
+
 // requestIDFromContext returns the correlation id the requestID middleware
 // stashed on the request context, and whether one was present. Every route is
 // behind that middleware so a handler always finds one; it is the id echoed in
@@ -100,7 +109,12 @@ func (s *Server) withSessionLog(ctx context.Context, sessionID string) context.C
 // discovery requests against inference usage.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token, ok := bearerToken(r)
+		// tokenFromRequest accepts EITHER the console's HttpOnly session cookie OR
+		// the Authorization: Bearer header, so the same admin API authenticates a
+		// browser session and an API client without change (#100, AC2). API clients
+		// are unaffected: with no cookie present this falls straight through to the
+		// Bearer header exactly as before.
+		token, ok := tokenFromRequest(r)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or malformed bearer token")
 			return
@@ -119,8 +133,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			writeError(w, http.StatusInternalServerError, "internal_error", "authentication failed")
 			return
 		}
-		ctx := context.WithValue(r.Context(), apiKeyContextKey, key)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r.WithContext(withKey(r.Context(), key)))
 	})
 }
 
@@ -258,6 +271,33 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 		}
 		if !hasRole(key.Roles, authz.RoleAdmin) {
 			writeError(w, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// scopeMiddleware gates a route to keys holding a specific admin scope (#90). It
+// runs INSIDE authMiddleware (wrap as s.authMiddleware(s.scopeMiddleware(scope,
+// h))), so the key is already authenticated and stashed on the context: it reads
+// keyFromContext and requires authz.HasScope(key, scope), otherwise 403. The
+// RoleAdmin superuser holds every scope (so existing admin keys pass every
+// route, preserving backward compatibility — AC2), while a key granted only a
+// specific scope passes exactly its scope-gated routes and a key with neither
+// gets 403. As with adminMiddleware, an unauthenticated request never reaches
+// here (authMiddleware already returned 401), and the 403 message is generic and
+// never echoes the key's id, roles, or scopes.
+func (s *Server) scopeMiddleware(scope string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, ok := keyFromContext(r.Context())
+		if !ok {
+			// Defensive: authMiddleware always stashes a key before us. If it is
+			// somehow absent, fail closed as unauthenticated rather than admitting.
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing api key")
+			return
+		}
+		if !authz.HasScope(key, scope) {
+			writeError(w, http.StatusForbidden, "forbidden", "insufficient scope")
 			return
 		}
 		next.ServeHTTP(w, r)

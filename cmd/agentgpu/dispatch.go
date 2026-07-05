@@ -23,19 +23,27 @@ func dispatch(args []string) error {
 	// Build the single root logger both the server and worker inherit (#23):
 	// level/format/output resolved from env + defaults (flag > env > default), so
 	// the log level is configurable without a code change. The redaction
-	// ReplaceAttr and JSON-by-default encoding live in newLogger so they apply
-	// uniformly to every subsystem that takes this logger. A file sink (if any) is
-	// closed on the way out so its buffer is flushed.
-	logger, closeLog, err := newLogger(config.ResolveLog(config.LogConfig{}, nil))
+	// ReplaceAttr and JSON-by-default encoding live in newLoggerHandle so they
+	// apply uniformly to every subsystem that takes this logger. The handle also
+	// carries the dynamic level var and the in-memory log ring (#90 foundation for
+	// the log-stream/level admin endpoints): the server command threads the handle
+	// to the admin config endpoint, which flips the level at runtime via
+	// logHandle.SetLevel (#92); the in-memory ring awaits the log-stream endpoint
+	// (#99). A file sink (if any) is closed on the way out so its buffer is flushed.
+	lh, err := newLoggerHandle(config.ResolveLog(config.LogConfig{}, nil))
 	if err != nil {
 		return err
 	}
-	defer func() { _ = closeLog() }()
+	defer func() { _ = lh.Close() }()
+	logger := lh.Logger
 	slog.SetDefault(logger)
 
 	switch args[0] {
 	case "server":
-		return runServerCmd(ctx, logger, args[1:])
+		// The server passes the whole log handle (not just the logger) so the admin
+		// config endpoint (#92) can flip the dynamic log level at runtime via
+		// logHandle.SetLevel — the seam #90 wired here at the single logging site.
+		return runServerCmd(ctx, lh, args[1:])
 	case "worker":
 		return runWorkerCmd(ctx, logger, args[1:])
 	case "key":
@@ -44,6 +52,22 @@ func dispatch(args []string) error {
 		return runQuotaCmd(ctx, os.Stdout, args[1:])
 	case "models":
 		return runModelsCmd(ctx, os.Stdout, args[1:])
+	case "config":
+		return runConfigCmd(ctx, os.Stdout, args[1:])
+	case "workers":
+		return runWorkersCmd(ctx, os.Stdout, args[1:])
+	case "audit":
+		return runAuditCmd(ctx, os.Stdout, args[1:])
+	case "usage":
+		return runUsageCmd(ctx, os.Stdout, args[1:])
+	case "users":
+		return runUsersCmd(ctx, os.Stdout, args[1:])
+	case "gpus":
+		return runGPUsCmd(ctx, os.Stdout, args[1:])
+	case "telemetry":
+		return runTelemetryCmd(ctx, os.Stdout, args[1:])
+	case "logs":
+		return runLogsCmd(ctx, os.Stdout, args[1:])
 	case "loadtest":
 		return runLoadtestCmd(ctx, logger, os.Stdout, args[1:])
 	default:

@@ -15,14 +15,17 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/config"
 	"github.com/jaypetez/agent-gpu/internal/httpapi"
+	"github.com/jaypetez/agent-gpu/internal/httpapi/webui"
 	"github.com/jaypetez/agent-gpu/internal/metrics"
 	"github.com/jaypetez/agent-gpu/internal/quota"
 	"github.com/jaypetez/agent-gpu/internal/server"
 	"github.com/jaypetez/agent-gpu/internal/session"
+	usagepkg "github.com/jaypetez/agent-gpu/internal/usage"
 )
 
 // quotaCheckpointInterval is how often the server flushes the quota counters to
@@ -34,12 +37,35 @@ const quotaCheckpointInterval = 30 * time.Second
 // can lose (mirrors the quota checkpoint cadence).
 const sessionCheckpointInterval = 30 * time.Second
 
+// auditCheckpointInterval is how often the server flushes the admin audit log to
+// disk while running, bounding how much of the audit trail a crash can lose to
+// one interval (mirrors the quota/session checkpoint cadence) (#90).
+const auditCheckpointInterval = 30 * time.Second
+
+// usageSampleInterval is how often the snapshotter folds the live per-key quota
+// snapshots into the rolling usage series (#97). The series is DAILY-granularity,
+// so a sample only ever refreshes today's point (or rolls to a new day at UTC
+// midnight); a coarse cadence is therefore plenty — it does not need the 30s of
+// the counter checkpoint. Five minutes keeps "tokens today" current for the
+// dashboard while the per-key List+UsageForKey sweep stays cheap.
+const usageSampleInterval = 5 * time.Minute
+
+// usageCheckpointInterval is how often the rolling usage series is flushed to
+// disk, bounding how much history a crash can lose. It mirrors the quota/session/
+// audit checkpoint cadence so the state files flush together (#97).
+const usageCheckpointInterval = 30 * time.Second
+
+// auditLogCapacity bounds the in-memory admin audit log to a rolling window of
+// the most recent entries, so the trail cannot grow without limit (#90). It is
+// generous for an admin API's write volume.
+const auditLogCapacity = 100_000
+
 // httpShutdownTimeout bounds how long the HTTP server is given to drain
 // in-flight requests on graceful shutdown before the process proceeds to stop
 // the gRPC server.
 const httpShutdownTimeout = 10 * time.Second
 
-func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error {
+func runServerCmd(ctx context.Context, lh *logHandle, args []string) error {
 	if len(args) < 1 || args[0] != "start" {
 		return usagef("usage: agentgpu server start [--listen host:port]")
 	}
@@ -64,6 +90,7 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 	maxSessionContextTokens := fs.Int("max-session-context-tokens", 0, "per-session cumulative context-token cap (0 = unlimited or $AGENTGPU_MAX_SESSION_CONTEXT_TOKENS)")
 	sessionOverflow := fs.String("session-overflow-policy", "", "history over-cap policy: trim (drop oldest, default) or reject (default trim or $AGENTGPU_SESSION_OVERFLOW_POLICY)")
 	modelWarmMax := fs.Duration("model-warm-max", 0, "max model-warmth keep_alive window for session-bound jobs; keep_alive = min(session TTL, this) (default 1h or $AGENTGPU_MODEL_WARM_MAX)")
+	uiPath := fs.String("ui-path", "", "serve the admin console's static assets from this directory instead of the embedded copy (dev only; point at internal/httpapi/webui). Empty uses the assets compiled into the binary.")
 	setUsage(fs, "Usage: agentgpu server start [--listen host:port] [--http-listen host:port] [flags]")
 	// The server/worker commands have no caller-injected writer; their help goes to
 	// stdout (a success), matching the informational top-level help.
@@ -101,7 +128,11 @@ func runServerCmd(ctx context.Context, logger *slog.Logger, args []string) error
 		MaxSessionsPerKey: *maxSessionsPerKey,
 		OverflowPolicy:    *sessionOverflow,
 	}, nil, nil)
-	return serveControlPlane(ctx, logger, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout)
+	// The log config is resolved here too (flag > env > default, idempotent with the
+	// resolution in dispatch) so the admin config endpoint (#92) can report the
+	// effective level/format/output and hot-reload the level.
+	lcfg := config.ResolveLog(config.LogConfig{}, nil)
+	return serveControlPlane(ctx, lh, cfg, *storeFlag, qcfg, scfg, heartbeatTimeout, lcfg, *uiPath)
 }
 
 // metricsListenOff reports whether the operator explicitly turned the metrics
@@ -131,7 +162,8 @@ func metricsListenOff(fs *flag.FlagSet, flagValue string) bool {
 // serveControlPlane starts the gRPC control-plane server and blocks until ctx
 // is cancelled (SIGINT/SIGTERM), then shuts down gracefully, checkpointing the
 // quota counters on the way out.
-func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, scfg config.SessionConfig, heartbeatTimeout time.Duration) error {
+func serveControlPlane(ctx context.Context, lh *logHandle, cfg config.ServerConfig, storeFlag string, qcfg config.QuotaConfig, scfg config.SessionConfig, heartbeatTimeout time.Duration, lcfg config.LogConfig, uiPath string) error {
+	logger := lh.Logger
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.Listen, err)
@@ -267,11 +299,102 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		return fmt.Errorf("register metrics collector: %w", err)
 	}
 
+	// Admin audit log (#90): an append-only, in-memory + file-checkpoint trail of
+	// every admin WRITE. It is loaded from its checkpoint at boot and flushed
+	// periodically + on shutdown (mirroring the quota/session wiring), so the trail
+	// survives restarts and a crash loses at most one checkpoint interval. The
+	// checkpoint lives alongside the other control-plane state files.
+	auditPath := auditCheckpointPath(qcfg.Path)
+	auditLog := audit.NewMemoryStore(auditLogCapacity)
+	if err := auditLog.LoadCheckpoint(auditPath); err != nil {
+		return fmt.Errorf("load audit checkpoint: %w", err)
+	}
+
+	// Rolling per-key usage series (#97): a bounded daily-token history backing the
+	// sparkline + exhaustion forecast in GET /v1/admin/usage. It is loaded from its
+	// checkpoint at boot and fed by the snapshotter goroutine below (which folds the
+	// live quota snapshots into today's daily sample), then flushed periodically + on
+	// shutdown — mirroring the quota/audit wiring so the history survives restarts and
+	// a crash loses at most one checkpoint interval. The checkpoint lives alongside
+	// the other control-plane state files.
+	usagePath := usageCheckpointPath(qcfg.Path)
+	usageStore := usagepkg.New()
+	if err := usageStore.LoadCheckpoint(usagePath); err != nil {
+		return fmt.Errorf("load usage checkpoint: %w", err)
+	}
+
+	// Runtime settings/config (#92): the effective resolved tunable values seed the
+	// admin config holder, the boot-only values are surfaced read-only, and the
+	// appliers wire each tunable field to the matching thread-safe subsystem setter
+	// so a PUT /v1/admin/config takes effect live with no restart. The log-level
+	// applier flips the dynamic level via the log handle threaded down from dispatch;
+	// the session-caps applier replaces the history store's caps and the manager's
+	// per-key cap as a unit, parsing the overflow policy (an unrecognized value is
+	// rejected so a bad PUT is a 400, not a silent trim fallback).
+	configInitial := httpapi.ConfigSettings{
+		LogLevel:                  lcfg.Level,
+		QuotaDefaultRPM:           qcfg.DefaultRPM,
+		QuotaDefaultTPM:           qcfg.DefaultTPM,
+		QuotaDefaultDailyTokens:   qcfg.DefaultDailyTokens,
+		QuotaDefaultMonthlyTokens: qcfg.DefaultMonthlyTokens,
+		QuotaGlobalRPM:            qcfg.GlobalRPM,
+		QuotaGlobalTPM:            qcfg.GlobalTPM,
+		SessionTTL:                scfg.TTL.String(),
+		SessionMaxTurns:           scfg.MaxTurns,
+		SessionMaxBytes:           scfg.MaxBytes,
+		SessionMaxContextTokens:   scfg.MaxContextTokens,
+		SessionMaxSessionsPerKey:  scfg.MaxSessionsPerKey,
+		SessionOverflowPolicy:     overflow.String(),
+		ModelWarmMax:              scfg.ModelWarmMax.String(),
+		HeartbeatTimeout:          heartbeatTimeout.String(),
+	}
+	configBoot := httpapi.ConfigReadOnly{
+		ServerListen:        cfg.Listen,
+		ServerHTTPListen:    cfg.HTTPListen,
+		ServerMetricsListen: metricsAddr,
+		QuotaPath:           qcfg.Path,
+		SessionPath:         sessPath,
+		LogFormat:           lcfg.Format,
+		LogOutput:           lcfg.Output,
+	}
+	configAppliers := buildConfigAppliers(lh, eng, mgr, histStore, srv)
+	configPath := configCheckpointPath(qcfg.Path)
+
 	// Public HTTP API: authenticates Bearer tokens via the same key store and
 	// permission-filters the catalog with the shared authorizer above. The same
-	// Prometheus instrument is threaded in so the request path is metered.
+	// Prometheus instrument is threaded in so the request path is metered, the
+	// audit log records every admin write, and the runtime-config holder backs the
+	// settings/config endpoints (#92).
 	authSvc := auth.NewService(st)
-	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen)
+	httpOpts := []httpapi.Option{
+		httpapi.WithAuditLog(auditLog),
+		httpapi.WithUsageSeries(usageStore),
+		// Live log query + SSE tail (#99): read the in-memory ring (#90) through a
+		// thin cmd-side adapter so the HTTP layer never depends on the logging setup.
+		httpapi.WithLogSource(newLogRingSource(lh.Ring)),
+		httpapi.WithRuntimeConfig(configInitial, configBoot, configAppliers, configPath),
+	}
+	// Admin console (#100): with --ui-path set, serve the console's static assets
+	// from disk so an operator can iterate on the CSS/vendored JS live; otherwise
+	// the assets compiled into the binary (go:embed) are used. A bad --ui-path
+	// fails startup loudly rather than silently serving 404s.
+	if uiPath != "" {
+		assets, err := webui.DiskAssets(uiPath)
+		if err != nil {
+			return fmt.Errorf("ui-path %q: %w", uiPath, err)
+		}
+		httpOpts = append(httpOpts, httpapi.WithUIAssets(assets))
+		logger.Info("serving admin console assets from disk", "ui_path", uiPath)
+	}
+	httpSrv := httpapi.NewServer(srv, authSvc, az, mgr, m, logger, cfg.HTTPListen, httpOpts...)
+
+	// Re-apply any persisted PUT overrides on top of the freshly-resolved config, so
+	// an operator's prior config change survives this restart and wins over the boot
+	// flags for those tunable fields (#92). A missing file or a bad value is
+	// tolerated (the boot value stands), so a corrupted checkpoint cannot wedge startup.
+	if err := httpSrv.LoadConfigCheckpoint(configPath); err != nil {
+		return fmt.Errorf("load config checkpoint: %w", err)
+	}
 
 	// Metrics listener (#24): a second HTTP server serving only /metrics on a
 	// dedicated port, unauthenticated (it is an operational port, not the public
@@ -327,6 +450,61 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 		}
 	}()
 
+	// Periodic audit-log checkpoint, bounding how much of the admin audit trail a
+	// crash can lose to one interval (mirrors the quota/session checkpoints).
+	auditTicker := time.NewTicker(auditCheckpointInterval)
+	defer auditTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-auditTicker.C:
+				if err := auditLog.Checkpoint(auditPath); err != nil {
+					logger.Warn("audit checkpoint failed", "err", err)
+				}
+			}
+		}
+	}()
+
+	// Usage snapshotter (#97): on a coarse cadence, fold the live per-key quota
+	// snapshots into the rolling daily usage series so GET /v1/admin/usage reports a
+	// current "tokens today" point and a forecast. It selects on ctx.Done so it stops
+	// cleanly on shutdown (no goroutine leak). A sweep is List(all keys) →
+	// UsageForKey(each); a List error is logged and the sweep skipped (the next tick
+	// retries) rather than crashing the running server. Sampled once at startup so a
+	// freshly-booted dashboard is not blank until the first tick.
+	sampleUsage(ctx, logger, authSvc, eng, usageStore)
+	usageTicker := time.NewTicker(usageSampleInterval)
+	defer usageTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-usageTicker.C:
+				sampleUsage(ctx, logger, authSvc, eng, usageStore)
+			}
+		}
+	}()
+
+	// Periodic usage-series checkpoint, bounding how much history a crash can lose to
+	// one interval (mirrors the quota/session/audit checkpoints).
+	usageTickerCP := time.NewTicker(usageCheckpointInterval)
+	defer usageTickerCP.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-usageTickerCP.C:
+				if err := usageStore.Checkpoint(usagePath); err != nil {
+					logger.Warn("usage checkpoint failed", "err", err)
+				}
+			}
+		}
+	}()
+
 	errCh := make(chan error, 3)
 	go func() { errCh <- gs.Serve(lis) }()
 	go func() {
@@ -367,6 +545,15 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 			logger.Warn("quota checkpoint on shutdown failed", "err", err)
 		}
 		checkpointSessions(logger, sessStore, histStore, sessPath, histPath)
+		if err := auditLog.Checkpoint(auditPath); err != nil {
+			logger.Warn("audit checkpoint on shutdown failed", "err", err)
+		}
+		// Sample once more on the way out so the persisted series carries the latest
+		// "tokens today" figure, then flush it (mirrors the quota checkpoint).
+		sampleUsage(context.Background(), logger, authSvc, eng, usageStore)
+		if err := usageStore.Checkpoint(usagePath); err != nil {
+			logger.Warn("usage checkpoint on shutdown failed", "err", err)
+		}
 		return nil
 	case err := <-errCh:
 		return err
@@ -380,6 +567,60 @@ func serveControlPlane(ctx context.Context, logger *slog.Logger, cfg config.Serv
 // lifecycle, so a single --session-path flag configures both.
 func sessionHistoryPath(sessionPath string) string {
 	return filepath.Join(filepath.Dir(sessionPath), "history.json")
+}
+
+// auditCheckpointPath derives the admin audit-log checkpoint path from the quota
+// checkpoint path: audit.json alongside the other control-plane state files. The
+// audit log shares the state directory and lifecycle with quota/session, so it
+// needs no separate flag (#90); it can be promoted to its own flag/env later if
+// an operator needs to relocate it.
+func auditCheckpointPath(quotaPath string) string {
+	return filepath.Join(filepath.Dir(quotaPath), "audit.json")
+}
+
+// usageCheckpointPath derives the rolling usage-series checkpoint path from the
+// quota checkpoint path: usage.json alongside the other control-plane state files
+// (#97). The series shares the state directory and lifecycle with quota/session/
+// audit, so it needs no separate flag; it holds only per-key daily token history
+// (no secrets) and is re-loaded at boot so the sparkline survives a restart.
+func usageCheckpointPath(quotaPath string) string {
+	return filepath.Join(filepath.Dir(quotaPath), "usage.json")
+}
+
+// sampleUsage folds one round of live per-key quota snapshots into the rolling
+// usage series (#97): it lists every key and records each key's current snapshot
+// (TokensToday/RequestsThisMinute) into today's daily sample. A List error is
+// logged and the sweep skipped (the next tick retries) rather than failing — a
+// telemetry sample must never crash the running server. A per-key snapshot error
+// is logged and that key skipped. It is called from the snapshotter goroutine, at
+// startup, and on shutdown, so it must be cheap and side-effect-free beyond the
+// store write.
+func sampleUsage(ctx context.Context, logger *slog.Logger, authSvc *auth.Service, eng *quota.Engine, usageStore *usagepkg.Store) {
+	keys, err := authSvc.List(ctx)
+	if err != nil {
+		logger.Warn("usage sample: list keys failed", "err", err)
+		return
+	}
+	snaps := make([]quota.Snapshot, 0, len(keys))
+	for _, k := range keys {
+		snap, err := eng.UsageForKey(ctx, k)
+		if err != nil {
+			logger.Warn("usage sample: snapshot failed", "key_id", k.ID, "err", err)
+			continue
+		}
+		snaps = append(snaps, snap)
+	}
+	usageStore.Record(snaps, time.Now())
+}
+
+// configCheckpointPath derives the runtime-config override checkpoint path from
+// the quota checkpoint path: config.json alongside the other control-plane state
+// files (#92). The config overrides share the state directory and lifecycle with
+// quota/session/audit, so they need no separate flag; the file holds ONLY the
+// fields changed via PUT (an override map), re-applied on top of the resolved boot
+// config at startup so a prior PUT survives a restart.
+func configCheckpointPath(quotaPath string) string {
+	return filepath.Join(filepath.Dir(quotaPath), "config.json")
 }
 
 // sessionKeepSet returns the ids of the sessions currently in the store, used as

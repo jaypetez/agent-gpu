@@ -1,0 +1,225 @@
+package webui
+
+// telemetry.templ — the Telemetry dashboard (issue 103): request rate/latency,
+// throttles, fleet-by-status, active sessions, and session affinity, in one board.
+// The static header sits above an HTMX-polled region that loads after first paint
+// and refreshes every 10s — a roll-up cadence, deliberately calmer than the Overview
+// health strip's 5s so the dashboard doesn't churn needlessly. All styling is
+// token-derived utility classes; no raw hex and no arbitrary [...] values. The
+// latency/wait distributions render as labeled horizontal bars (no charting
+// library, CSP-clean); status is always color AND text.
+
+// Telemetry is the dashboard screen. The board (#telemetry-board) loads on first
+// paint, then refreshes every 10s.
+templ Telemetry(d TelemetryData) {
+	@Shell(d.Shell) {
+		<div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+			<div>
+				<h1 class="text-2xl font-semibold text-fg">Telemetry</h1>
+				<p class="mt-1 text-sm text-fg-muted">Request rate, latency, throttling, fleet health, and session affinity. Updates every 10s.</p>
+			</div>
+			<button
+				type="button"
+				class="btn btn-ghost"
+				hx-get={ d.Shell.AssetPath + "/../partials/telemetry" }
+				hx-target="#telemetry-board"
+				hx-swap="outerHTML"
+				title="Refresh now"
+			>
+				@iconRefresh()
+				<span>Refresh</span>
+			</button>
+		</div>
+		<!-- The region role + label name the board as a landmark so tests (and
+		     assistive tech) address it by role, not by its #id. -->
+		<div
+			id="telemetry-board"
+			role="region"
+			aria-label="Telemetry"
+			hx-get={ d.Shell.AssetPath + "/../partials/telemetry" }
+			hx-trigger="load, every 10s"
+			hx-swap="outerHTML"
+		>
+			@TelemetryLoading()
+		</div>
+	}
+}
+
+// TelemetryBoardPartial is the loaded telemetry board: the KPI strip over the
+// latency + wait-time histograms and the fleet/affinity panels. It keeps its poll
+// attributes so it re-refreshes itself.
+templ TelemetryBoardPartial(assetPath string, b TelemetryBoard) {
+	<div
+		id="telemetry-board"
+		role="region"
+		aria-label="Telemetry"
+		hx-get={ assetPath + "/../partials/telemetry" }
+		hx-trigger="every 10s"
+		hx-swap="outerHTML"
+	>
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			for _, k := range b.KPIs {
+				@kpiCard(k)
+			}
+		</div>
+		<div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+			@histogramPanel("Request latency", b.Latency)
+			@histogramPanel("Time in queue", b.WaitTime)
+		</div>
+		<div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+			@fleetStatusPanel(b.Fleet)
+			@affinityPanel(b.Affinity)
+		</div>
+	</div>
+}
+
+// histogramPanel renders a cumulative latency/wait distribution as labeled
+// horizontal bars with a Count/Mean/Max summary. The bar widths are live data
+// (percentages), so they are inline width styles — not Tailwind arbitrary values.
+// Empty state covers a distribution with no observations yet.
+templ histogramPanel(title string, h Histogram) {
+	<div class="panel">
+		<div class="panel-head">
+			<span class="panel-title">{ title }</span>
+			<span class="font-mono text-xs text-fg-faint">{ itoaU64(h.Count) } obs</span>
+		</div>
+		<div class="panel-body">
+			if h.Count == 0 {
+				@emptyState("Nothing measured yet", "Bars appear here once requests have been served.")
+			} else {
+				<div class="mb-4 flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
+					<div class="flex items-baseline gap-2">
+						<span class="text-fg-faint">Mean</span>
+						<span class="font-mono tnum font-semibold text-fg">{ itoaU64(h.MeanMs) }ms</span>
+					</div>
+					<div class="flex items-baseline gap-2">
+						<span class="text-fg-faint">Max</span>
+						<span class="font-mono tnum text-fg">{ itoaU64(h.MaxMs) }ms</span>
+					</div>
+				</div>
+				<ul class="flex flex-col gap-2">
+					for _, bar := range h.Bars {
+						<li>
+							<div class="mb-1 flex items-center justify-between text-xs">
+								<span class="font-mono text-fg-muted">{ bar.Label }</span>
+								<span class="font-mono tnum text-fg">{ itoaU64(bar.Count) }</span>
+							</div>
+							<div class="h-2 w-full overflow-hidden rounded-full bg-surface-2" role="img" aria-label={ bar.Label + ": " + itoaU64(bar.Count) }>
+								<div class="h-full rounded-full bg-accent" style={ barWidth(bar.Pct, 100) }></div>
+							</div>
+						</li>
+					}
+				</ul>
+			}
+		</div>
+	</div>
+}
+
+// fleetStatusPanel renders the worker-by-status breakdown: each status as a
+// text-labeled badge with its count. Empty state covers a fleet with no workers.
+templ fleetStatusPanel(rows []TelemetryStatus) {
+	<div class="panel">
+		<div class="panel-head"><span class="panel-title">Fleet by status</span></div>
+		<div class="panel-body p-0">
+			if len(rows) == 0 {
+				<div class="px-4 py-6">
+					@emptyState("No workers connected", "Start a worker and its status appears here.")
+				</div>
+			} else {
+				<ul class="divide-y divide-line">
+					for _, row := range rows {
+						<li class="flex items-center justify-between px-4 py-2.5">
+							@statusBadge(row.Tone, row.Status)
+							<span class="font-mono tnum text-fg">{ itoa(row.Count) }</span>
+						</li>
+					}
+				</ul>
+			}
+		</div>
+	</div>
+}
+
+// affinityPanel renders the session-affinity hit/miss/rebind counts plus a derived
+// hit-rate meter. The hit rate's tone is reinforced by the raw counts beside it.
+templ affinityPanel(a TelemetryAffinity) {
+	<div class="panel">
+		<div class="panel-head"><span class="panel-title">Session affinity</span></div>
+		<div class="panel-body">
+			if !a.HasData {
+				@emptyState("No routed turns yet", "Affinity hit/miss appears once sessions route to warm workers.")
+			} else {
+				<div>
+					<div class="mb-1 flex items-center justify-between text-xs">
+						<span class="text-fg-muted">Warm-worker hit rate</span>
+						<span class={ "font-mono tnum font-semibold", toneText(a.RateTone) }>{ itoa(a.HitRate) }%</span>
+					</div>
+					<div class="h-2 w-full overflow-hidden rounded-full bg-surface-2" role="img" aria-label={ "Affinity hit rate " + itoa(a.HitRate) + " percent" }>
+						<div class={ "h-full rounded-full", toneBar(a.RateTone) } style={ barWidth(a.HitRate, 100) }></div>
+					</div>
+				</div>
+				<dl class="mt-4 grid grid-cols-3 gap-3 text-sm">
+					<div class="flex flex-col gap-0.5">
+						<dt class="text-xs text-fg-faint">Hits</dt>
+						<dd class="font-mono tnum text-ok">{ a.Hits }</dd>
+					</div>
+					<div class="flex flex-col gap-0.5">
+						<dt class="text-xs text-fg-faint">Misses</dt>
+						<dd class="font-mono tnum text-fg">{ a.Misses }</dd>
+					</div>
+					<div class="flex flex-col gap-0.5">
+						<dt class="text-xs text-fg-faint">Rebinds</dt>
+						<dd class="font-mono tnum text-fg">{ a.Rebinds }</dd>
+					</div>
+				</dl>
+			}
+		</div>
+	</div>
+}
+
+// TelemetryLoading is the board's first-paint skeleton (loading state).
+templ TelemetryLoading() {
+	<div id="telemetry-board" role="region" aria-label="Telemetry" aria-busy="true">
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			for range 3 {
+				<div class="panel panel-body">
+					<div class="skeleton h-3 w-20"></div>
+					<div class="skeleton mt-3 h-8 w-28"></div>
+				</div>
+			}
+		</div>
+		<div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+			for range 2 {
+				<div class="panel">
+					<div class="panel-head"><span class="panel-title">Distribution</span></div>
+					<div class="panel-body"><div class="skeleton h-24 w-full"></div></div>
+				</div>
+			}
+		</div>
+		<span class="sr-only">Loading telemetry…</span>
+	</div>
+}
+
+// TelemetryError is the board's error state: an in-voice notice with a retry that
+// re-fetches the region.
+templ TelemetryError(assetPath, msg string) {
+	<div id="telemetry-board" role="region" aria-label="Telemetry">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load telemetry</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get={ assetPath + "/../partials/telemetry" }
+					hx-target="#telemetry-board"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}

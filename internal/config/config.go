@@ -187,7 +187,9 @@ type QuotaConfig struct {
 	// GlobalRPM is the server-wide requests-per-minute cap enforced at the HTTP
 	// boundary across the whole fleet, independent of per-key quota (#6). It is
 	// resolved with flag > env > default precedence (0 = unlimited; global rate
-	// limiting off). It is applied at load time; there is no hot-reload.
+	// limiting off). The boot value comes from here; it is also runtime-tunable via
+	// PUT /v1/admin/config (#92), which calls quota.Engine.SetGlobalLimits to change
+	// it live with no restart.
 	GlobalRPM uint64
 	// GlobalTPM is the server-wide tokens-per-minute cap, the token-budget analog
 	// of GlobalRPM (0 = unlimited).

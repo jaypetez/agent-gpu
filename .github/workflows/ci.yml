@@ -23,7 +23,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Lint GitHub Actions workflows
         uses: docker://rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9
@@ -60,7 +60,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Lint OpenAPI spec (validate 3.1 + recommended ruleset)
         uses: docker://redocly/cli:2.33.2@sha256:6ba52a89c87a37749cee3e31def1f10ad322a6c5418b008334c4694ae665086e
@@ -82,10 +82,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           check-latest: true
@@ -121,8 +121,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Drop generated proto from the gate metric, then compute the func table.
-          grep -v 'proto/agentgpu/v1' coverage.out > coverage.gate.out
+          # Drop generated code from the gate metric, then compute the func table.
+          # Generated protobuf stubs (proto/agentgpu/v1) and generated templ render
+          # functions (*_templ.go, the admin console #100) are both 0%/low-covered
+          # by design — they are mechanical output, not hand-written logic — so they
+          # would unfairly drag the total. Exclude both so the ratchet reflects the
+          # coverage of code we actually author.
+          grep -v 'proto/agentgpu/v1' coverage.out | grep -v '_templ.go' > coverage.gate.out
           go tool cover -func=coverage.gate.out > coverage.func.txt
 
           total="$(awk '/^total:/ { gsub(/%/, "", $3); print $3 }' coverage.func.txt)"
@@ -187,10 +192,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           check-latest: true
@@ -205,6 +210,102 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           govulncheck ./...
 
+  ui:
+    name: ui
+    # The admin console (#100) commits generated artifacts — the templ Go
+    # (*_templ.go) and the Tailwind-built CSS (app.css) — so `go build` needs no
+    # Node. This job regenerates both from source and fails on any drift, the
+    # stricter check the proto flow lacks: a stale committed artifact (someone
+    # edited a .templ or the design tokens but forgot `make ui`) turns the build
+    # red here instead of silently shipping mismatched markup/styles.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: internal/httpapi/webui/package-lock.json
+
+      - name: Regenerate console artifacts (templ + Tailwind)
+        run: make ui
+
+      - name: Fail on drift in committed artifacts
+        # `go build` consumes the committed *_templ.go and app.css directly (no
+        # generation at build/release time — goreleaser cross-compiles with
+        # CGO_ENABLED=0 and no codegen step), so the committed artifacts MUST match
+        # their sources. Any diff means a regenerate-and-commit was missed.
+        run: git diff --exit-code -- internal/httpapi/webui
+
+  e2e:
+    name: e2e (layered test gate)
+    # The layered agentic E2E gate (#105): `make test-e2e` runs the Go unit +
+    # httptest suite (machine-parseable `go test -json`) AND the Playwright + axe
+    # accessibility E2E (it builds the binary, installs Chromium, runs the specs)
+    # as ONE command with a single pass/fail exit code. This is the same target a
+    # developer/agent runs locally, so CI exercises it for real. The build FAILS on
+    # any axe violation or test failure. The JSON results + dashboard screenshots
+    # are uploaded as artifacts for review. The authoritative -race + coverage gate
+    # lives in the `go` job; the Docker/inference smoke lives in the `compose` job.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: internal/httpapi/webui/package-lock.json
+
+      - name: Install Playwright Chromium
+        working-directory: internal/httpapi/webui
+        run: npm ci && npx playwright install --with-deps chromium
+
+      - name: Run the layered E2E gate (make test-e2e)
+        # Builds agentgpu, runs Go unit+httptest (JSON) and the Playwright+axe suite
+        # behind a single exit code. ui-e2e (re)builds the binary and passes
+        # AGENTGPU_BIN itself; the npm install + browser install above are reused as
+        # fast no-ops.
+        run: make test-e2e
+
+      - name: Upload E2E results + screenshots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-results
+          path: |
+            test-results/**
+            internal/httpapi/webui/test-results/**
+          retention-days: 7
+          if-no-files-found: ignore
+
   docker:
     name: docker
     runs-on: ubuntu-latest
@@ -215,10 +316,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Build server image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -295,10 +396,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Validate compose.yaml
         run: docker compose config -q
@@ -330,25 +431,25 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           # GoReleaser needs full history/tags even for a snapshot build.
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           check-latest: true
 
       - name: Validate GoReleaser config
-        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
           args: check
 
       - name: Cross-compile all targets (no publish)
-        uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           version: "~> v2"
           args: build --snapshot --clean
@@ -367,10 +468,10 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
           check-latest: true

@@ -32,6 +32,10 @@ coverage.out
 coverage.gate.out
 coverage.func.txt
 coverage.html
+# Machine-parseable test artifacts from `make test-e2e` / `make test-all` (#105):
+# the tee'd `go test -json` streams. The Playwright JSON lives under
+# internal/httpapi/webui/test-results/ (ignored separately below).
+/test-results/
 # We use Go modules, not vendoring
 /vendor/
 
@@ -42,3 +46,17 @@ coverage.html
 # and the GitHub Pages publish workflow)
 /openapi.html
 /_site/
+
+# Admin console (#100) dev/test toolchain (Node is dev/test/CI-only; never a
+# runtime dep). The Node project (package.json, lockfile, node_modules) lives under
+# internal/httpapi/webui/ so node_modules is an ancestor of assets/css/input.css and
+# Tailwind v4 can resolve `@import "tailwindcss"` in a clean `npm ci`. The generated
+# *_templ.go and the built app.css ARE committed (so `go build` needs no Node) and
+# are deliberately NOT ignored.
+node_modules/
+npm-debug.log*
+internal/httpapi/webui/test-results/
+internal/httpapi/webui/playwright-report/
+internal/httpapi/webui/blob-report/
+internal/httpapi/webui/.playwright/
+.tailwindcss-cache

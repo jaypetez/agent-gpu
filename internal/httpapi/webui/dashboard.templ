@@ -1,0 +1,276 @@
+package webui
+
+// dashboard.templ — the Overview screen: a task-centric control board answering an
+// operator's three standing questions at a glance — is the queue backing up, are
+// the workers healthy, is anything erroring. Six panels total (a 3-card KPI row +
+// the three named panels), under the AC's ceiling of eight.
+//
+// The shell renders instantly; each panel's live numbers are loaded by HTMX after
+// first paint (hx-trigger="load") from the panel partials, which read the existing
+// /v1/admin telemetry/stats/logs JSON. Every panel declares its loading, empty,
+// and error states explicitly. Polling refreshes the data on a calm cadence.
+
+templ Dashboard(d DashboardData) {
+	@Shell(d.Shell) {
+		<div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+			<div>
+				<h1 class="text-2xl font-semibold text-fg">Fleet overview</h1>
+				<p class="mt-1 text-sm text-fg-muted">Live health of the inference fleet. Updates every few seconds.</p>
+			</div>
+			<button
+				type="button"
+				class="btn btn-ghost"
+				hx-get={ d.Shell.AssetPath + "/../partials/overview" }
+				hx-target="#overview"
+				hx-swap="outerHTML"
+				title="Refresh now"
+			>
+				@iconGauge()
+				<span>Refresh</span>
+			</button>
+		</div>
+		<!--
+		  The whole board is one HTMX-polled region: it loads on first paint, then
+		  refreshes itself every 5s. Each child panel is server-rendered from the
+		  same telemetry pull so the numbers are internally consistent.
+		-->
+		<div
+			id="overview"
+			hx-get={ d.Shell.AssetPath + "/../partials/overview" }
+			hx-trigger="load, every 5s"
+			hx-swap="outerHTML"
+		>
+			@OverviewLoading()
+		</div>
+	}
+}
+
+// OverviewLoading is the first-paint skeleton: the board's shape with shimmering
+// placeholders, so the operator sees structure immediately rather than a blank
+// frame (AC4 loading state).
+templ OverviewLoading() {
+	<div id="overview" aria-busy="true">
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			for range 3 {
+				<div class="panel panel-body">
+					<div class="skeleton h-3 w-20"></div>
+					<div class="skeleton mt-3 h-8 w-28"></div>
+					<div class="skeleton mt-3 h-3 w-32"></div>
+				</div>
+			}
+		</div>
+		<div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+			<div class="panel">
+				<div class="panel-head"><span class="panel-title">Queue depth</span></div>
+				<div class="panel-body"><div class="skeleton h-24 w-full"></div></div>
+			</div>
+			<div class="panel">
+				<div class="panel-head"><span class="panel-title">Worker health</span></div>
+				<div class="panel-body"><div class="skeleton h-24 w-full"></div></div>
+			</div>
+		</div>
+		<div class="mt-4 panel">
+			<div class="panel-head"><span class="panel-title">Event stream</span></div>
+			<div class="panel-body"><div class="skeleton h-32 w-full"></div></div>
+		</div>
+		<span class="sr-only">Loading fleet telemetry…</span>
+	</div>
+}
+
+// OverviewError is the board's error state: a single in-voice notice with a retry
+// that re-fetches the region. Shown when the telemetry pull fails (AC4 error
+// state). Status is conveyed by the icon AND the text.
+templ OverviewError(assetPath, msg string) {
+	<div id="overview">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load telemetry</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get={ assetPath + "/../partials/overview" }
+					hx-target="#overview"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}
+
+// Overview is the loaded board: the KPI row + the three named panels, all from one
+// telemetry snapshot. It keeps the polling attributes so it re-refreshes itself.
+templ Overview(assetPath string, kpis []KPI, queue QueueDepth, workers []WorkerRow, events []EventRow) {
+	<div
+		id="overview"
+		hx-get={ assetPath + "/../partials/overview" }
+		hx-trigger="every 5s"
+		hx-swap="outerHTML"
+	>
+		<div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			for _, k := range kpis {
+				@kpiCard(k)
+			}
+		</div>
+		<div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+			@queuePanel(queue)
+			@workersPanel(workers)
+		</div>
+		<div class="mt-4">
+			@eventsPanel(events)
+		</div>
+	</div>
+}
+
+// kpiCard is one headline metric. The status tone colors the value AND a text tag,
+// so meaning never rests on color alone.
+templ kpiCard(k KPI) {
+	<div class="panel panel-body">
+		<div class="flex items-center justify-between">
+			<span class="panel-title">{ k.Label }</span>
+			@toneTag(k.Tone)
+		</div>
+		<div class="mt-2 flex items-baseline gap-1">
+			<span class={ "text-2xl font-semibold tnum font-mono", toneText(k.Tone) }>{ k.Value }</span>
+			if k.Unit != "" {
+				<span class="text-sm text-fg-faint">{ k.Unit }</span>
+			}
+		</div>
+		<p class="mt-1 text-xs text-fg-muted">{ k.Caption }</p>
+	</div>
+}
+
+// queuePanel is the named queue-depth panel: the total pending plus the
+// per-priority split as labeled bars. Empty (idle) state is an explicit, calm
+// "queue is empty" rather than three zero bars.
+templ queuePanel(q QueueDepth) {
+	<div class="panel">
+		<div class="panel-head">
+			<span class="panel-title">Queue depth</span>
+			<span class="font-mono text-sm tnum text-fg">{ itoa(q.Total) }</span>
+		</div>
+		<div class="panel-body">
+			if q.Total == 0 {
+				@emptyState("Queue is empty", "No jobs are waiting — every request is being dispatched immediately.")
+			} else {
+				<ul class="flex flex-col gap-3">
+					@queueBar("High", q.High, q.Total, "ok")
+					@queueBar("Normal", q.Normal, q.Total, "info")
+					@queueBar("Low", q.Low, q.Total, "idle")
+				</ul>
+			}
+		</div>
+	</div>
+}
+
+templ queueBar(label string, n, total int, tone string) {
+	<li>
+		<div class="mb-1 flex items-center justify-between text-xs">
+			<span class="text-fg-muted">{ label }</span>
+			<span class="font-mono tnum text-fg">{ itoa(n) }</span>
+		</div>
+		<div class="h-2 w-full overflow-hidden rounded-full bg-surface-2" role="img" aria-label={ label + ": " + itoa(n) + " of " + itoa(total) }>
+			<div class={ "h-full rounded-full", toneBar(tone) } style={ barWidth(n, total) }></div>
+		</div>
+	</li>
+}
+
+// workersPanel is the named worker-health panel: each worker's status as a
+// text-labeled badge, in-flight jobs, and load. Empty state covers a fleet with no
+// workers connected.
+templ workersPanel(workers []WorkerRow) {
+	<div class="panel">
+		<div class="panel-head">
+			<span class="panel-title">Worker health</span>
+			<span class="font-mono text-sm tnum text-fg">{ itoa(len(workers)) }</span>
+		</div>
+		<div class="panel-body p-0">
+			if len(workers) == 0 {
+				<div class="px-4 py-6">
+					@emptyState("No workers connected", "Start a worker with agentgpu worker start and it will register here.")
+				</div>
+			} else {
+				<div class="overflow-x-auto">
+					<table class="tbl">
+						<thead>
+							<tr>
+								<th scope="col">Worker</th>
+								<th scope="col">Status</th>
+								<th scope="col" class="text-right">Jobs</th>
+								<th scope="col" class="text-right">Load</th>
+							</tr>
+						</thead>
+						<tbody>
+							for _, w := range workers {
+								<tr tabindex="0">
+									<td class="font-mono text-xs text-fg-muted">{ shortID(w.ID) }</td>
+									<td>@statusBadge(w.Tone, w.Status)</td>
+									<td class="tbl-num text-fg">{ itoaU32(w.ActiveJobs) }</td>
+									<td class="tbl-num text-fg-muted">{ itoaU32(w.Load) }%</td>
+								</tr>
+							}
+						</tbody>
+					</table>
+				</div>
+			}
+		</div>
+	</div>
+}
+
+// eventsPanel is the named event-stream panel: the most recent structured log
+// lines, each with a text-labeled level. Empty state covers a quiet system.
+templ eventsPanel(events []EventRow) {
+	<div class="panel">
+		<div class="panel-head">
+			<span class="panel-title">Event stream</span>
+			<span class="text-xs text-fg-faint">recent</span>
+		</div>
+		<div class="panel-body p-0">
+			if len(events) == 0 {
+				<div class="px-4 py-6">
+					@emptyState("Nothing to report", "No recent events. New log lines appear here as the fleet works.")
+				</div>
+			} else {
+				<ul class="divide-y divide-line font-mono text-xs">
+					for _, e := range events {
+						<li class="flex items-start gap-3 px-4 py-2">
+							<span class="tnum text-fg-faint">{ e.Time }</span>
+							<span class={ "w-12 flex-none font-semibold uppercase", toneText(e.Tone) }>{ e.Level }</span>
+							<span class="min-w-0 flex-1 break-words text-fg-muted">{ e.Message }</span>
+						</li>
+					}
+				</ul>
+			}
+		</div>
+	</div>
+}
+
+// emptyState is the shared empty/idle treatment: a glyph + a title + a one-line
+// next step in the operator's voice. An empty screen is an invitation to act, not
+// a dead end (AC4).
+templ emptyState(title, hint string) {
+	<div class="flex flex-col items-center gap-2 py-6 text-center">
+		<span class="text-fg-faint">
+			@iconInbox()
+		</span>
+		<p class="text-sm font-medium text-fg">{ title }</p>
+		<p class="max-w-sm text-xs text-fg-muted">{ hint }</p>
+	</div>
+}
+
+// statusBadge renders a status pill: the colored dot is decorative; the text label
+// carries the meaning, so the status reads in grayscale and to a screen reader.
+templ statusBadge(tone, label string) {
+	<span class={ "badge", toneBadge(tone) }>{ label }</span>
+}
+
+// toneTag is the small status word beside a KPI value (e.g. "ok"/"watch"), so the
+// KPI's health is stated in text, not only in the value's color.
+templ toneTag(tone string) {
+	<span class={ "font-mono text-xs font-semibold uppercase tracking-wide", toneText(tone) }>{ toneWord(tone) }</span>
+}

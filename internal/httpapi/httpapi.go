@@ -48,11 +48,13 @@ package httpapi
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/jaypetez/agent-gpu/internal/audit"
 	"github.com/jaypetez/agent-gpu/internal/auth"
 	"github.com/jaypetez/agent-gpu/internal/authz"
 	"github.com/jaypetez/agent-gpu/internal/metrics"
@@ -62,6 +64,7 @@ import (
 	"github.com/jaypetez/agent-gpu/internal/session"
 	"github.com/jaypetez/agent-gpu/internal/store"
 	"github.com/jaypetez/agent-gpu/internal/types"
+	usagepkg "github.com/jaypetez/agent-gpu/internal/usage"
 )
 
 // fleetSource is the subset of *server.Server the HTTP layer needs: a
@@ -73,9 +76,28 @@ import (
 // it.
 type fleetSource interface {
 	Fleet() []types.Worker
+	// WorkerByID resolves one worker's snapshot for the admin detail endpoint
+	// (#93); the bool is false when no such worker is connected (mapped to 404).
+	WorkerByID(id string) (types.Worker, bool)
 	DrainWorker(id string) error
+	// DrainWorkerWithDeadline is the timed/forced drain (#93): a deadline > 0
+	// schedules a forced eviction once in-flight jobs reach zero or the deadline
+	// elapses; a deadline <= 0 is the pure soft drain (identical to DrainWorker).
+	DrainWorkerWithDeadline(id string, deadline time.Duration) error
+	// AdminPullModel / AdminUnloadModel dispatch a model pull/unload to a worker on
+	// behalf of an admin operator (#93); authorization is the HTTP models:write
+	// scope, so neither re-runs the inference-path model authz. ErrWorkerNotFound
+	// when the worker is not connected.
+	AdminPullModel(ctx context.Context, workerID, model string) error
+	AdminUnloadModel(ctx context.Context, workerID, model string) error
 	QueueStats() queue.Stats
 	WaitTimeStats() server.WaitTimeStats
+	// AffinityStats is the session-affinity hit/miss/rebind snapshot the telemetry
+	// dashboard reports (#98). Added here alongside QueueStats/WaitTimeStats — the
+	// other in-process control-plane mirrors this layer already reads — so the
+	// telemetry handler stays unit-testable with the fake fleet. *server.Server
+	// satisfies it (AffinityStats).
+	AffinityStats() server.AffinityStats
 }
 
 // inferenceEngine is the subset of *server.Server the chat/completions handlers
@@ -109,6 +131,15 @@ type Server struct {
 	// against nil.
 	quota *quota.Engine
 
+	// usageSeries backs the rolling historical token series in GET /v1/admin/usage
+	// (#97): a bounded per-key daily series captured by the snapshotter goroutine in
+	// cmd. It is nil-safe — when nil (WithUsageSeries not supplied, e.g. most unit
+	// tests) the usage endpoint still serves the live per-key snapshot rows but with
+	// empty series and no forecast, so the series is a pure enrichment. It is read
+	// only here; the snapshotter that feeds it lives in cmd, mirroring how the quota
+	// counters are checkpointed there.
+	usageSeries *usagepkg.Store
+
 	// sessionMgr backs the session CRUD endpoints and stateful chat mode (#36).
 	// When nil, sessions are disabled: the /v1/sessions endpoints return 501 and
 	// a chat request carrying a body session_id is rejected. In cmd it is always
@@ -128,6 +159,59 @@ type Server struct {
 	// OpenAPI route set is unaffected).
 	metrics *metrics.Metrics
 
+	// requestStats is the lock-free in-process request-rate/latency accumulator
+	// (#98): a read-side mirror of the Prometheus request_duration histogram,
+	// updated inline by metricsMiddleware (atomics only, never a mutex) and read on
+	// demand by GET /v1/admin/telemetry. It exists because the Prometheus collectors
+	// are write-only in-process — there is no read API over a CounterVec/HistogramVec
+	// — so the JSON dashboard reads this rather than scraping Gather(). NewServer sets
+	// it up front; requestStatsOnce lazily constructs it for a Server built via a
+	// struct literal (some unit tests) so the hot path never dereferences nil. See
+	// telemetry.go.
+	requestStats     *requestStats
+	requestStatsOnce sync.Once
+
+	// auditLog is the append-only admin audit trail (#90): every admin WRITE
+	// records one redacted entry (actor, op, target, before/after, request_id,
+	// outcome). It is nil-safe — a nil store makes the recording calls no-ops, so
+	// unit tests that do not wire it behave exactly as before — and is set in
+	// NewServer when an audit store is supplied. Secrets are never recorded (the
+	// before/after projection omits SecretHash/Salt; see admin_audit.go).
+	auditLog *audit.MemoryStore
+
+	// config is the runtime settings/config holder backing GET/PUT
+	// /v1/admin/config (#92): the current tunable values plus the injected appliers
+	// that push a PUT change into the live subsystems. It is nil-safe — when no
+	// runtime config is wired (WithRuntimeConfig not supplied) the config endpoints
+	// return 503, mirroring how the session endpoints gate on a nil manager — and is
+	// set in NewServer when the option is supplied. These settings carry no secrets.
+	config *runtimeConfig
+
+	// logs is the read seam over the in-memory log ring (#90) backing GET
+	// /v1/admin/logs and its SSE live-tail (#99). It is an interface so this layer
+	// does not depend on cmd's concrete ring (the adapter lives in cmd, mirroring
+	// the config-applier injection in #92); the ring's records are already redacted
+	// at capture, so the source hands back redacted LogRecords this layer never
+	// re-inspects for secrets. It is nil-safe — when no log source is wired
+	// (WithLogSource not supplied, e.g. most unit tests) the log endpoints return
+	// 501, mirroring the nil-quota usage endpoint — and is set in NewServer when the
+	// option is supplied. Reads are concurrency-safe (the ring is mutex-guarded).
+	logs LogSource
+
+	// logStreamPoll overrides the live-tail poll interval (GET /v1/admin/logs/stream).
+	// It is zero in production (the handler then uses logStreamPollInterval); it is
+	// injectable only so a unit test can drive the tail fast and deterministically
+	// without a real-time sleep. See logStreamPollOrDefault.
+	logStreamPoll time.Duration
+
+	// idempotency caches the response of an admin WRITE keyed by its
+	// Idempotency-Key header so a duplicate request within the TTL replays the
+	// prior response instead of re-running the mutation (#90). It is constructed
+	// in NewServer; idempotencyOnce lazily constructs it for a Server built via a
+	// struct literal (some unit tests) so the middleware never dereferences nil.
+	idempotency     *idempotencyCache
+	idempotencyOnce sync.Once
+
 	// rlMu guards the rate-limit throttle counters below. A small dedicated mutex
 	// (rather than reusing a broader lock) keeps the throttle accounting cheap and
 	// off the request hot path's critical sections, mirroring server.affinityMu.
@@ -138,6 +222,17 @@ type Server struct {
 	globalThrottled uint64
 	keyThrottled    uint64
 
+	// startedAt is the wall-clock instant the Server was constructed (NewServer),
+	// used to compute uptime_seconds in the telemetry summary (#98) so the GUI can
+	// derive request rate from the monotonic requests.count. It is set once in
+	// NewServer and read-only thereafter; a struct-literal Server (some unit tests)
+	// leaves it zero, in which case uptimeSeconds reports 0.
+	startedAt time.Time
+	// nowFunc is the clock uptimeSeconds reads, defaulting to time.Now. It is
+	// injectable only so a unit test can make uptime deterministic; production never
+	// overrides it. A nil nowFunc means time.Now (uptimeSeconds guards).
+	nowFunc func() time.Time
+
 	// httpSrv is constructed in NewServer (not in ListenAndServe) so the pointer
 	// is non-nil and stable before any goroutine starts or any Shutdown call
 	// races startup. This gives a happens-before edge between construction and
@@ -145,6 +240,66 @@ type Server struct {
 	// no window where Shutdown sees nil and silently no-ops while the listener is
 	// still being brought up.
 	httpSrv *http.Server
+
+	// uiAssets is the filesystem the embedded admin console (#100) serves its
+	// static assets from. It is nil by default, in which case registerUIRoutes
+	// falls back to the assets compiled into the binary via go:embed (the
+	// production path). WithUIPath sets it to a disk-rooted FS so an operator can
+	// iterate on the CSS/vendored JS live without rebuilding (the --ui-path dev
+	// mode). The compiled templates are Go either way; only assets are switchable.
+	uiAssets fs.FS
+}
+
+// Option configures optional dependencies on an HTTP API Server that are not
+// part of the core positional constructor signature. It keeps NewServer
+// backward-compatible as cross-cutting subsystems (the admin audit log, #90) are
+// threaded in without churning every call site.
+type Option func(*Server)
+
+// WithAuditLog wires the append-only admin audit store (#90) so every admin
+// WRITE records a redacted entry. A nil store leaves auditing disabled (the
+// recording calls become no-ops), so tests and embedders that do not need it are
+// unaffected.
+func WithAuditLog(a *audit.MemoryStore) Option {
+	return func(s *Server) { s.auditLog = a }
+}
+
+// WithUsageSeries wires the rolling per-key daily usage series (#97) that backs
+// the historical sparkline and exhaustion forecast in GET /v1/admin/usage. A nil
+// store leaves the series disabled: the usage endpoint still serves the live
+// per-key snapshot rows (with empty series and no forecast), so callers and tests
+// that do not wire it behave exactly as before. The same *usage.Store is fed by
+// the snapshotter goroutine in cmd.
+func WithUsageSeries(u *usagepkg.Store) Option {
+	return func(s *Server) { s.usageSeries = u }
+}
+
+// WithLogSource wires the read seam over the in-memory log ring (#90) backing GET
+// /v1/admin/logs and its SSE live-tail (#99). A nil source (the option not
+// supplied, e.g. most unit tests) leaves log streaming disabled: the log
+// endpoints return 501, mirroring how the usage endpoint gates on a nil quota
+// engine. The concrete adapter over the ring lives in cmd (it maps the cmd-private
+// logRecord onto the exported LogRecord), so this package does not depend on the
+// logging setup — keeping the #90 ring untouched. The records the source returns
+// are already redacted at capture.
+func WithLogSource(src LogSource) Option {
+	return func(s *Server) { s.logs = src }
+}
+
+// WithUIAssets wires a custom filesystem for the embedded admin console's static
+// assets (#100). It backs the --ui-path development mode: cmd resolves a disk FS
+// rooted at the UI directory's assets and passes it here, so an operator iterating
+// on the CSS or vendored JS sees changes live without rebuilding the binary. When
+// the option is not supplied (production), registerUIRoutes serves the assets
+// compiled into the binary via go:embed. A nil fs.FS is treated as "not supplied"
+// (the embedded assets are used), so passing a failed disk-FS lookup never strands
+// the console without assets.
+func WithUIAssets(assets fs.FS) Option {
+	return func(s *Server) {
+		if assets != nil {
+			s.uiAssets = assets
+		}
+	}
 }
 
 // NewServer constructs an HTTP API Server. grpcSrv supplies the fleet snapshot,
@@ -152,21 +307,29 @@ type Server struct {
 // backs the session API + stateful chat (nil disables sessions), m is the
 // Prometheus instrument the request path updates (nil disables metrics, #24),
 // log receives structured logs (defaulting to slog.Default() when nil), and
-// listen is the host:port to bind.
-func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authorizer, mgr *session.Manager, m *metrics.Metrics, log *slog.Logger, listen string) *Server {
+// listen is the host:port to bind. Optional cross-cutting dependencies (e.g. the
+// admin audit log) are supplied via Option.
+func NewServer(grpcSrv *server.Server, authSvc *auth.Service, az *authz.Authorizer, mgr *session.Manager, m *metrics.Metrics, log *slog.Logger, listen string, opts ...Option) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	s := &Server{
-		fleet:      grpcSrv,
-		engine:     grpcSrv,
-		auth:       authSvc,
-		authz:      az,
-		quota:      grpcSrv.Quota(),
-		sessionMgr: mgr,
-		metrics:    m,
-		log:        log,
-		listen:     listen,
+		fleet:        grpcSrv,
+		engine:       grpcSrv,
+		auth:         authSvc,
+		authz:        az,
+		quota:        grpcSrv.Quota(),
+		sessionMgr:   mgr,
+		metrics:      m,
+		log:          log,
+		listen:       listen,
+		idempotency:  newIdempotencyCache(defaultIdempotencyTTL, idempotencyCacheMax),
+		requestStats: &requestStats{},
+		startedAt:    time.Now(),
+		nowFunc:      time.Now,
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	// Build the *http.Server up front so the pointer is stable before any
 	// ListenAndServe goroutine or Shutdown call observes it (see field doc).
@@ -208,6 +371,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleGetSession)))
 	mux.Handle("DELETE /v1/sessions/{id}", s.authMiddleware(http.HandlerFunc(s.handleDeleteSession)))
 	s.registerAdminRoutes(mux)
+	// Embedded admin console (#100). Mounted via a function call, NOT via
+	// route-registration string literals in THIS file, so the OpenAPI route-sync
+	// test (which parses those literals here and pins the public-API count) does
+	// not count the console's HTML/static routes against the API contract: the GUI
+	// is not part of the OpenAPI surface. The routes still mount on this same mux
+	// and inherit the metrics→requestID→recover chain below. See webui.go.
+	s.registerUIRoutes(mux)
 	// Middleware order (outermost first): metrics → requestID → recover → mux.
 	// Correlation id is established before auth so every response — including
 	// unauthenticated 401s short-circuited by authMiddleware — gets a request_id
@@ -222,29 +392,99 @@ func (s *Server) Handler() http.Handler {
 	return s.metricsMiddleware(s.requestIDMiddleware(s.recoverMiddleware(mux)))
 }
 
-// admin wraps an admin handler in the auth + admin-role gates. Every admin route
-// is registered through it so the two-stage gating (authenticate then require
-// the admin role) is applied uniformly and cannot be forgotten on a new route.
+// admin wraps an admin handler in the auth + admin-role gates. It is retained as
+// the superuser gate (authenticate then require the admin role) for any route
+// that is not scope-decomposed; scope-gated routes use requireScope instead. The
+// RoleAdmin superuser passes both, so existing admin keys are unaffected (AC2).
 func (s *Server) admin(h http.HandlerFunc) http.Handler {
 	return s.authMiddleware(s.adminMiddleware(h))
 }
 
-// registerAdminRoutes mounts the admin API (#4) on mux. Every route is gated by
-// s.admin (authenticate → require admin role). Go 1.22+ method+path patterns let
-// the collection, {id}, and {id}/sub routes coexist without collision and pin
-// each verb. See admin.go for the handlers and the response shapes.
+// requireScope wraps a read (non-mutating) admin handler in the auth + scope
+// gates: authenticate, then require the given admin scope (authz.HasScope, which
+// the RoleAdmin superuser always satisfies). It is the read counterpart of
+// requireScopeWrite (which additionally layers idempotency). Using it on the
+// existing admin routes makes the scope matrix real — a key with only
+// keys:read passes GET /v1/admin/keys but not the writes — while a RoleAdmin key
+// still passes everything.
+func (s *Server) requireScope(scope string, h http.HandlerFunc) http.Handler {
+	return s.authMiddleware(s.scopeMiddleware(scope, h))
+}
+
+// requireScopeWrite wraps an admin WRITE handler in the full admin write stack:
+// authenticate → require the scope → idempotency replay → audit-recorded
+// handler. The idempotency middleware sits inside the scope gate (so only an
+// authorized write is ever cached/replayed) and outside the handler (so it
+// captures the handler's response). Audit recording happens inside the handler
+// itself (the handler calls s.recordAudit around its mutation), since only the
+// handler knows the before/after of the specific resource.
+func (s *Server) requireScopeWrite(scope string, h http.HandlerFunc) http.Handler {
+	return s.authMiddleware(s.scopeMiddleware(scope, s.idempotent(h)))
+}
+
+// registerAdminRoutes mounts the admin API (#4, scoped in #90) on mux. Each
+// route is gated by the matching resource×operation scope via requireScope
+// (reads) or requireScopeWrite (writes, which additionally layer idempotency and
+// audit). The RoleAdmin superuser holds every scope, so an admin key passes every
+// route exactly as before. Go 1.22+ method+path patterns let the collection,
+// {id}, and {id}/sub routes coexist without collision and pin each verb. See
+// admin.go for the handlers and the response shapes.
 func (s *Server) registerAdminRoutes(mux *http.ServeMux) {
-	mux.Handle("POST /v1/admin/keys", s.admin(s.handleAdminCreateKey))
-	mux.Handle("GET /v1/admin/keys", s.admin(s.handleAdminListKeys))
-	mux.Handle("GET /v1/admin/keys/{id}", s.admin(s.handleAdminGetKey))
-	mux.Handle("DELETE /v1/admin/keys/{id}", s.admin(s.handleAdminRevokeKey))
-	mux.Handle("POST /v1/admin/keys/{id}/rotate", s.admin(s.handleAdminRotateKey))
-	mux.Handle("PUT /v1/admin/keys/{id}/permissions", s.admin(s.handleAdminSetPermissions))
-	mux.Handle("PUT /v1/admin/keys/{id}/quota", s.admin(s.handleAdminSetQuota))
-	mux.Handle("GET /v1/admin/keys/{id}/quota", s.admin(s.handleAdminGetQuota))
-	mux.Handle("GET /v1/admin/workers", s.admin(s.handleAdminListWorkers))
-	mux.Handle("POST /v1/admin/workers/{id}/drain", s.admin(s.handleAdminDrainWorker))
-	mux.Handle("GET /v1/admin/stats", s.admin(s.handleAdminStats))
+	mux.Handle("POST /v1/admin/keys", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminCreateKey))
+	mux.Handle("GET /v1/admin/keys", s.requireScope(authz.ScopeKeysRead, s.handleAdminListKeys))
+	mux.Handle("GET /v1/admin/keys/{id}", s.requireScope(authz.ScopeKeysRead, s.handleAdminGetKey))
+	mux.Handle("DELETE /v1/admin/keys/{id}", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminRevokeKey))
+	mux.Handle("POST /v1/admin/keys/{id}/rotate", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminRotateKey))
+	mux.Handle("PUT /v1/admin/keys/{id}/permissions", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminSetPermissions))
+	mux.Handle("PUT /v1/admin/keys/{id}/quota", s.requireScopeWrite(authz.ScopeKeysWrite, s.handleAdminSetQuota))
+	mux.Handle("GET /v1/admin/keys/{id}/quota", s.requireScope(authz.ScopeKeysRead, s.handleAdminGetQuota))
+	// Role/scope catalog (#95): the assignable roles + the inference actions and
+	// admin scopes each grants, plus the full scope vocabulary, so a permissions
+	// editor GUI can render its pickers without reverse-engineering authz.decide.
+	// A pure read of static metadata gated to keys:read (same resource as the keys
+	// it helps edit) — not audited.
+	mux.Handle("GET /v1/admin/roles", s.requireScope(authz.ScopeKeysRead, s.handleAdminRoles))
+	mux.Handle("GET /v1/admin/workers", s.requireScope(authz.ScopeWorkersRead, s.handleAdminListWorkers))
+	mux.Handle("GET /v1/admin/workers/{id}", s.requireScope(authz.ScopeWorkersRead, s.handleAdminGetWorker))
+	// Aggregated GPU/fleet capacity inventory (#94): a read-only roll-up over the
+	// same heartbeat capacity fields the worker endpoints expose (no new probing).
+	// Gated to workers:read — it is fleet capacity data, the same resource as the
+	// worker list.
+	mux.Handle("GET /v1/admin/gpus", s.requireScope(authz.ScopeWorkersRead, s.handleAdminGPUs))
+	mux.Handle("POST /v1/admin/workers/{id}/drain", s.requireScopeWrite(authz.ScopeWorkersWrite, s.handleAdminDrainWorker))
+	// Per-worker model management (#93): pull a model onto a worker / unload one
+	// from it. Gated to models:write (not workers:write) — they act on the model
+	// catalog resident on the worker. {model...} is a multi-segment wildcard so a
+	// namespaced or colon-tagged model (library/x:tag, qwen2:0.5b) is captured
+	// whole via r.PathValue("model").
+	mux.Handle("POST /v1/admin/workers/{id}/models", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminPullModel))
+	mux.Handle("DELETE /v1/admin/workers/{id}/models/{model...}", s.requireScopeWrite(authz.ScopeModelsWrite, s.handleAdminUnloadModel))
+	mux.Handle("GET /v1/admin/stats", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminStats))
+	// Dashboard telemetry summary (#98): request rate/latency, throttles, fleet
+	// health by status, active sessions, and affinity hit/miss in ONE call. A
+	// read-only JSON facade over the SAME in-process collectors — it scrapes nothing
+	// from Prometheus and the /metrics listener is unchanged. Gated to telemetry:read
+	// (the same scope as the stats and usage endpoints) — it is monitoring telemetry.
+	mux.Handle("GET /v1/admin/telemetry", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminTelemetry))
+	// Per-key usage vs limits + a rolling historical series and best-effort
+	// exhaustion forecast (#97). A read-only roll-up over the same quota snapshot the
+	// per-key quota endpoint exposes, enriched with the bounded daily series. Gated
+	// to telemetry:read — it is usage telemetry, the same resource as the stats
+	// endpoint. Supports ?format=csv for a flat CSV export of the per-key rows.
+	mux.Handle("GET /v1/admin/usage", s.requireScope(authz.ScopeTelemetryRead, s.handleAdminUsage))
+	mux.Handle("GET /v1/admin/audit", s.requireScope(authz.ScopeAuditRead, s.handleAdminAudit))
+	// Structured log query + live tail (#99): a filterable, cursor-paginated read of
+	// the in-memory log ring (#90) and an SSE live-tail of new matching lines. Both
+	// gated to logs:read; both 501 when no log source is wired (WithLogSource not
+	// supplied). The ring's records are already redacted at capture, so no secret
+	// reaches either endpoint. See admin_logs.go.
+	mux.Handle("GET /v1/admin/logs", s.requireScope(authz.ScopeLogsRead, s.handleAdminLogs))
+	mux.Handle("GET /v1/admin/logs/stream", s.requireScope(authz.ScopeLogsRead, s.handleAdminLogsStream))
+	// Settings/config management (#92): the effective resolved settings (config:read)
+	// and a partial live hot-reload update (config:write, which additionally layers
+	// idempotency + audit via requireScopeWrite).
+	mux.Handle("GET /v1/admin/config", s.requireScope(authz.ScopeConfigRead, s.handleAdminGetConfig))
+	mux.Handle("PUT /v1/admin/config", s.requireScopeWrite(authz.ScopeConfigWrite, s.handleAdminPutConfig))
 }
 
 // ListenAndServe binds s.listen and serves until the listener is closed or

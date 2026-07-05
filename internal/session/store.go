@@ -233,14 +233,20 @@ func (m *MemorySessionStore) LoadCheckpoint(path string, now time.Time) (dropped
 // per-session turn-count, cumulative-byte, and cumulative context-token caps
 // under a configurable overflow policy (trim-oldest by default), as documented
 // on HistoryStore. History survives restarts via Checkpoint/LoadCheckpoint.
+//
+// The caps and overflow policy are runtime-tunable (#92): SetCaps replaces them
+// live with no restart. They are guarded by mu — the same lock that serializes
+// Append/trim/exceedsCap — so a cap read on the append hot path always sees a
+// consistent set and a live update never races a concurrent append. Tightening a
+// cap takes effect on the NEXT append (already-stored history is not retroactively
+// trimmed until it next grows), matching how LoadCheckpoint re-trims on load.
 type MemoryHistoryStore struct {
+	mu        sync.RWMutex
 	maxTurns  int
 	maxBytes  int
 	maxTokens int
 	policy    OverflowPolicy
-
-	mu      sync.RWMutex
-	history map[string][]types.Message
+	history   map[string][]types.Message
 }
 
 // NewMemoryHistoryStore returns an empty in-memory HistoryStore bounded by
@@ -265,6 +271,43 @@ func NewMemoryHistoryStoreWithPolicy(maxTurns, maxBytes, maxTokens int, policy O
 		maxTokens: maxTokens,
 		policy:    policy,
 		history:   make(map[string][]types.Message),
+	}
+}
+
+// HistoryCaps is the runtime-tunable set of per-session history caps and the
+// overflow policy (#92). A non-positive cap means "unbounded" for that dimension,
+// matching the constructor convention. It is the value SetCaps applies and Caps
+// returns, so the admin config layer can read and replace the whole set atomically.
+type HistoryCaps struct {
+	MaxTurns  int
+	MaxBytes  int
+	MaxTokens int
+	Policy    OverflowPolicy
+}
+
+// SetCaps replaces the per-session history caps and overflow policy at runtime
+// (#92), under the same lock that serializes appends so the change is atomic with
+// respect to a concurrent Append/AppendBatch. It takes effect on the next append
+// (stored history is not retroactively trimmed). Safe for concurrent use.
+func (m *MemoryHistoryStore) SetCaps(c HistoryCaps) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxTurns = c.MaxTurns
+	m.maxBytes = c.MaxBytes
+	m.maxTokens = c.MaxTokens
+	m.policy = c.Policy
+}
+
+// Caps returns the current history caps and overflow policy (#92), read under mu
+// so it reflects any live SetCaps. It backs the admin config GET projection.
+func (m *MemoryHistoryStore) Caps() HistoryCaps {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return HistoryCaps{
+		MaxTurns:  m.maxTurns,
+		MaxBytes:  m.maxBytes,
+		MaxTokens: m.maxTokens,
+		Policy:    m.policy,
 	}
 }
 

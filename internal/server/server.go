@@ -83,6 +83,19 @@ type worker struct {
 	// written from multiple goroutines concurrently).
 	send chan *agentgpuv1.ServerMessage
 
+	// ctx is the per-stream context derived from stream.Context() in Connect, and
+	// cancel tears it down. Cancelling unblocks both the reader (stream.Recv) and
+	// the writer goroutine, so the RPC returns and the deferred removeWorker runs.
+	// ctx.Done() is the leak-free "this worker is going away" signal — it fires on
+	// EVERY Connect exit path (worker disconnect, EOF, stream error, a superseding
+	// reconnect, and a forced evict), because Connect defers cancel() — so the
+	// forced-drain reaper (#93) selects on it to stop. cancel is the seam that
+	// reaper uses to evict a worker that has not finished draining by its deadline;
+	// the natural paths do not need it. Both are set once in Connect and never
+	// mutated, so they need no lock for reads.
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	mu      sync.Mutex
 	pending map[string]chan types.JobResult // job id -> result waiter
 	// streams accumulates the output deltas of in-flight streaming jobs, keyed by
@@ -142,6 +155,19 @@ func (w *worker) markDraining() {
 	w.mu.Lock()
 	w.draining = true
 	w.mu.Unlock()
+}
+
+// inFlight returns the number of jobs currently dispatched to the worker and
+// awaiting a result (the pending-waiter count). It backs the forced-drain reaper
+// (#93), which evicts a draining worker once its in-flight jobs reach zero. The
+// pending map is the authoritative server-side count: an entry is added at
+// dispatch (addPending) and removed when the result arrives (resolve) or the
+// stream drops (failAllPending), so it tracks exactly the jobs a drain must wait
+// on.
+func (w *worker) inFlight() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.pending)
 }
 
 // snapshot builds a fleet-view snapshot of the worker. now and timeout classify
@@ -360,6 +386,12 @@ type Server struct {
 	// existing scheduler/dispatch/quota/authz path is unchanged. Wired by #36.
 	sessionMgr *session.Manager
 
+	// warmMu guards modelWarmMax, which is runtime-tunable (#92): SetModelWarmMax
+	// replaces it live with no restart, and sessionDispatchHints reads it under
+	// warmMu so a concurrent dispatch observes the change atomically. It is a small
+	// dedicated mutex separate from s.mu so a warm-window update never contends with
+	// the fleet read path.
+	warmMu sync.RWMutex
 	// modelWarmMax caps the model-warmth keep_alive window (#35): for a
 	// session-bound job the dispatcher sets Job.KeepAliveSeconds to
 	// min(session TTL, modelWarmMax) so the model stays resident across the
@@ -844,7 +876,14 @@ func (s *Server) failAllWaiters(err *types.JobError) {
 // connected worker; it runs until the worker disconnects or the server's
 // context is cancelled.
 func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
-	ctx := stream.Context()
+	// Derive a cancelable context from the stream context so a forced drain (#93)
+	// can tear this stream down on demand: cancelling unblocks both the writer
+	// goroutine and the reader's stream.Recv, the RPC returns, and the deferred
+	// removeWorker cleans up. The natural lifecycle (worker disconnect, graceful
+	// Deregister) cancels it through the parent stream context; the explicit
+	// defer cancel() guarantees no leak on any return path.
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
 
 	// The first message must be a registration.
 	first, err := stream.Recv()
@@ -870,6 +909,8 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		id:        reg.GetWorkerId(),
 		models:    types.ModelsFromProto(reg.GetModels()),
 		send:      make(chan *agentgpuv1.ServerMessage, 16),
+		ctx:       ctx,
+		cancel:    cancel,
 		pending:   make(map[string]chan types.JobResult),
 		streams:   make(map[string]*strings.Builder),
 		observers: make(map[string]chan types.JobChunk),
@@ -913,15 +954,49 @@ func (s *Server) Connect(stream agentgpuv1.ControlPlane_ConnectServer) error {
 		}
 	}()
 
+	// Receiver goroutine: stream.Recv blocks, so it is run here and its results are
+	// fed to recvCh, letting the reader loop below ALSO select on ctx.Done(). That
+	// is what makes a forced evict (#93) actually tear the RPC down: w.cancel()
+	// unblocks the loop, Connect returns, gRPC cancels the real stream context, and
+	// this goroutine's next stream.Recv errors and it exits — no reader/stream leak.
+	// Without this, the loop would stay parked in stream.Recv() and keep processing
+	// heartbeats for an already-evicted worker. recvCh is buffered so a final result
+	// produced just as the loop exits does not wedge this goroutine; the ctx.Done
+	// guard on the send covers the rest.
+	type recvResult struct {
+		msg *agentgpuv1.WorkerMessage
+		err error
+	}
+	recvCh := make(chan recvResult, 1)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{msg: msg, err: err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	// Reader loop: receive worker -> server messages.
 	for {
+		var rr recvResult
 		select {
+		case <-ctx.Done():
+			// The stream context ended (worker disconnect) or this worker was
+			// force-evicted (w.cancel). Either way, stop reading and let the deferred
+			// removeWorker run; pending jobs were already failed by the evict path.
+			return ctx.Err()
 		case err := <-sendErr:
 			return err
-		default:
+		case rr = <-recvCh:
 		}
 
-		msg, err := stream.Recv()
+		msg, err := rr.msg, rr.err
 		if err != nil {
 			if err == io.EOF {
 				s.log.Info("worker disconnected", "worker", w.id)
@@ -1091,7 +1166,10 @@ func (s *Server) sessionDispatchHints(ctx context.Context, job types.Job, keyID 
 			"session", job.SessionID, "key_id", keyID, "err", err)
 		return "", 0
 	}
-	return sess.BoundWorkerID, warmWindowSeconds(sess.TTL, s.modelWarmMax)
+	s.warmMu.RLock()
+	warm := s.modelWarmMax
+	s.warmMu.RUnlock()
+	return sess.BoundWorkerID, warmWindowSeconds(sess.TTL, warm)
 }
 
 // warmWindowSeconds derives the keep_alive window (in whole seconds) for a
@@ -1422,11 +1500,48 @@ func (s *Server) Fleet() []types.Worker {
 	return out
 }
 
+// WorkerByID returns the fleet snapshot for the worker with the given id and
+// whether it is currently connected. It is the per-worker read seam for the
+// admin detail endpoint (#93): rather than make the HTTP layer scan Fleet(), the
+// server resolves the live handle under the registry lock and projects the same
+// snapshot Fleet() would (so status/draining/uptime are computed identically).
+func (s *Server) WorkerByID(id string) (types.Worker, bool) {
+	now := s.now()
+	s.mu.RLock()
+	w, ok := s.workers[id]
+	s.mu.RUnlock()
+	if !ok {
+		return types.Worker{}, false
+	}
+	return w.snapshot(now, s.heartbeatTimeout), true
+}
+
 // DrainWorker marks the worker with the given id as draining: pickWorker stops
 // selecting it while its in-flight jobs finish. It is the admin seam for #4
 // (operator-initiated drain), distinct from a worker self-deregistering on
 // graceful shutdown. Returns ErrWorkerNotFound if no such worker is connected.
+//
+// This is the pure soft-drain (no deadline): the worker is left to finish its
+// in-flight jobs and is only removed when it eventually closes its stream. It is
+// preserved exactly as before; DrainWorkerWithDeadline(id, 0) is equivalent.
 func (s *Server) DrainWorker(id string) error {
+	return s.DrainWorkerWithDeadline(id, 0)
+}
+
+// DrainWorkerWithDeadline marks the worker draining and, when deadline > 0,
+// schedules a forced eviction once the worker's in-flight jobs reach zero OR the
+// deadline elapses — whichever comes first (#93). A deadline <= 0 is the pure
+// soft drain (identical to DrainWorker): the worker finishes its in-flight jobs
+// and is removed only when it closes its stream. Returns ErrWorkerNotFound if no
+// such worker is connected.
+//
+// The forced path never blocks the caller: the soft drain is applied
+// synchronously (so routing stops at once) and the wait runs in a background
+// reaper goroutine. The reaper holds no server lock while it waits, stops itself
+// if the worker disconnects on its own (no leak), and evicts via the shared
+// stale-eviction primitive (evictWorker) plus a stream cancel, so the forced and
+// natural removal paths converge on the same registry cleanup.
+func (s *Server) DrainWorkerWithDeadline(id string, deadline time.Duration) error {
 	s.mu.RLock()
 	w, ok := s.workers[id]
 	s.mu.RUnlock()
@@ -1434,8 +1549,77 @@ func (s *Server) DrainWorker(id string) error {
 		return ErrWorkerNotFound
 	}
 	w.markDraining()
-	s.log.Info("worker drain requested", "worker", id)
+	if deadline <= 0 {
+		s.log.Info("worker drain requested", "worker", id)
+		return nil
+	}
+	s.log.Info("worker drain requested", "worker", id, "deadline", deadline.String())
+	go s.reapDrainedWorker(w, deadline)
 	return nil
+}
+
+// reapDrainedWorker waits for a draining worker's in-flight jobs to finish, then
+// force-evicts it; if the deadline elapses first, it force-evicts regardless,
+// failing whatever jobs are still in flight. It is the background half of a timed
+// forced drain (#93).
+//
+// Concurrency: the reaper takes no server lock while waiting. It polls inFlight()
+// on a short ticker (a job completing removes its pending entry, the same signal
+// the placement loop already keys capacity off, so there is no missed-wakeup
+// risk) and selects in parallel on:
+//   - a deadline timer — force-evict when it fires;
+//   - w.ctx.Done() — the worker disconnected on its own (graceful drain completed,
+//     or the stream dropped) and was already removed by removeWorker, so the
+//     reaper just exits, leaving no goroutine leak.
+//
+// An already-zero in-flight count at drain time evicts on the first tick.
+func (s *Server) reapDrainedWorker(w *worker, deadline time.Duration) {
+	// Poll often enough to evict promptly once jobs drain, but coarsely relative to
+	// the deadline so the ticker is cheap. Bounded to a small floor/ceiling.
+	interval := deadline / 20
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	if interval > time.Second {
+		interval = time.Second
+	}
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			// Worker went away on its own (finished draining or disconnected); the
+			// deferred removeWorker already cleaned it up. Nothing to force.
+			return
+		case <-timer.C:
+			s.log.Warn("forced drain deadline reached; evicting worker",
+				"worker", w.id, "in_flight", w.inFlight(), "deadline", deadline.String())
+			s.forceEvictWorker(w)
+			return
+		case <-ticker.C:
+			if w.inFlight() == 0 {
+				s.log.Info("drained worker idle; evicting", "worker", w.id)
+				s.forceEvictWorker(w)
+				return
+			}
+		}
+	}
+}
+
+// forceEvictWorker removes a worker now, reusing the stale-eviction primitive
+// (evictWorker: delete from the registry if still current, fail its pending jobs)
+// and then cancels its stream so the Connect RPC returns and the deferred
+// removeWorker also runs. It is idempotent against a worker already gone: the
+// evictWorker guard is a no-op if the id was reassigned, and cancel on an
+// already-cancelled context is a no-op. Pending jobs are failed with
+// worker_evicted so a forced-drain caller is distinguishable from a graceful
+// finish.
+func (s *Server) forceEvictWorker(w *worker) {
+	s.evictWorker(w, &types.JobError{Code: "worker_evicted", Message: "worker drained and evicted"})
+	w.cancel()
 }
 
 // SubmitAuthorizedJob authorizes an already-authenticated key for inference on
@@ -1606,6 +1790,57 @@ func (s *Server) SubmitAuthorizedJobStream(ctx context.Context, key store.APIKey
 // graceful-shutdown checkpointing by the cmd layer).
 func (s *Server) Quota() *quota.Engine { return s.quota }
 
+// SetHeartbeatTimeout replaces the stale-eviction window at runtime (#92): the
+// length of time a worker may go without a heartbeat before the eviction loop
+// reaps it. A non-positive value is rejected (the existing timeout is kept) so
+// eviction is never disabled by a bad value; the runtime-config layer validates
+// d > 0 before calling, so a rejection here is a defensive backstop. It takes
+// effect immediately with no restart — evictStale, pickWorker, and Fleet all read
+// heartbeatTimeout under s.mu, and this writes it under s.mu.Lock() — and is safe
+// for concurrent use. The eviction-loop scan cadence (evictScan) is unchanged; the
+// next scan simply uses the new timeout.
+func (s *Server) SetHeartbeatTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heartbeatTimeout = d
+}
+
+// HeartbeatTimeout returns the current stale-eviction window (#92), read under
+// s.mu so it reflects any live SetHeartbeatTimeout. It backs the admin config GET
+// projection.
+func (s *Server) HeartbeatTimeout() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.heartbeatTimeout
+}
+
+// SetModelWarmMax replaces the model-warmth keep_alive cap at runtime (#92): the
+// longest a session-bound model is kept resident on its worker after a turn. A
+// non-positive value is rejected (the existing cap is kept) so the derived warm
+// window stays bounded; the runtime-config layer validates d > 0 before calling.
+// It takes effect on the next session-bound dispatch with no restart
+// (sessionDispatchHints reads it under warmMu) and is safe for concurrent use.
+func (s *Server) SetModelWarmMax(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.warmMu.Lock()
+	defer s.warmMu.Unlock()
+	s.modelWarmMax = d
+}
+
+// ModelWarmMax returns the current model-warmth keep_alive cap (#92), read under
+// warmMu so it reflects any live SetModelWarmMax. It backs the admin config GET
+// projection.
+func (s *Server) ModelWarmMax() time.Duration {
+	s.warmMu.RLock()
+	defer s.warmMu.RUnlock()
+	return s.modelWarmMax
+}
+
 // PullModel authorizes an already-authenticated key for the Pull action on
 // model and, if permitted, instructs the named worker to fetch it onto its
 // local Ollama. It mirrors SubmitAuthorizedJob's authorize-before-act ordering:
@@ -1680,6 +1915,66 @@ func (s *Server) UnloadSessionModel(ctx context.Context, workerID, model string)
 		// Ollama's idle keep_alive timer will release the model regardless.
 		s.log.Debug("unload dropped: worker send not ready", "worker", workerID, "model", model)
 	}
+}
+
+// AdminPullModel instructs the named worker to pull model onto its local Ollama
+// on behalf of an admin operator (#93). It is the dispatch-only counterpart of
+// PullModel: the admin HTTP endpoint is already gated by the models:write admin
+// scope, so this method deliberately does NOT re-run the inference-path model
+// authorization (authz.Pull / per-key allow-deny lists) that PullModel applies —
+// doing so would wrongly block a non-superuser key that legitimately holds
+// models:write but is not on a model's allow-list. The pull is fire-and-forget:
+// the worker pulls asynchronously and advertises the new model on its next
+// heartbeat. Returns ErrWorkerNotFound if no such worker is connected, or ctx's
+// error if the caller's context ends before the message is enqueued.
+func (s *Server) AdminPullModel(ctx context.Context, workerID, model string) error {
+	s.mu.RLock()
+	w, ok := s.workers[workerID]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrWorkerNotFound
+	}
+	select {
+	case w.send <- &agentgpuv1.ServerMessage{
+		Payload: &agentgpuv1.ServerMessage_PullModel{
+			PullModel: &agentgpuv1.PullModel{Model: model},
+		},
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.log.Info("admin pull requested", "worker", workerID, "model", model)
+	return nil
+}
+
+// AdminUnloadModel instructs the named worker to unload model from its Ollama,
+// freeing the VRAM, on behalf of an admin operator (#93). It mirrors
+// UnloadSessionModel's best-effort send but, unlike it, RETURNS ErrWorkerNotFound
+// when the worker is not connected so the admin DELETE endpoint can map that to a
+// 404. A model that is not currently loaded is a worker-side no-op (the executor
+// treats an Ollama "not found" as success), so a successful dispatch is reported
+// as success regardless of whether the model was resident — matching the
+// "missing model is success" contract. Like the admin pull, authorization is the
+// HTTP models:write scope; no inference-path model authz is applied. Returns ctx's
+// error if the caller's context ends before the message is enqueued.
+func (s *Server) AdminUnloadModel(ctx context.Context, workerID, model string) error {
+	s.mu.RLock()
+	w, ok := s.workers[workerID]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrWorkerNotFound
+	}
+	select {
+	case w.send <- &agentgpuv1.ServerMessage{
+		Payload: &agentgpuv1.ServerMessage_UnloadModel{
+			UnloadModel: &agentgpuv1.UnloadModel{Model: model},
+		},
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.log.Info("admin unload requested", "worker", workerID, "model", model)
+	return nil
 }
 
 // SubmitJob dispatches a job to a worker and waits for the result. This is the

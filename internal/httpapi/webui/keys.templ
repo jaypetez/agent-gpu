@@ -1,0 +1,537 @@
+package webui
+
+// keys.templ — the API keys, users, and permissions screens (issue 102). One
+// screen (Keys) over a single masked table; every state-changing action is an
+// Alpine-driven modal that posts via HTMX:
+//
+//   - Keys(...)            the screen: a "New key" action over a live, masked key
+//     table (HTMX-polled). The table NEVER shows a token — only a fixed mask — and
+//     each row carries an owner/team, its roles + admin scopes, created/last-used/
+//     expiry, and a status (active/revoked/expired) shown as a text-labeled badge.
+//   - KeyListPartial(...)  the loaded table fragment, with per-row controls:
+//     edit permissions (full-replace editor), rotate (high-friction, reveals a new
+//     token once), and revoke (HIGH friction — typed-name confirm, like the
+//     workers' force-evict).
+//   - KeyReveal_(...)      the ONE-TIME token reveal returned by create/rotate: the
+//     plaintext token shown exactly once, with a copy affordance, never stored or
+//     re-shown.
+//   - KeyActionToast(...)  the inline toast a revoke / permissions write swaps in.
+//
+// All styling is token-derived utility classes from app.css; no raw hex and no
+// arbitrary [...] values (the token-lint test fails the build on either). Status is
+// always color AND text. Destructive controls use Alpine for the confirm interaction
+// and HTMX for the write, inheriting the body's hx-headers CSRF token; there are NO
+// inline event handlers (CSP-clean: script-src 'self' 'unsafe-eval').
+
+// Keys is the API-keys screen. The static header (with the create action) sits
+// above the HTMX-polled masked table. The create modal and its full role/scope
+// pickers live at the page root so the form is mounted once; the per-row rotate /
+// revoke / permissions modals live inside each row in the table fragment.
+templ Keys(d KeysData) {
+	@Shell(d.Shell) {
+		<div x-data="{ createOpen: false }">
+			<div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+				<div>
+					<h1 class="text-2xl font-semibold text-fg">API keys</h1>
+					<p class="mt-1 text-sm text-fg-muted">Issue, scope, rotate, and revoke keys. Secrets are shown once at creation.</p>
+				</div>
+				<div class="flex gap-2">
+					<button
+						type="button"
+						class="btn btn-ghost"
+						hx-get={ d.Shell.AssetPath + "/../partials/keys" }
+						hx-target="#key-list"
+						hx-swap="outerHTML"
+						title="Refresh now"
+					>
+						@iconGauge()
+						<span>Refresh</span>
+					</button>
+					<button type="button" class="btn btn-primary" x-on:click="createOpen = true">
+						@iconKey()
+						<span>New key</span>
+					</button>
+				</div>
+			</div>
+			<!-- Masked key table: loads on first paint, then refreshes on a calm cadence. -->
+			<div
+				id="key-list"
+				hx-get={ d.Shell.AssetPath + "/../partials/keys" }
+				hx-trigger="load, every 15s"
+				hx-swap="outerHTML"
+			>
+				@KeyListLoading()
+			</div>
+			@createKeyModal(d)
+		</div>
+	}
+}
+
+// createKeyModal is the new-key form, a single-column dialog with persistent labels,
+// required-field marking, and inline (on-blur) validation on the name. The role and
+// admin-scope pickers are rendered from the catalog (authz.AllRoles / authz.AllScopes)
+// seeded into KeysData, so the editor can never offer a value authorization doesn't
+// recognize. It posts via HTMX; the response is the one-time token reveal, swapped
+// into #key-reveal, and the table is refreshed on success.
+templ createKeyModal(d KeysData) {
+	<div x-show="createOpen" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4" role="dialog" aria-modal="true" aria-labelledby="create-key-title">
+		<div class="modal-backdrop" x-on:click="createOpen = false"></div>
+		<div class="modal relative mt-8 w-full max-w-lg p-5" x-data="{ name: '' }">
+			<div class="mb-4 flex items-start justify-between gap-3">
+				<div>
+					<h2 id="create-key-title" class="text-lg font-semibold text-fg">New API key</h2>
+					<p class="mt-1 text-sm text-fg-muted">The token is shown once after you create it.</p>
+				</div>
+				<button type="button" class="btn btn-ghost" x-on:click="createOpen = false" aria-label="Close">✕</button>
+			</div>
+			<form
+				class="flex flex-col gap-4"
+				hx-post="/admin/keys"
+				hx-target="#key-reveal"
+				hx-swap="innerHTML"
+				x-on:htmx:after-request="if ($event.detail.successful) { createOpen = false; htmx.ajax('GET', '/admin/partials/keys', { target: '#key-list', swap: 'outerHTML' }); }"
+			>
+				@csrfField(d.Shell.CSRFToken)
+				<div class="flex flex-col gap-1.5">
+					<label for="key-name" class="text-sm font-medium text-fg">Name <span class="text-danger">*</span></label>
+					<input
+						id="key-name"
+						name="name"
+						type="text"
+						required
+						autocomplete="off"
+						spellcheck="false"
+						placeholder="ci-pipeline"
+						class="field"
+						x-model="name"
+						x-bind:aria-invalid="name.trim() === '' ? 'true' : 'false'"
+						aria-describedby="key-name-hint"
+					/>
+					<p id="key-name-hint" class="text-xs text-fg-faint">A human label so the key can be told apart later.</p>
+				</div>
+				<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+					<div class="flex flex-col gap-1.5">
+						<label for="key-owner" class="text-sm font-medium text-fg">Owner</label>
+						<input id="key-owner" name="owner" type="text" autocomplete="off" placeholder="data-team@" class="field"/>
+					</div>
+					<div class="flex flex-col gap-1.5">
+						<label for="key-team" class="text-sm font-medium text-fg">Team</label>
+						<input id="key-team" name="team" type="text" autocomplete="off" placeholder="platform" class="field"/>
+					</div>
+				</div>
+				@rolePicker(d.Roles, nil)
+				@scopePicker(d.AdminScopes, nil)
+				@modelListFields(nil, nil, "create-")
+				<div class="mt-1 flex items-center justify-end gap-2">
+					<button type="button" class="btn btn-ghost" x-on:click="createOpen = false">Cancel</button>
+					<button type="submit" class="btn btn-primary" x-bind:disabled="name.trim() === ''">Create key</button>
+				</div>
+			</form>
+		</div>
+	</div>
+	<!-- One-time token reveal target: the create/rotate response is swapped here. -->
+	<div id="key-reveal"></div>
+}
+
+// rolePicker renders the assignable-role checkboxes from the catalog, each with its
+// short description (persistent label + helper text). selected marks the roles a key
+// already holds (for the permissions editor). Roles post under the repeated "roles"
+// field; the catalog is the SAME authz.AllRoles the JSON roles endpoint serves, so
+// the picker can never offer a role authorization doesn't recognize.
+templ rolePicker(roles []RoleOption, selected []string) {
+	<fieldset class="flex flex-col gap-2">
+		<legend class="text-sm font-medium text-fg">Roles</legend>
+		<p class="text-xs text-fg-faint">Roles bundle inference capabilities. Admin scopes below grant console access.</p>
+		<div class="flex flex-col gap-1.5">
+			for _, role := range roles {
+				<label class="flex items-start gap-2.5 rounded-md border border-line p-2.5 transition-colors hover:border-line-strong">
+					<input
+						type="checkbox"
+						name="roles"
+						value={ role.Name }
+						class="mt-0.5"
+						checked?={ hasString(selected, role.Name) }
+					/>
+					<span class="min-w-0">
+						<span class="font-mono text-sm text-fg">{ role.Name }</span>
+						<span class="block text-xs text-fg-muted">{ role.Description }</span>
+					</span>
+				</label>
+			}
+		</div>
+	</fieldset>
+}
+
+// scopePicker renders the admin-scope checkboxes from the full scope vocabulary
+// (authz.AllScopes). The scopes are grouped two-up for density; each carries the
+// scope string as both label and value, posted under the repeated "admin_scopes"
+// field.
+templ scopePicker(scopes []string, selected []string) {
+	<fieldset class="flex flex-col gap-2">
+		<legend class="text-sm font-medium text-fg">Admin scopes</legend>
+		<p class="text-xs text-fg-faint">Fine-grained console permissions, e.g. keys:read to view this screen.</p>
+		<div class="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+			for _, sc := range scopes {
+				<label class="flex items-center gap-2.5 rounded-md border border-line px-2.5 py-2 transition-colors hover:border-line-strong">
+					<input
+						type="checkbox"
+						name="admin_scopes"
+						value={ sc }
+						checked?={ hasString(selected, sc) }
+					/>
+					<span class="font-mono text-xs text-fg">{ sc }</span>
+				</label>
+			}
+		</div>
+	</fieldset>
+}
+
+// modelListFields renders the allow/deny model textareas (one pattern per line).
+// allow/deny prefill the current lists for the permissions editor; idPrefix keeps
+// the ids unique per mounted form.
+templ modelListFields(allow, deny []string, idPrefix string) {
+	<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+		<div class="flex flex-col gap-1.5">
+			<label for={ idPrefix + "allow-models" } class="text-sm font-medium text-fg">Allow models</label>
+			<textarea
+				id={ idPrefix + "allow-models" }
+				name="allow_models"
+				rows="3"
+				autocomplete="off"
+				spellcheck="false"
+				placeholder="llama3&#10;mistral"
+				class="field h-auto py-2 font-mono"
+			>{ joinLines(allow) }</textarea>
+			<p class="text-xs text-fg-faint">One pattern per line. Empty allows all (subject to deny).</p>
+		</div>
+		<div class="flex flex-col gap-1.5">
+			<label for={ idPrefix + "deny-models" } class="text-sm font-medium text-fg">Deny models</label>
+			<textarea
+				id={ idPrefix + "deny-models" }
+				name="deny_models"
+				rows="3"
+				autocomplete="off"
+				spellcheck="false"
+				placeholder="gpt-4*"
+				class="field h-auto py-2 font-mono"
+			>{ joinLines(deny) }</textarea>
+			<p class="text-xs text-fg-faint">One pattern per line. Deny wins over allow.</p>
+		</div>
+	</div>
+}
+
+// KeyListPartial is the loaded masked key table. Each row shows the key's id (NOT a
+// token), name, owner/team, roles + admin scopes, created/last-used/expiry, and a
+// status badge (text + tone). Per-row controls open Alpine modals to edit
+// permissions, rotate (reveal a new token once), or revoke (typed-name HIGH
+// friction). It keeps its poll attributes so it re-refreshes itself.
+templ KeyListPartial(rows []KeyRow, roles []RoleOption, scopes []string) {
+	<div
+		id="key-list"
+		hx-get="/admin/partials/keys"
+		hx-trigger="every 15s"
+		hx-swap="outerHTML"
+	>
+		<div class="panel">
+			<div class="panel-head">
+				<span class="panel-title">Keys</span>
+				<span class="font-mono text-sm tnum text-fg">{ itoa(len(rows)) }</span>
+			</div>
+			<div class="panel-body p-0">
+				if len(rows) == 0 {
+					<div class="px-4 py-6">
+						@emptyState("No API keys yet", "Create a key with the New key button. Its token is shown once.")
+					</div>
+				} else {
+					<div class="overflow-x-auto">
+						<table class="tbl">
+							<thead>
+								<tr>
+									<th scope="col">Name</th>
+									<th scope="col">Secret</th>
+									<th scope="col">Owner / team</th>
+									<th scope="col">Roles</th>
+									<th scope="col">Admin scopes</th>
+									<th scope="col">Created</th>
+									<th scope="col">Last used</th>
+									<th scope="col">Expiry</th>
+									<th scope="col">Status</th>
+									<th scope="col"><span class="sr-only">Actions</span></th>
+								</tr>
+							</thead>
+							<tbody>
+								for _, k := range rows {
+									@keyRow(k, roles, scopes)
+								}
+							</tbody>
+						</table>
+					</div>
+				}
+			</div>
+		</div>
+	</div>
+}
+
+// keyRow is one masked key row plus its action modals. The Secret cell shows a
+// FIXED mask, never a token. Status is a text-labeled badge. The Manage cell hosts
+// an Alpine island controlling the permissions / rotate / revoke modals for this
+// row; each posts via HTMX and inherits the body CSRF header.
+templ keyRow(k KeyRow, roles []RoleOption, scopes []string) {
+	<tr x-data="{ permsOpen: false, rotateOpen: false, revokeOpen: false, confirm: '' }">
+		<td>
+			<span class="font-medium text-fg" title={ k.ID }>{ k.Name }</span>
+			<span class="block font-mono text-xs text-fg-faint" title={ k.ID }>{ shortID(k.ID) }</span>
+		</td>
+		<td><span class="font-mono text-xs text-fg-faint" title="The token is shown once at creation and never stored.">{ k.MaskedSecret }</span></td>
+		<td>
+			if k.Owner != "" || k.Team != "" {
+				<span class="text-sm text-fg">{ ownerTeam(k.Owner, k.Team) }</span>
+			} else {
+				<span class="text-fg-faint">—</span>
+			}
+		</td>
+		<td>@chips(k.Roles)</td>
+		<td>@chips(k.AdminScopes)</td>
+		<td class="text-xs text-fg-muted">{ k.Created }</td>
+		<td class="text-xs text-fg-faint">{ k.LastUsed }</td>
+		<td class="text-xs text-fg-muted">{ k.Expiry }</td>
+		<td>@statusBadge(k.Tone, k.Status)</td>
+		<td class="text-right">
+			<div class="inline-flex gap-1">
+				<button type="button" class="btn btn-ghost" x-on:click="permsOpen = true" aria-label={ "Edit permissions for " + k.Name }>Permissions</button>
+				if !k.Revoked && !k.Expired {
+					<button type="button" class="btn btn-ghost" x-on:click="rotateOpen = true" aria-label={ "Rotate " + k.Name }>Rotate</button>
+				}
+				if !k.Revoked {
+					<button type="button" class="btn btn-danger" x-on:click="revokeOpen = true; confirm = ''" aria-label={ "Revoke " + k.Name }>Revoke</button>
+				}
+			</div>
+			@permissionsModal(k, roles, scopes)
+			@rotateModal(k)
+			@revokeModal(k)
+		</td>
+	</tr>
+}
+
+// permissionsModal is the per-row FULL-REPLACE permissions editor: it prefills the
+// key's current roles, admin scopes, and allow/deny lists, lets the operator change
+// them, and posts the complete set (a replace, not a merge). It validates before
+// submit (the pickers only offer catalog values; the server rejects anything else).
+templ permissionsModal(k KeyRow, roles []RoleOption, scopes []string) {
+	<div x-show="permsOpen" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4" role="dialog" aria-modal="true" aria-labelledby={ "perms-title-" + k.ID }>
+		<div class="modal-backdrop" x-on:click="permsOpen = false"></div>
+		<div class="modal relative mt-8 w-full max-w-lg p-5 text-left">
+			<div class="mb-4 flex items-start justify-between gap-3">
+				<div>
+					<h2 id={ "perms-title-" + k.ID } class="text-lg font-semibold text-fg">Edit permissions</h2>
+					<p class="mt-1 text-sm text-fg-muted">{ k.Name } — replaces all roles, scopes, and model lists.</p>
+				</div>
+				<button type="button" class="btn btn-ghost" x-on:click="permsOpen = false" aria-label="Close">✕</button>
+			</div>
+			<form
+				class="flex flex-col gap-4"
+				hx-post={ "/admin/keys/" + k.ID + "/permissions" }
+				hx-target="#toasts"
+				hx-swap="beforeend"
+				x-on:htmx:after-request="if ($event.detail.successful) { permsOpen = false; htmx.ajax('GET', '/admin/partials/keys', { target: '#key-list', swap: 'outerHTML' }); }"
+			>
+				@rolePicker(roles, k.Roles)
+				@scopePicker(scopes, k.AdminScopes)
+				@modelListFields(k.AllowModels, k.DenyModels, "perms-"+k.ID+"-")
+				<div class="mt-1 flex items-center justify-end gap-2">
+					<button type="button" class="btn btn-ghost" x-on:click="permsOpen = false">Cancel</button>
+					<button type="submit" class="btn btn-primary">Save permissions</button>
+				</div>
+			</form>
+		</div>
+	</div>
+}
+
+// rotateModal confirms a rotate (medium-high friction): rotating replaces the
+// secret and the old token stops working immediately, so it states the impact and
+// requires an explicit confirm. The response is the one-time reveal of the NEW
+// token, swapped into #key-reveal.
+templ rotateModal(k KeyRow) {
+	<div x-show="rotateOpen" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4" role="dialog" aria-modal="true" aria-labelledby={ "rotate-title-" + k.ID }>
+		<div class="modal-backdrop" x-on:click="rotateOpen = false"></div>
+		<div class="modal relative mt-8 w-full max-w-md p-5 text-left">
+			<h2 id={ "rotate-title-" + k.ID } class="text-lg font-semibold text-fg">Rotate key</h2>
+			<p class="mt-2 text-sm text-fg-muted">
+				Rotating <span class="font-mono text-fg">{ k.Name }</span> issues a new token and <span class="text-warn">immediately invalidates the current one</span>. Any client using the old token will stop working until updated.
+			</p>
+			<form
+				class="mt-4 flex items-center justify-end gap-2"
+				hx-post={ "/admin/keys/" + k.ID + "/rotate" }
+				hx-target="#key-reveal"
+				hx-swap="innerHTML"
+				x-on:htmx:after-request="if ($event.detail.successful) { rotateOpen = false; htmx.ajax('GET', '/admin/partials/keys', { target: '#key-list', swap: 'outerHTML' }); }"
+			>
+				<button type="button" class="btn btn-ghost" x-on:click="rotateOpen = false">Cancel</button>
+				<button type="submit" class="btn btn-primary">Rotate and reveal new token</button>
+			</form>
+		</div>
+	</div>
+}
+
+// revokeModal is the HIGH-friction revoke (mirrors the workers' force-evict): it
+// states the impact and the confirm button stays DISABLED until the operator types
+// the key id verbatim. Revoking is permanent; a revoked key can't authenticate.
+templ revokeModal(k KeyRow) {
+	<div x-show="revokeOpen" x-cloak class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4" role="dialog" aria-modal="true" aria-labelledby={ "revoke-title-" + k.ID }>
+		<div class="modal-backdrop" x-on:click="revokeOpen = false"></div>
+		<div class="modal relative mt-8 w-full max-w-md p-5 text-left">
+			<h2 id={ "revoke-title-" + k.ID } class="text-lg font-semibold text-fg">Revoke key</h2>
+			<p class="mt-2 text-sm text-fg-muted">
+				Revoking <span class="font-mono text-fg">{ k.Name }</span> is <span class="text-danger">permanent</span>. The key stops authenticating immediately and cannot be restored.
+			</p>
+			<div class="mt-4 flex flex-col gap-2">
+				<label class="text-xs text-fg-muted">
+					Type the key id <span class="font-mono text-fg">{ k.ID }</span> to confirm.
+				</label>
+				<input
+					type="text"
+					x-model="confirm"
+					autocomplete="off"
+					spellcheck="false"
+					placeholder={ k.ID }
+					class="field font-mono"
+					aria-label="Type the key id to confirm revocation"
+				/>
+				<div class="mt-1 flex items-center justify-end gap-2">
+					<button type="button" class="btn btn-ghost" x-on:click="revokeOpen = false; confirm = ''">Cancel</button>
+					<button
+						type="button"
+						class="btn btn-danger"
+						hx-post={ "/admin/keys/" + k.ID + "/revoke" }
+						hx-target="#toasts"
+						hx-swap="beforeend"
+						x-bind:disabled={ "confirm !== '" + k.ID + "'" }
+						x-on:click="revokeOpen = false; confirm = ''; htmx.ajax('GET', '/admin/partials/keys', { target: '#key-list', swap: 'outerHTML' })"
+					>Revoke key</button>
+				</div>
+			</div>
+		</div>
+	</div>
+}
+
+// chips renders a compact list of role/scope tags, or an em dash when empty, so a
+// cell never reads as blank.
+templ chips(items []string) {
+	if len(items) == 0 {
+		<span class="text-fg-faint">—</span>
+	} else {
+		<span class="flex flex-wrap gap-1">
+			for _, it := range items {
+				<span class="rounded-sm border border-line bg-surface-2 px-1.5 py-0.5 font-mono text-xs text-fg-muted">{ it }</span>
+			}
+		</span>
+	}
+}
+
+// KeyListLoading is the table's first-paint skeleton (loading state).
+templ KeyListLoading() {
+	<div id="key-list" aria-busy="true">
+		<div class="panel">
+			<div class="panel-head"><span class="panel-title">Keys</span></div>
+			<div class="panel-body"><div class="skeleton h-32 w-full"></div></div>
+		</div>
+		<span class="sr-only">Loading API keys…</span>
+	</div>
+}
+
+// KeyListError is the table's error state: an in-voice notice with a retry that
+// re-fetches the region. Status is conveyed by the icon AND the text.
+templ KeyListError(msg string) {
+	<div id="key-list">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load API keys</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get="/admin/partials/keys"
+					hx-target="#key-list"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}
+
+// KeyReveal_ is the ONE-TIME token reveal returned by create/rotate. The plaintext
+// token is shown exactly once, in a focused dialog, with a copy-to-clipboard
+// affordance; it is never stored, logged, or shown again. Dismissing the dialog
+// (Done or the backdrop) does not merely hide it — dismiss() empties the #key-reveal
+// container so the plaintext token is REMOVED from the DOM, not left hidden where it
+// could be inspected. The copy and dismiss use Alpine expressions (CSP allows
+// 'unsafe-eval' for Alpine; there is no inline onclick attribute). The trailing
+// underscore avoids colliding with the KeyReveal view-model type.
+templ KeyReveal_(rev KeyReveal) {
+	<div
+		x-data="{ open: true, copied: false, copy() { navigator.clipboard.writeText($refs.token.textContent.trim()); this.copied = true; setTimeout(() => this.copied = false, 2000); }, dismiss() { this.open = false; const host = document.getElementById('key-reveal'); if (host) { setTimeout(() => { host.innerHTML = ''; }, 0); } } }"
+		x-show="open"
+		x-cloak
+		class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4"
+		role="dialog"
+		aria-modal="true"
+		aria-labelledby="reveal-title"
+	>
+		<div class="modal-backdrop" x-on:click="dismiss()"></div>
+		<div class="modal relative mt-8 w-full max-w-lg p-5 text-left">
+			<div class="flex items-start gap-3">
+				<span class="text-ok">
+					@iconKey()
+				</span>
+				<div class="min-w-0 flex-1">
+					<h2 id="reveal-title" class="text-lg font-semibold text-fg">{ rev.Title }</h2>
+					<p class="mt-1 text-sm text-fg-muted">{ rev.Message }</p>
+				</div>
+			</div>
+			<div class="mt-4 flex flex-col gap-2">
+				<label for="reveal-token" class="text-xs font-medium text-fg-muted">{ revealTokenLabel(rev) }</label>
+				<div class="flex items-stretch gap-2">
+					<code
+						id="reveal-token"
+						x-ref="token"
+						class="field flex h-auto min-w-0 flex-1 items-center overflow-x-auto whitespace-nowrap py-2 text-sm"
+					>{ rev.Token }</code>
+					<button type="button" class="btn btn-primary" x-on:click="copy()" aria-label="Copy token to clipboard">
+						<span x-show="!copied">Copy</span>
+						<span x-show="copied" x-cloak>Copied</span>
+					</button>
+				</div>
+				<p class="text-xs text-danger">Store it in your secret manager now. For security, it can't be retrieved later.</p>
+			</div>
+			<div class="mt-5 flex items-center justify-end">
+				<button type="button" class="btn" x-on:click="dismiss()">Done</button>
+			</div>
+		</div>
+	</div>
+}
+
+// KeyActionToast is the toast fragment a revoke / permissions write swaps into
+// #toasts. Status is conveyed by the tone AND the text; it is announced via the
+// toast region's aria-live and auto-dismisses. Mirrors WorkerActionToast.
+templ KeyActionToast(res KeyActionResult) {
+	<div
+		class={ "toast pointer-events-auto", toastTone(res.Tone) }
+		role="status"
+		x-data="{ show: true }"
+		x-show="show"
+		x-init="setTimeout(() => show = false, 6000)"
+	>
+		<span class={ toneText(res.Tone) }>
+			@iconAlert()
+		</span>
+		<div class="min-w-0">
+			<p class="font-medium text-fg">{ res.Title }</p>
+			<p class="mt-0.5 text-fg-muted">{ res.Message }</p>
+		</div>
+	</div>
+}

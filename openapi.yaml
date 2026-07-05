@@ -11,17 +11,40 @@ info:
     This document is the formal contract for the public HTTP surface served by `internal/httpapi`.
     The server-to-worker control plane is gRPC and is intentionally **not** described here.
 
-    ## Authentication
+    ## Authentication & authorization
 
     Every endpoint requires an API key presented as an HTTP Bearer token
-    (`Authorization: Bearer agpu_<keyid>_<secret>`). See the `bearerAuth` security scheme. Admin
-    endpoints additionally require the key to hold the `admin` role; a non-admin key receives `403`.
+    (`Authorization: Bearer agpu_<keyid>_<secret>`). See the `bearerAuth` security scheme.
+
+    Admin endpoints are authorized at **resource×operation scope** granularity: each admin route
+    requires a scope of the form `<resource>:<read|write>` (see `AdminScope`) — e.g. `keys:read`
+    gates `GET /v1/admin/keys`, `keys:write` gates the key mutations, `workers:write` gates draining
+    a worker, `telemetry:read` gates the stats endpoint. The built-in `admin` role is a **superuser**
+    that implicitly holds every scope, so an admin key may use every admin endpoint. A key holding a
+    specific scope (but not the admin role) passes only that scope's routes; a key with neither
+    receives `403`.
 
     ## Errors
 
     Every error response uses one consistent envelope — see the `Error` schema — carrying a generic
     human-readable `message` and a stable machine-readable `code`. Messages never leak secrets or
     internal detail; clients branch on `code`.
+
+    ## Pagination
+
+    Admin list endpoints (`GET /v1/admin/keys`, `GET /v1/admin/workers`) return a cursor-paginated
+    envelope `{"data": [...], "pagination": {"next_cursor": <string|null>, "has_more": <bool>}}`.
+    Pass `pagination.next_cursor` back as the `cursor` query parameter to fetch the next page;
+    `cursor` is `null` on the last page. The cursor is opaque — do not construct or parse it.
+    Pagination is cursor-based (not offset-based) so a page boundary is stable as the underlying set
+    changes.
+
+    ## Idempotency
+
+    Admin write requests accept an optional `Idempotency-Key` header. Re-sending a request with the
+    same key within the server's retention window replays the original (successful) response instead
+    of performing the write again — making retries on a flaky network safe. A replay carries the
+    `Idempotency-Replayed: true` response header.
 
     ## Streaming
 
@@ -56,7 +79,10 @@ tags:
   - name: Sessions
     description: Owner-scoped server-side conversation sessions backing the stateful chat mode.
   - name: Admin
-    description: Admin-only management of API keys, quotas, permissions, and workers. Requires the admin role.
+    description: |
+      Admin-only management of API keys, quotas, permissions, and workers. Each route requires the
+      matching admin scope (see `AdminScope`); the `admin` role grants every scope. Writes accept an
+      `Idempotency-Key` header and list endpoints are cursor-paginated.
 
 paths:
   /v1/models:
@@ -413,11 +439,16 @@ paths:
       operationId: adminCreateKey
       summary: Create an API key
       description: |
-        Mints a new API key with the requested roles and per-model allow/deny lists, and returns its
-        id together with the **one-time** plaintext token. The token is shown exactly once and cannot
-        be recovered afterward. Requires the admin role.
+        Mints a new API key with the requested roles, admin scopes, and per-model allow/deny lists,
+        and returns its id together with the **one-time** plaintext token. The token is shown exactly
+        once and cannot be recovered afterward. An unknown role or admin scope is rejected with `400`
+        (no key is created); `GET /v1/admin/roles` enumerates the valid roles and scopes. Requires the
+        `keys:write` scope (the `admin` role grants it). Supports the `Idempotency-Key` header so a
+        retry does not mint a duplicate key.
       tags:
         - Admin
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -443,6 +474,7 @@ paths:
                 token: agpu_8f3a1c2b_Sx9Qd2m7nKpZ4tL6yR0wF1hJ3vC5bN8
                 roles:
                   - user
+                admin_scopes: []
                 allow_models:
                   - llama3
                 deny_models: []
@@ -458,12 +490,17 @@ paths:
     get:
       operationId: adminListKeys
       summary: List API keys
-      description: Returns metadata for every API key. Secrets are never included. Requires the admin role.
+      description: |
+        Returns a cursor-paginated page of API-key metadata (secrets are never included) in the
+        shared list envelope. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
       responses:
         "200":
-          description: The list of API keys (metadata only).
+          description: A cursor-paginated page of API keys (metadata only).
           content:
             application/json:
               schema:
@@ -479,7 +516,7 @@ paths:
     get:
       operationId: adminGetKey
       summary: Get an API key
-      description: Returns one API key's metadata, or `404` if the id is unknown. Requires the admin role.
+      description: Returns one API key's metadata, or `404` if the id is unknown. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
       parameters:
@@ -504,11 +541,13 @@ paths:
       summary: Revoke an API key
       description: |
         Revokes the key so subsequent authentication fails immediately, and returns `204`, or `404`
-        if the id is unknown. Requires the admin role.
+        if the id is unknown. Requires the `keys:write` scope (the `admin` role grants it). Supports
+        the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "204":
           description: The key was revoked. No content.
@@ -527,11 +566,13 @@ paths:
       summary: Rotate an API key secret
       description: |
         Replaces the key's secret (the old token stops verifying immediately) and returns the new
-        **one-time** plaintext token, or `404` if the id is unknown. Requires the admin role.
+        **one-time** plaintext token, or `404` if the id is unknown. Requires the `keys:write` scope
+        (the `admin` role grants it). Supports the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: The key id and its new one-time plaintext token.
@@ -553,13 +594,18 @@ paths:
       operationId: adminSetKeyPermissions
       summary: Replace an API key's permissions
       description: |
-        Replaces the key's roles and per-model allow/deny lists (a full replace, not a merge: an
-        omitted or null list clears that dimension) and returns the updated metadata, or `404` if the
-        id is unknown. The change takes effect immediately. Requires the admin role.
+        Replaces the key's roles, admin scopes, and per-model allow/deny lists (a full replace, not a
+        merge: an omitted or null list clears that dimension) and returns the updated metadata, or
+        `404` if the id is unknown. The change takes effect immediately. Requires the `keys:write`
+        scope (the `admin` role grants it). An unknown role **or** an unknown admin scope is rejected
+        with `400`, and validation runs before any mutation so a rejected request leaves the key
+        unchanged; `GET /v1/admin/roles` enumerates the valid roles and scopes. Supports the
+        `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -569,6 +615,7 @@ paths:
             example:
               roles:
                 - user
+              admin_scopes: []
               allow_models:
                 - llama3
                 - qwen2:0.5b
@@ -586,6 +633,7 @@ paths:
                 name: my-agent
                 roles:
                   - user
+                admin_scopes: []
                 allow_models:
                   - llama3
                   - qwen2:0.5b
@@ -615,12 +663,13 @@ paths:
         Sets the key's per-key quota override and returns the updated metadata, or `404` if the id is
         unknown. Each field is optional: an omitted field defaults to `0` ("unlimited" for that
         dimension), while a body with **every** field omitted clears the override entirely so the key
-        falls back to the global defaults. The change takes effect immediately. Requires the admin
-        role.
+        falls back to the global defaults. The change takes effect immediately. Requires the
+        `keys:write` scope (the `admin` role grants it). Supports the `Idempotency-Key` header.
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/KeyId"
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -644,6 +693,7 @@ paths:
                 name: my-agent
                 roles:
                   - user
+                admin_scopes: []
                 allow_models:
                   - llama3
                 deny_models: []
@@ -672,7 +722,7 @@ paths:
       description: |
         Returns the key's current usage in each window versus its effective limits, plus when each
         window next resets, or `404` if the id is unknown. Returns `501` when the quota subsystem is
-        disabled. Requires the admin role.
+        disabled. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
       parameters:
@@ -709,16 +759,89 @@ paths:
         "501":
           $ref: "#/components/responses/NotImplemented"
 
-  /v1/admin/workers:
+  /v1/admin/roles:
     get:
-      operationId: adminListWorkers
-      summary: List workers
-      description: Returns a point-in-time snapshot of every worker in the fleet. Requires the admin role.
+      operationId: adminListRoles
+      summary: List assignable roles and admin scopes
+      description: |
+        Returns the catalog a permissions editor renders its pickers against: the assignable roles —
+        each with the inference actions it grants (`pull`/`load`/`infer`), the breadth those actions
+        apply to (`model_scope`), and whether it implicitly grants every admin scope — plus the
+        complete admin-scope vocabulary. This is exactly what the authorization engine enforces, so a
+        GUI need not reverse-engineer the role rules. Roles are returned in privilege order
+        (`admin` → `user` → `read-only`); `scopes` is the sorted scope vocabulary (the same set
+        `PUT /v1/admin/keys/{id}/permissions` validates against). The document is static — it carries
+        no per-key state and no secrets. Requires the `keys:read` scope (the `admin` role grants it).
       tags:
         - Admin
       responses:
         "200":
-          description: The fleet snapshot.
+          description: The assignable-role catalog and the admin-scope vocabulary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminRolesResponse"
+              example:
+                roles:
+                  - name: admin
+                    description: "Superuser: every inference action on every model (ignoring allow/deny) and every admin scope."
+                    inference_actions:
+                      - pull
+                      - load
+                      - infer
+                    model_scope: all
+                    grants_all_admin_scopes: true
+                  - name: user
+                    description: Pull, load, and infer, but only on allow-listed models (deny-list wins).
+                    inference_actions:
+                      - pull
+                      - load
+                      - infer
+                    model_scope: allow-listed
+                    grants_all_admin_scopes: false
+                  - name: read-only
+                    description: Infer only (never pull or load), on allow-listed models (deny-list wins).
+                    inference_actions:
+                      - infer
+                    model_scope: allow-listed
+                    grants_all_admin_scopes: false
+                scopes:
+                  - audit:read
+                  - audit:write
+                  - config:read
+                  - config:write
+                  - keys:read
+                  - keys:write
+                  - logs:read
+                  - logs:write
+                  - models:read
+                  - models:write
+                  - telemetry:read
+                  - telemetry:write
+                  - workers:read
+                  - workers:write
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers:
+    get:
+      operationId: adminListWorkers
+      summary: List workers
+      description: |
+        Returns a cursor-paginated page of the fleet snapshot in the shared list envelope. Requires
+        the `workers:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: A cursor-paginated page of the fleet snapshot.
           content:
             application/json:
               schema:
@@ -730,26 +853,205 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
-  /v1/admin/workers/{id}/drain:
-    post:
-      operationId: adminDrainWorker
-      summary: Drain a worker
+  /v1/admin/workers/{id}:
+    get:
+      operationId: adminGetWorker
+      summary: Inspect one worker
       description: |
-        Marks the worker draining: it receives no new jobs while its in-flight jobs are allowed to
-        finish. Returns `204`, or `404` if no such worker is connected. Requires the admin role.
+        Returns the rich per-worker detail projection: its available models, lifecycle status (and a
+        convenience `draining` boolean), GPU type, total/free VRAM, coarse load, active-job count,
+        last-heartbeat time, registration time, and a derived uptime. GPU capacity is reported at the
+        aggregate level the control plane tracks (there is no per-GPU breakdown). Returns `404` if no
+        such worker is connected. Requires the `workers:read` scope (the `admin` role grants it).
       tags:
         - Admin
       parameters:
         - $ref: "#/components/parameters/WorkerId"
       responses:
-        "204":
-          description: The worker is now draining. No content.
+        "200":
+          description: The per-worker detail projection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWorkerDetailView"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers/{id}/drain:
+    post:
+      operationId: adminDrainWorker
+      summary: Drain a worker
+      description: |
+        Marks the worker draining: it receives no new jobs while its in-flight jobs are allowed to
+        finish. Returns `204`, or `404` if no such worker is connected. Requires the `workers:write`
+        scope (the `admin` role grants it). Supports the `Idempotency-Key` header.
+
+        An optional body `{"deadline_seconds": N}` turns the soft drain into a **timed forced drain**:
+        with `N > 0` the worker is evicted once its in-flight jobs finish **or** `N` seconds elapse,
+        whichever comes first (its pending jobs then fail). An absent/empty body or `N == 0` is the
+        pure soft drain; a negative `N` is rejected with `400`.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminDrainWorkerRequest"
+            example:
+              deadline_seconds: 30
+      responses:
+        "204":
+          description: The worker is now draining. No content.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers/{id}/models:
+    post:
+      operationId: adminPullModel
+      summary: Pull a model onto a worker
+      description: |
+        Instructs the worker to pull the named model onto its local Ollama. The pull is
+        fire-and-forget: the server dispatches the request and returns `202 Accepted` immediately; the
+        model appears in the worker's detail/list once it finishes pulling and the worker's next
+        heartbeat advertises it. Returns `404` if no such worker is connected, or `400` for an empty
+        model. Requires the `models:write` scope (the `admin` role grants it). Supports the
+        `Idempotency-Key` header.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminPullModelRequest"
+            example:
+              model: llama3
+      responses:
+        "202":
+          description: The pull has been accepted and dispatched to the worker. No content.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/workers/{id}/models/{model}:
+    delete:
+      operationId: adminUnloadModel
+      summary: Unload a model from a worker
+      description: |
+        Best-effort asks the worker to unload the named model from its Ollama, freeing the VRAM.
+        Returns `204`. A model that is not currently loaded is a no-op and is still reported as
+        success (the "missing model is success" contract). Returns `404` only when no such worker is
+        connected. Requires the `models:write` scope (the `admin` role grants it). Supports the
+        `Idempotency-Key` header.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/WorkerId"
+        - $ref: "#/components/parameters/ModelName"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "204":
+          description: The unload has been dispatched (or the model was already absent). No content.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/gpus:
+    get:
+      operationId: adminGetGPUs
+      summary: Get fleet GPU capacity inventory
+      description: |
+        Returns an aggregated, read-only GPU/fleet capacity inventory derived live from the worker
+        heartbeat snapshot — it performs **no new GPU probing** and reuses the same per-worker
+        capacity fields the worker endpoints expose. The response has three sections: `fleet` (the
+        roll-up: worker count, summed total/free VRAM in bytes, and the mean/max of the coarse 0-100
+        per-worker load), `by_type` (workers grouped by their reported GPU type, with per-type worker
+        count and summed VRAM, sorted by `gpu_type`), and `workers` (the per-worker heatmap cells,
+        sorted by `id`). Both orderings are deterministic so the response is stable across calls over
+        the same snapshot.
+
+        Note that the control plane tracks GPU capacity only at the aggregate per-worker level, so a
+        heatmap "cell" is one **worker** (not one physical GPU) and `gpu_type` is the worker's reported
+        string (e.g. `2x NVIDIA GeForce RTX 4090`, or `cpu` for a GPU-less worker) grouped as-is. An
+        empty fleet yields zero aggregates and empty arrays with a `200`. Contains no secrets. Requires
+        the `workers:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The aggregated GPU/fleet capacity inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminGPUsResponse"
+              example:
+                fleet:
+                  worker_count: 2
+                  total_vram: 51539607552
+                  free_vram: 32212254720
+                  mean_load: 36
+                  max_load: 60
+                by_type:
+                  - gpu_type: 2x NVIDIA GeForce RTX 4090
+                    worker_count: 1
+                    total_vram: 51539607552
+                    free_vram: 30064771072
+                  - gpu_type: cpu
+                    worker_count: 1
+                    total_vram: 0
+                    free_vram: 0
+                workers:
+                  - id: worker-a
+                    gpu_type: 2x NVIDIA GeForce RTX 4090
+                    total_vram: 51539607552
+                    free_vram: 30064771072
+                    load: 60
+                    status: online
+                    active_jobs: 3
+                  - id: worker-b
+                    gpu_type: cpu
+                    total_vram: 0
+                    free_vram: 0
+                    load: 12
+                    status: online
+                    active_jobs: 0
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -762,7 +1064,7 @@ paths:
         global job-queue depth (total plus a per-priority breakdown), per-worker load, and the
         time-in-queue distribution. The wait-time distribution covers only jobs that were queued and
         then placed on a worker — the synchronous fast path (never queued) is deliberately excluded.
-        Contains no secrets. Requires the admin role.
+        Contains no secrets. Requires the `telemetry:read` scope (the `admin` role grants it).
       tags:
         - Admin
       responses:
@@ -808,6 +1110,404 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /v1/admin/telemetry:
+    get:
+      operationId: adminGetTelemetry
+      summary: Get the dashboard telemetry summary
+      description: |
+        Returns, in a single call, the structured statistics a monitoring dashboard renders: the HTTP
+        request count and latency distribution, the aggregate (server-wide) throttle counts, fleet
+        health (worker count, a breakdown by lifecycle status, the job-queue depth, and the
+        time-in-queue distribution), the live active-session count, the session-affinity
+        hit/miss/rebind counters, and the process uptime in seconds. It is read live (no caching) and
+        contains no secrets.
+
+        This is a read-only JSON facade over the **same in-process collectors** the server already
+        maintains — it scrapes or parses nothing from the Prometheus `/metrics` endpoint, which is
+        unchanged and remains the canonical scrape target. It is distinct from `GET /v1/admin/stats`
+        (which keeps its own queue/worker/wait-time shape): this endpoint rolls up every dashboard
+        signal so a GUI fetches them once. The request `count` is monotonic; divide its delta by the
+        change in `uptime_seconds` (or the wall-clock between two polls) to derive a request rate.
+
+        The latency histogram mirrors the wait-time histogram shape: cumulative `le_ms` buckets with a
+        trailing `+Inf` bucket (`le_ms` of `0`). Requires the `telemetry:read` scope (the `admin` role
+        grants it).
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The consolidated dashboard telemetry summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminTelemetryResponse"
+              example:
+                requests:
+                  count: 1840
+                  latency:
+                    sum_ms: 220800
+                    max_ms: 4200
+                    mean_ms: 120
+                    buckets:
+                      - le_ms: 10
+                        count: 320
+                      - le_ms: 100
+                        count: 1180
+                      - le_ms: 1000
+                        count: 1790
+                      - le_ms: 10000
+                        count: 1840
+                      - le_ms: 0
+                        count: 1840
+                throttles:
+                  global: 4
+                  key: 1
+                fleet:
+                  worker_count: 2
+                  by_status:
+                    online: 1
+                    draining: 1
+                  queue:
+                    total: 3
+                    by_priority:
+                      normal: 2
+                      high: 1
+                  wait_time:
+                    count: 128
+                    sum_ms: 76800
+                    max_ms: 4200
+                    mean_ms: 600
+                    buckets:
+                      - le_ms: 100
+                        count: 40
+                      - le_ms: 1000
+                        count: 118
+                      - le_ms: 0
+                        count: 128
+                sessions:
+                  active: 7
+                affinity:
+                  hits: 512
+                  misses: 18
+                  rebinds: 18
+                uptime_seconds: 3600
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/usage:
+    get:
+      operationId: adminGetUsage
+      summary: Get per-key usage vs limits with history and forecast
+      description: |
+        Returns, for every key, its current consumption versus its effective limits — the same live
+        usage snapshot the per-key `GET /v1/admin/keys/{id}/quota` endpoint reports (requests this
+        minute, tokens this minute/today/this month, and the per-window reset times) — enriched with
+        a bounded rolling **daily token series** (for a sparkline, at most 7 points, oldest first) and
+        a best-effort **exhaustion forecast** (the projected instant each token budget is reached at
+        the recent daily burn rate). A top-level `summary` carries the **aggregate** (server-wide)
+        throttle counts: the rate limiter tracks throttling fleet-wide, not per key, so per-key
+        throttling is deliberately not fabricated.
+
+        The rows are cursor-paginated in the shared list envelope (`data` + `pagination`), sorted by
+        `key_id`. The optional `key_id`, `owner`, and `team` query parameters filter the rows by exact
+        match (ANDed; an empty filter matches all). Pass `format=csv` to download the same per-key rows
+        as a flat CSV export (`text/csv`) — the CSV is the **full** filtered set (an export, not a
+        paginated view) and omits the variable-length series and the fleet-wide summary.
+
+        The forecast is an **estimate** for dashboard rendering, not an enforcement input — the quota
+        engine alone decides admission; a forecast field is `null` when the budget is unlimited, usage
+        is not rising, or there is too little history to project a slope. The series is a pure
+        enrichment: when the historical-series subsystem is not wired the rows are still served with an
+        empty `series` and a null forecast. Contains no secrets. Requires the `telemetry:read` scope
+        (the `admin` role grants it). Returns `501` when the quota engine is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/UsageKeyID"
+        - $ref: "#/components/parameters/UsageOwner"
+        - $ref: "#/components/parameters/UsageTeam"
+        - $ref: "#/components/parameters/UsageFormat"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: |
+            The per-key usage rows (cursor-paginated) plus the fleet-wide throttle summary, or — when
+            `format=csv` — a flat CSV export of the per-key rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUsageResponse"
+              example:
+                summary:
+                  key_count: 2
+                  global_throttled: 4
+                  key_throttled: 1
+                data:
+                  - key_id: 0a1b2c3d4e5f6a7b
+                    name: batch-jobs
+                    owner: alice@example.com
+                    team: platform
+                    limits:
+                      rpm: 60
+                      tpm: 0
+                      daily_tokens: 1000000
+                      monthly_tokens: 0
+                    requests_this_minute: 3
+                    tokens_this_minute: 1200
+                    tokens_today: 640000
+                    tokens_this_month: 5120000
+                    minute_resets_at: 1718960460
+                    day_resets_at: 1719014400
+                    month_resets_at: 1719792000
+                    series:
+                      - day: 1718841600
+                        tokens: 420000
+                        requests: 2
+                      - day: 1718928000
+                        tokens: 640000
+                        requests: 3
+                    forecast:
+                      daily_exhaustion_at: 1718999100
+                      monthly_exhaustion_at: null
+                pagination:
+                  next_cursor: null
+                  has_more: false
+            text/csv:
+              schema:
+                type: string
+                description: |
+                  A flat CSV export with a header row and one row per key:
+                  `key_id,name,owner,team,rpm_limit,tpm_limit,daily_tokens_limit,monthly_tokens_limit,`
+                  `requests_this_minute,tokens_this_minute,tokens_today,tokens_this_month,`
+                  `daily_exhaustion_at,monthly_exhaustion_at`. Forecast columns are unix seconds or
+                  empty when there is no estimate.
+              example: |
+                key_id,name,owner,team,rpm_limit,tpm_limit,daily_tokens_limit,monthly_tokens_limit,requests_this_minute,tokens_this_minute,tokens_today,tokens_this_month,daily_exhaustion_at,monthly_exhaustion_at
+                0a1b2c3d4e5f6a7b,batch-jobs,alice@example.com,platform,60,0,1000000,0,3,1200,640000,5120000,1718999100,
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/audit:
+    get:
+      operationId: adminListAudit
+      summary: Query the admin audit log
+      description: |
+        Returns a cursor-paginated page of admin audit-log entries — **newest first** — in the shared
+        list envelope. Every administrative write (key create/rotate/revoke, permission and quota
+        changes, worker drain, model pull/unload, config update) records one entry: the actor key id,
+        the operation, the target resource, the redacted before/after metadata projection of the
+        affected object, the request correlation id, and the outcome. Secrets are never recorded (the
+        before/after snapshots carry only safe metadata fields).
+
+        The optional `actor`, `op`, and `target` query parameters filter by exact match, and
+        `since`/`until` bound the time window (unix epoch seconds; `since` inclusive, `until`
+        exclusive). Non-empty filters are ANDed. An absent or unparseable bound is treated as
+        unbounded on that side. Requires the `audit:read` scope (the `admin` role grants it).
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/AuditActor"
+        - $ref: "#/components/parameters/AuditOp"
+        - $ref: "#/components/parameters/AuditTarget"
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditUntil"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: A cursor-paginated page of audit-log entries, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuditListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /v1/admin/logs:
+    get:
+      operationId: adminListLogs
+      summary: Query the structured log buffer
+      description: |
+        Returns a cursor-paginated page of recent structured log lines from the server's bounded
+        in-memory log ring — **newest first** — in the shared list envelope. Each line carries the
+        emit time, the level, the human message, and the structured fields as a discrete `attrs` map
+        (request id, session id, worker, and any other slog attributes) rather than embedded in the
+        message text. Every line was **redacted at capture** — a secret-named attribute reads
+        `[REDACTED]` — so the response never carries secret material. The buffer is fixed-capacity
+        (drop-oldest), so memory is bounded.
+
+        Filters are ANDed. `level` is the **minimum** level to return (`debug`/`info`/`warn`/`error`);
+        **when omitted it defaults to `warn`**, so the default view excludes debug/info noise. The
+        `request_id`, `session_id`, and `worker` parameters match the corresponding `attrs` field by
+        exact value (a line that lacks the attribute does not match). `since`/`until` bound the time
+        window (unix epoch seconds; `since` inclusive, `until` exclusive). An absent or unparseable
+        bound is treated as unbounded. Requires the `logs:read` scope (the `admin` role grants it).
+        Returns `501` when the log-buffer subsystem is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/LogLevel"
+        - $ref: "#/components/parameters/LogRequestID"
+        - $ref: "#/components/parameters/LogSessionID"
+        - $ref: "#/components/parameters/LogWorker"
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditUntil"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: A cursor-paginated page of log lines, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminLogListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/logs/stream:
+    get:
+      operationId: adminStreamLogs
+      summary: Live-tail the structured log buffer (SSE)
+      description: |
+        Opens a Server-Sent Events stream that live-tails new structured log lines as they are
+        emitted, applying the **same filters** as `GET /v1/admin/logs` (`level` defaulting to `warn`,
+        `request_id`, `session_id`, `worker`, and the `since`/`until` window). Each event is one
+        `data: <json>` frame whose payload is a single log entry (the same shape as a `data[]` row of
+        the query endpoint), delivered in chronological order. Periodic SSE comment frames keep the
+        connection alive through idle proxies.
+
+        **Tail semantics**: the stream begins at the buffer's current position and delivers only lines
+        emitted **after** the connection opens — it does not replay the existing buffer (fetch
+        `GET /v1/admin/logs` first if you want recent history). The stream position is the buffer's
+        monotonic record count, so a client that disconnects and **reconnects resumes tailing new
+        lines from that point without losing its place** — there is no server-held per-client cursor
+        to lose. The stream is infinite (no `[DONE]` sentinel); it ends cleanly when the client closes
+        the connection.
+
+        Lines are redacted at capture, so frames never carry secret material. Requires the `logs:read`
+        scope (the `admin` role grants it). Returns `501` when the log-buffer subsystem is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/LogLevel"
+        - $ref: "#/components/parameters/LogRequestID"
+        - $ref: "#/components/parameters/LogSessionID"
+        - $ref: "#/components/parameters/LogWorker"
+        - $ref: "#/components/parameters/AuditSince"
+        - $ref: "#/components/parameters/AuditUntil"
+      responses:
+        "200":
+          description: |
+            An SSE stream (`text/event-stream`) of log-entry `data:` frames, one per new matching log
+            line, terminated only by client disconnect.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  A sequence of SSE frames. Each data frame is `data: ` followed by a JSON `LogEntry`
+                  and a blank line; comment frames (`: keepalive`) are interleaved to keep the
+                  connection alive.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+
+  /v1/admin/config:
+    get:
+      operationId: adminGetConfig
+      summary: Get the effective server settings
+      description: |
+        Returns the effective resolved server settings: the runtime-tunable values under `settings`
+        and the boot-only values under `read_only` (also enumerated by key in `read_only_fields`).
+        Boot-only settings — the listen addresses, the quota/session checkpoint paths, and the log
+        format/output — can only be changed by restarting the server with a new flag/env value; the
+        runtime-tunable values can be changed live via `PUT /v1/admin/config`. The settings carry no
+        secrets. Requires the `config:read` scope (the `admin` role grants it). Returns `503` when the
+        runtime-config subsystem is not enabled.
+      tags:
+        - Admin
+      responses:
+        "200":
+          description: The effective resolved settings (runtime-tunable plus boot-only read-only).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    put:
+      operationId: adminUpdateConfig
+      summary: Update server settings live (hot-reload)
+      description: |
+        Applies a **partial** update to the runtime-tunable settings, taking effect **live with no
+        restart**. Only fields present in the body change; omitted fields are left untouched. The
+        update is validated in full BEFORE anything is applied — an out-of-range or wrong-typed value,
+        a boot-only field (the listen addresses, checkpoint paths, or log format/output), or an unknown
+        field is rejected with `400` and **nothing** is changed. Durations are Go duration strings
+        (e.g. `"30m"`, `"45s"`); session TTL, model-warm-max, and heartbeat-timeout must be positive;
+        the log level is one of `debug`/`info`/`warn`/`error`; the session overflow policy is `trim` or
+        `reject`. Each change is audited and checkpointed, so it survives a restart (a persisted change
+        wins over the boot flags for that field). Requires the `config:write` scope (the `admin` role
+        grants it). Supports the `Idempotency-Key` header. Returns `503` when the runtime-config
+        subsystem is not enabled.
+      tags:
+        - Admin
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminConfigUpdateRequest"
+            example:
+              log_level: debug
+              session_ttl: 1h0m0s
+              quota_global_rpm: 600
+      responses:
+        "200":
+          description: The effective resolved settings after the update.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminConfigResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -815,7 +1515,8 @@ components:
       scheme: bearer
       description: |
         An agent-gpu API key presented as `Authorization: Bearer agpu_<keyid>_<secret>`. Every
-        endpoint requires it. Admin endpoints additionally require the key to hold the `admin` role.
+        endpoint requires it. Admin endpoints additionally require the matching admin scope (see
+        `AdminScope`); the `admin` role is a superuser that grants every scope.
 
   parameters:
     SessionId:
@@ -839,6 +1540,15 @@ components:
       description: The worker id.
       schema:
         type: string
+    ModelName:
+      name: model
+      in: path
+      required: true
+      description: |
+        The model id (name), e.g. `llama3` or `qwen2:0.5b`. The path segment is matched whole, so a
+        namespaced (`library/llama3`) or colon-tagged (`qwen2:0.5b`) model id is supported.
+      schema:
+        type: string
     SessionIdHeader:
       name: X-Session-Id
       in: header
@@ -850,6 +1560,160 @@ components:
         field (stateful mode); if both are present the body field wins.
       schema:
         type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        An optional client-chosen key that makes an admin **write** safe to retry. If a request is
+        re-sent with the same key within the server's retention window, the server replays the
+        original response (status + body) instead of performing the write again, and sets the
+        `Idempotency-Replayed: true` response header on the replay. Only a successful (2xx) response
+        is cached; a failed attempt is not replayed (it may be retried). Use a unique value per
+        logical operation (e.g. a UUID).
+      schema:
+        type: string
+        maxLength: 255
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      description: |
+        The maximum number of items to return in this page. Clamped to the server maximum; an absent
+        or invalid value uses the server default.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+    PageCursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        An opaque pagination cursor from a prior response's `pagination.next_cursor`. Omit it to
+        start at the first page. A stale or invalid cursor restarts pagination at the first page.
+      schema:
+        type: string
+    AuditActor:
+      name: actor
+      in: query
+      required: false
+      description: Filter audit entries to those performed by exactly this actor (API key id).
+      schema:
+        type: string
+    AuditOp:
+      name: op
+      in: query
+      required: false
+      description: |
+        Filter audit entries to exactly this operation name (e.g. `key.create`, `key.revoke`,
+        `key.rotate`, `key.permissions`, `key.quota`, `worker.drain`).
+      schema:
+        type: string
+    AuditTarget:
+      name: target
+      in: query
+      required: false
+      description: Filter audit entries to those acting on exactly this resource id (a key id, a worker id).
+      schema:
+        type: string
+    AuditSince:
+      name: since
+      in: query
+      required: false
+      description: |
+        Lower bound on the audit window, as unix epoch seconds, **inclusive** — only entries recorded
+        at or after this instant are returned. An absent or unparseable value is unbounded.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    AuditUntil:
+      name: until
+      in: query
+      required: false
+      description: |
+        Upper bound on the audit window, as unix epoch seconds, **exclusive** — only entries recorded
+        strictly before this instant are returned. An absent or unparseable value is unbounded.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    LogLevel:
+      name: level
+      in: query
+      required: false
+      description: |
+        The **minimum** log level to return; lines below it are excluded. One of `debug`, `info`,
+        `warn`, `error`. **Omitted, it defaults to `warn`** — so the default view excludes debug/info
+        noise. An unrecognized value falls back to the `warn` default.
+      schema:
+        type: string
+        enum:
+          - debug
+          - info
+          - warn
+          - error
+    LogRequestID:
+      name: request_id
+      in: query
+      required: false
+      description: |
+        Filter log lines to those whose `attrs.request_id` equals this value exactly (the
+        correlation id stamped on every HTTP-handler line). Lines without the attribute do not match.
+      schema:
+        type: string
+    LogSessionID:
+      name: session_id
+      in: query
+      required: false
+      description: |
+        Filter log lines to those whose `attrs.session_id` equals this value exactly (present on
+        session-aware lines). Lines without the attribute do not match.
+      schema:
+        type: string
+    LogWorker:
+      name: worker
+      in: query
+      required: false
+      description: |
+        Filter log lines to those whose `attrs.worker` equals this value exactly (present on
+        server-process lines about a worker, e.g. model pull/drain). Lines without the attribute do
+        not match.
+      schema:
+        type: string
+    UsageKeyID:
+      name: key_id
+      in: query
+      required: false
+      description: Filter usage rows to exactly this key id. An empty value matches all keys.
+      schema:
+        type: string
+    UsageOwner:
+      name: owner
+      in: query
+      required: false
+      description: Filter usage rows to keys whose `owner` label matches exactly. An empty value matches all keys.
+      schema:
+        type: string
+    UsageTeam:
+      name: team
+      in: query
+      required: false
+      description: Filter usage rows to keys whose `team` label matches exactly. An empty value matches all keys.
+      schema:
+        type: string
+    UsageFormat:
+      name: format
+      in: query
+      required: false
+      description: |
+        The response format. The default (omitted) is the JSON envelope; `csv` returns a flat CSV
+        export of the per-key rows (`text/csv`), which is the full filtered set (not paginated).
+      schema:
+        type: string
+        enum:
+          - csv
 
   responses:
     Unauthorized:
@@ -864,15 +1728,15 @@ components:
               code: unauthorized
     Forbidden:
       description: |
-        The authenticated key is not permitted to perform this action (a non-admin key on an admin
-        endpoint, or a key not permitted to use the requested model).
+        The authenticated key is not permitted to perform this action (it lacks the admin scope the
+        route requires, or it is not permitted to use the requested model).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example:
             error:
-              message: admin role required
+              message: insufficient scope
               code: forbidden
     NotFound:
       description: The requested resource does not exist (or is not visible to this key).
@@ -1550,11 +2414,58 @@ components:
 
     Role:
       type: string
-      description: A built-in API-key role.
+      description: |
+        A built-in API-key role. `admin` is the management **superuser**: it grants every admin
+        scope (see `AdminScope`), so an admin key may use every admin endpoint regardless of its
+        explicit scope set.
       enum:
         - admin
         - user
         - read-only
+
+    AdminScope:
+      type: string
+      description: |
+        A fine-grained admin-API scope of the form `<resource>:<read|write>`. Scopes authorize the
+        management surface at resource×operation granularity: a `read` scope gates a resource's GET
+        endpoints, a `write` scope gates its mutations. A key may hold any subset; the `admin` role
+        is a superuser that implicitly holds them all. A key holding a specific scope (but not the
+        admin role) passes only that scope's routes and receives `403` elsewhere. Granting an
+        unknown scope on key create/permissions is rejected with `400`.
+      enum:
+        - config:read
+        - config:write
+        - workers:read
+        - workers:write
+        - models:read
+        - models:write
+        - keys:read
+        - keys:write
+        - logs:read
+        - logs:write
+        - telemetry:read
+        - telemetry:write
+        - audit:read
+        - audit:write
+
+    Pagination:
+      type: object
+      description: |
+        The cursor-pagination footer of a list response. Pagination is cursor-based (not offset):
+        pass `next_cursor` back as the `cursor` query parameter to fetch the next page. The cursor is
+        an opaque token — treat it as a black box; do not construct or parse it.
+      required:
+        - next_cursor
+        - has_more
+      properties:
+        next_cursor:
+          type: [string, "null"]
+          description: |
+            An opaque token for the next page, or `null` when this is the last page. Pass it as the
+            `cursor` query parameter on the next request.
+        has_more:
+          type: boolean
+          description: Whether a further page exists (true exactly when `next_cursor` is non-null).
 
     Limits:
       type: object
@@ -1596,6 +2507,7 @@ components:
         - id
         - name
         - roles
+        - admin_scopes
         - allow_models
         - deny_models
         - revoked
@@ -1608,10 +2520,21 @@ components:
         name:
           type: string
           description: A human-readable label.
+        owner:
+          type: string
+          description: Optional free-form owner label (descriptive metadata only; grants no identity or access). Omitted when unset.
+        team:
+          type: string
+          description: Optional free-form team/project label (descriptive metadata only; grants no access). Omitted when unset.
         roles:
           type: array
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: array
+          description: The fine-grained admin-API scopes granted to the key (empty unless scoped).
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: array
           description: The per-key allow-list of model names.
@@ -1634,10 +2557,17 @@ components:
           type: integer
           format: int64
           description: Unix epoch seconds when the key was created.
+        created_by:
+          type: string
+          description: Opaque id of the actor (admin key) that created this key. Omitted when the creator was not recorded.
         last_used:
           type: [integer, "null"]
           format: int64
           description: Unix epoch seconds of the most recent successful authentication. Omitted if never used.
+        expires_at:
+          type: [integer, "null"]
+          format: int64
+          description: Unix epoch seconds after which the key no longer authenticates (TTL). Omitted/null when the key never expires.
         limits:
           oneOf:
             - $ref: "#/components/schemas/Limits"
@@ -1646,14 +2576,19 @@ components:
 
     AdminKeyListResponse:
       type: object
-      description: The list of API keys.
+      description: |
+        A cursor-paginated page of API keys in the shared list envelope. `data` holds the page of
+        keys (metadata only); `pagination` carries the cursor for the next page.
       required:
-        - keys
+        - data
+        - pagination
       properties:
-        keys:
+        data:
           type: array
           items:
             $ref: "#/components/schemas/AdminKeyView"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
 
     AdminCreateKeyRequest:
       type: object
@@ -1664,11 +2599,22 @@ components:
         name:
           type: string
           description: A human-readable label for the new key.
+        owner:
+          type: string
+          description: Optional free-form owner label (descriptive metadata only; grants no identity or access).
+        team:
+          type: string
+          description: Optional free-form team/project label (descriptive metadata only; grants no access).
         roles:
           type: [array, "null"]
           description: The roles to grant the new key.
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: [array, "null"]
+          description: The fine-grained admin-API scopes to grant. An unknown scope is rejected with 400.
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: [array, "null"]
           description: The per-key allow-list of model names.
@@ -1679,6 +2625,13 @@ components:
           description: The per-key deny-list of model names.
           items:
             type: string
+        expires_at:
+          type: [integer, "null"]
+          format: int64
+          description: >-
+            Optional TTL as unix epoch seconds, after which the key no longer authenticates. Must be in
+            the future; a non-positive or already-past value is rejected with 400. Omit for a
+            non-expiring key.
 
     AdminCreateKeyResponse:
       type: object
@@ -1690,6 +2643,7 @@ components:
         - name
         - token
         - roles
+        - admin_scopes
         - allow_models
         - deny_models
         - created
@@ -1699,6 +2653,12 @@ components:
           description: The opaque public key id.
         name:
           type: string
+        owner:
+          type: string
+          description: The owner label, echoed back when one was supplied. Omitted when unset.
+        team:
+          type: string
+          description: The team/project label, echoed back when one was supplied. Omitted when unset.
         token:
           type: string
           description: The one-time plaintext token (`agpu_<keyid>_<secret>`). Shown once; not recoverable.
@@ -1706,6 +2666,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: array
           items:
@@ -1718,6 +2682,13 @@ components:
           type: integer
           format: int64
           description: Unix epoch seconds when the key was created.
+        created_by:
+          type: string
+          description: Opaque id of the actor (admin key) that created this key. Omitted when not recorded.
+        expires_at:
+          type: [integer, "null"]
+          format: int64
+          description: The key's TTL as unix epoch seconds, echoed back when one was requested. Omitted/null for a non-expiring key.
 
     AdminRotateKeyResponse:
       type: object
@@ -1736,13 +2707,17 @@ components:
     AdminPermissionsRequest:
       type: object
       description: |
-        A full replacement of a key's roles and allow/deny lists. An omitted or null list clears that
-        dimension.
+        A full replacement of a key's roles, admin scopes, and allow/deny lists. An omitted or null
+        list clears that dimension. An unknown admin scope is rejected with 400.
       properties:
         roles:
           type: [array, "null"]
           items:
             $ref: "#/components/schemas/Role"
+        admin_scopes:
+          type: [array, "null"]
+          items:
+            $ref: "#/components/schemas/AdminScope"
         allow_models:
           type: [array, "null"]
           items:
@@ -1827,6 +2802,224 @@ components:
           format: int64
           description: Unix epoch seconds when the month window next resets.
 
+    AdminConfigSettings:
+      type: object
+      description: |
+        The runtime-tunable server settings (#92). Every field here can be changed live via
+        `PUT /v1/admin/config` with no restart. Durations are Go duration strings (e.g. `30m0s`).
+        Quota/session limits of `0` mean "unlimited" for that dimension.
+      required:
+        - log_level
+        - quota_default_rpm
+        - quota_default_tpm
+        - quota_default_daily_tokens
+        - quota_default_monthly_tokens
+        - quota_global_rpm
+        - quota_global_tpm
+        - session_ttl
+        - session_max_turns
+        - session_max_bytes
+        - session_max_context_tokens
+        - session_max_sessions_per_key
+        - session_overflow_policy
+        - model_warm_max
+        - heartbeat_timeout
+      properties:
+        log_level:
+          type: string
+          description: Minimum structured-log level emitted.
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        quota_default_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default requests-per-minute (0 = unlimited).
+        quota_default_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default tokens-per-minute (0 = unlimited).
+        quota_default_daily_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default daily token budget (0 = unlimited).
+        quota_default_monthly_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Per-key default monthly token budget (0 = unlimited).
+        quota_global_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Server-wide requests-per-minute cap across the whole fleet (0 = unlimited).
+        quota_global_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Server-wide tokens-per-minute cap across the whole fleet (0 = unlimited).
+        session_ttl:
+          type: string
+          description: Per-session idle timeout as a Go duration string (must be positive).
+        session_max_turns:
+          type: integer
+          minimum: 0
+          description: Per-session conversation turn cap (0 = unbounded).
+        session_max_bytes:
+          type: integer
+          minimum: 0
+          description: Per-session cumulative-content byte cap (0 = unbounded).
+        session_max_context_tokens:
+          type: integer
+          minimum: 0
+          description: Per-session cumulative context-token cap (0 = unbounded).
+        session_max_sessions_per_key:
+          type: integer
+          minimum: 0
+          description: Concurrent active sessions a single owner key may hold (0 = unlimited).
+        session_overflow_policy:
+          type: string
+          description: Over-cap history behavior.
+          enum:
+            - trim
+            - reject
+        model_warm_max:
+          type: string
+          description: Max model-warmth keep_alive window for session-bound jobs, as a Go duration string (must be positive).
+        heartbeat_timeout:
+          type: string
+          description: Window a worker may go without a heartbeat before eviction, as a Go duration string (must be positive).
+
+    AdminConfigReadOnly:
+      type: object
+      description: |
+        The boot-only server settings (#92), surfaced read-only. These can only be changed by
+        restarting the server with a new flag/env value; `PUT /v1/admin/config` rejects any attempt
+        to change them with `400`.
+      required:
+        - server_listen
+        - server_http_listen
+        - server_metrics_listen
+        - quota_path
+        - session_path
+        - log_format
+        - log_output
+      properties:
+        server_listen:
+          type: string
+          description: The gRPC control-plane listen address.
+        server_http_listen:
+          type: string
+          description: The public HTTP API listen address.
+        server_metrics_listen:
+          type: string
+          description: The Prometheus metrics listen address (empty when disabled).
+        quota_path:
+          type: string
+          description: The quota counter checkpoint file path.
+        session_path:
+          type: string
+          description: The session+history checkpoint file path.
+        log_format:
+          type: string
+          description: The structured-log encoding (json or text).
+        log_output:
+          type: string
+          description: The structured-log sink (stderr, stdout, or a file path).
+
+    AdminConfigResponse:
+      type: object
+      description: |
+        The effective resolved server settings (#92): the runtime-tunable values, the boot-only
+        values flagged read-only, and the explicit list of boot-only field keys.
+      required:
+        - settings
+        - read_only
+        - read_only_fields
+      properties:
+        settings:
+          $ref: "#/components/schemas/AdminConfigSettings"
+        read_only:
+          $ref: "#/components/schemas/AdminConfigReadOnly"
+        read_only_fields:
+          type: array
+          description: The boot-only field keys, which `PUT /v1/admin/config` rejects.
+          items:
+            type: string
+
+    AdminConfigUpdateRequest:
+      type: object
+      description: |
+        A partial update of the runtime-tunable settings (#92). Every field is optional; only the
+        fields present are changed. The whole update is validated before anything is applied — an
+        invalid value, a boot-only field, or an unknown field is rejected with `400` and nothing is
+        changed. Durations are Go duration strings; session TTL, model-warm-max, and heartbeat-timeout
+        must be positive.
+      additionalProperties: false
+      properties:
+        log_level:
+          type: string
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        quota_default_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_default_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_default_daily_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_default_monthly_tokens:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_global_rpm:
+          type: integer
+          format: int64
+          minimum: 0
+        quota_global_tpm:
+          type: integer
+          format: int64
+          minimum: 0
+        session_ttl:
+          type: string
+          description: A Go duration string (must be positive), e.g. "30m".
+        session_max_turns:
+          type: integer
+          minimum: 0
+        session_max_bytes:
+          type: integer
+          minimum: 0
+        session_max_context_tokens:
+          type: integer
+          minimum: 0
+        session_max_sessions_per_key:
+          type: integer
+          minimum: 0
+        session_overflow_policy:
+          type: string
+          enum:
+            - trim
+            - reject
+        model_warm_max:
+          type: string
+          description: A Go duration string (must be positive), e.g. "1h".
+        heartbeat_timeout:
+          type: string
+          description: A Go duration string (must be positive), e.g. "45s".
+
     AdminWorkerView:
       type: object
       description: A point-in-time projection of one worker in the fleet.
@@ -1886,14 +3079,243 @@ components:
 
     AdminWorkerListResponse:
       type: object
-      description: The fleet snapshot.
+      description: |
+        A cursor-paginated page of the fleet snapshot in the shared list envelope. `data` holds the
+        page of workers; `pagination` carries the cursor for the next page.
       required:
-        - workers
+        - data
+        - pagination
       properties:
-        workers:
+        data:
           type: array
           items:
             $ref: "#/components/schemas/AdminWorkerView"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AdminWorkerDetailView:
+      type: object
+      description: |
+        The rich per-worker detail projection returned by `GET /v1/admin/workers/{id}`: the list
+        view's fields plus the registration time and a derived uptime. GPU capacity is reported at the
+        aggregate level the control plane tracks (`gpu_type` + `total_vram`/`free_vram`); there is no
+        per-GPU breakdown.
+      required:
+        - id
+        - models
+        - status
+        - draining
+        - active_jobs
+        - total_vram
+        - free_vram
+        - load
+        - gpu_type
+        - last_seen
+      properties:
+        id:
+          type: string
+        models:
+          type: array
+          description: The model names the worker currently has available.
+          items:
+            type: string
+        status:
+          type: string
+          description: The worker's lifecycle state.
+          enum:
+            - online
+            - draining
+            - stale
+            - unknown
+        draining:
+          type: boolean
+          description: Whether the worker is draining (also implied by `status == "draining"`).
+        active_jobs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of jobs the worker is currently running.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total VRAM in bytes (aggregate across the worker's GPUs).
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Free VRAM in bytes (aggregate across the worker's GPUs).
+        load:
+          type: integer
+          format: int64
+          minimum: 0
+          description: A coarse 0-100 utilization value.
+        gpu_type:
+          type: string
+          description: The worker's reported GPU type.
+        last_seen:
+          type: integer
+          format: int64
+          description: Unix epoch seconds of the worker's last heartbeat.
+        registered_at:
+          type: integer
+          format: int64
+          description: |
+            Unix epoch seconds of when the worker registered with the server. Omitted when no
+            registration time is recorded. Uptime resets on reconnect.
+        uptime_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Seconds the worker has been registered, derived as `last_seen - registered_at`. Omitted
+            when no registration time is recorded.
+
+    AdminDrainWorkerRequest:
+      type: object
+      description: |
+        The optional body for draining a worker. `deadline_seconds > 0` turns the soft drain into a
+        timed forced drain (evict once in-flight jobs finish or the deadline elapses); `0` or an
+        absent body is the pure soft drain.
+      properties:
+        deadline_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Seconds to wait for in-flight jobs to finish before force-evicting the worker. `0` (or
+            omitted) leaves the worker to drain naturally with no forced eviction.
+
+    AdminPullModelRequest:
+      type: object
+      description: The body for pulling a model onto a worker.
+      required:
+        - model
+      properties:
+        model:
+          type: string
+          description: The model name to pull onto the worker (e.g. `llama3`).
+
+    AuditRedactedValues:
+      type: object
+      description: |
+        A before/after snapshot of an audited object: a map of only safe, non-sensitive metadata
+        fields (e.g. a key's id, name, roles, scopes, allow/deny lists, revoked flag). It NEVER
+        carries secret material — the stored secret hash and salt are never projected here.
+      additionalProperties: true
+
+    AuditEntry:
+      type: object
+      description: |
+        One immutable record of an administrative write: who did it (the actor key id), what they did
+        (the operation), the target resource, the redacted before/after projection of the affected
+        object, the request correlation id, and the outcome. Secrets are never recorded.
+      required:
+        - time
+        - actor
+        - op
+        - target
+        - request_id
+        - outcome
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: When the operation was recorded (RFC 3339, UTC).
+        actor:
+          type: string
+          description: The opaque id of the API key that performed the operation.
+        op:
+          type: string
+          description: |
+            The operation name, e.g. `key.create`, `key.revoke`, `key.rotate`, `key.permissions`,
+            `key.quota`, `worker.drain`.
+        target:
+          type: string
+          description: The id of the resource the operation acted on (a key id, a worker id), or empty if none.
+        before:
+          $ref: "#/components/schemas/AuditRedactedValues"
+          description: The redacted projection of the target before the change. Absent when there is no prior object.
+        after:
+          $ref: "#/components/schemas/AuditRedactedValues"
+          description: The redacted projection of the target after the change. Absent when there is no resulting object.
+        request_id:
+          type: string
+          description: The request correlation id (the `X-Request-Id` echoed to the client) tying the entry to its request.
+        outcome:
+          type: string
+          description: Whether the audited write succeeded or failed.
+          enum:
+            - success
+            - failure
+
+    AdminAuditListResponse:
+      type: object
+      description: |
+        A cursor-paginated page of audit-log entries (newest first) in the shared list envelope.
+        `data` holds the page of entries; `pagination` carries the cursor for the next page.
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    LogEntry:
+      type: object
+      description: |
+        One structured log line from the in-memory log buffer: when it was emitted, the level, the
+        human message, and the structured fields as a discrete `attrs` map (never embedded in the
+        message text). The line was redacted at capture, so a secret-named attribute reads
+        `[REDACTED]`; the entry never carries secret material.
+      required:
+        - time
+        - level
+        - message
+        - attrs
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: When the line was emitted (RFC 3339, UTC).
+        level:
+          type: string
+          description: The log level name.
+          enum:
+            - DEBUG
+            - INFO
+            - WARN
+            - ERROR
+        message:
+          type: string
+          description: The human-readable log message (no structured fields embedded).
+        attrs:
+          type: object
+          description: |
+            The line's structured attributes as discrete key→value pairs (e.g. `request_id`,
+            `session_id`, `worker`). Always present (an empty object when the line had no attributes).
+            Secret-named attributes are redacted to `[REDACTED]`.
+          additionalProperties: true
+
+    AdminLogListResponse:
+      type: object
+      description: |
+        A cursor-paginated page of log lines (newest first) in the shared list envelope. `data` holds
+        the page of entries; `pagination` carries the cursor for the next page.
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
 
     AdminStatsResponse:
       type: object
@@ -2031,3 +3453,564 @@ components:
           format: int64
           minimum: 0
           description: The cumulative count of recorded waits less than or equal to `le_ms`.
+
+    AdminUsageResponse:
+      type: object
+      description: |
+        The per-key usage report returned by `GET /v1/admin/usage`: a fleet-wide throttle summary plus
+        the cursor-paginated per-key usage rows (in the shared list envelope shape). The summary sits
+        alongside the list so a dashboard reads the aggregate throttle counts once regardless of which
+        page it fetched. Contains no secrets.
+      required:
+        - summary
+        - data
+        - pagination
+      properties:
+        summary:
+          $ref: "#/components/schemas/AdminUsageSummary"
+        data:
+          type: array
+          description: The per-key usage rows for this page, sorted by `key_id`.
+          items:
+            $ref: "#/components/schemas/AdminUsageRow"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    AdminUsageSummary:
+      type: object
+      description: |
+        The top-level, fleet-wide section of the usage report. The throttle counts are **aggregate**
+        (server-wide), sourced from the rate limiter — which does not attribute throttling to
+        individual keys — so they are reported once here and never per row.
+      required:
+        - key_count
+        - global_throttled
+        - key_throttled
+      properties:
+        key_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of keys matched by the active filters (the full result set, not just this page).
+        global_throttled:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of requests rejected by the server-wide (global) rate limiter.
+        key_throttled:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of per-key quota 429s observed across all keys.
+
+    AdminUsageRow:
+      type: object
+      description: |
+        One key's usage row: its identity and labels, the live quota snapshot (current usage versus
+        effective limits, the same fields as `AdminQuotaUsageResponse`), the rolling daily token series
+        (a sparkline; empty when there is no history or the series subsystem is disabled), and a
+        best-effort exhaustion forecast.
+      required:
+        - key_id
+        - name
+        - limits
+        - requests_this_minute
+        - tokens_this_minute
+        - tokens_today
+        - tokens_this_month
+        - minute_resets_at
+        - day_resets_at
+        - month_resets_at
+        - series
+        - forecast
+      properties:
+        key_id:
+          type: string
+          description: The key id this row describes.
+        name:
+          type: string
+          description: The key's human label.
+        owner:
+          type: string
+          description: The key's optional owner label, omitted when unset.
+        team:
+          type: string
+          description: The key's optional team label, omitted when unset.
+        limits:
+          $ref: "#/components/schemas/Limits"
+        requests_this_minute:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_this_minute:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_today:
+          type: integer
+          format: int64
+          minimum: 0
+        tokens_this_month:
+          type: integer
+          format: int64
+          minimum: 0
+        minute_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the minute window next resets.
+        day_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the day window next resets.
+        month_resets_at:
+          type: integer
+          format: int64
+          description: Unix epoch seconds when the month window next resets.
+        series:
+          type: array
+          description: |
+            The rolling daily token series, oldest first (at most 7 points). Always present (an empty
+            array, never null) so a client can iterate without a nil guard.
+          items:
+            $ref: "#/components/schemas/AdminUsageSeriesPoint"
+        forecast:
+          $ref: "#/components/schemas/AdminUsageForecast"
+
+    AdminUsageSeriesPoint:
+      type: object
+      description: One daily point of a key's usage series.
+      required:
+        - day
+        - tokens
+        - requests
+      properties:
+        day:
+          type: integer
+          format: int64
+          description: Unix epoch seconds at the UTC-midnight start of the day this point covers.
+        tokens:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative tokens the key consumed during this day.
+        requests:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The requests observed in the minute window at sample time — a coarse activity signal, not a
+            daily request total (the quota engine retains no daily request count).
+
+    AdminUsageForecast:
+      type: object
+      description: |
+        A best-effort projection of when a key exhausts its token budgets at the recent daily burn
+        rate. It is an **estimate** for rendering, not an enforcement input. A field is `null` when the
+        budget is unlimited, usage is not rising, or there is insufficient history to project a slope.
+      required:
+        - daily_exhaustion_at
+        - monthly_exhaustion_at
+      properties:
+        daily_exhaustion_at:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Projected unix epoch seconds the daily token budget is reached, or `null` when there is no
+            estimate. Because the daily budget resets each UTC midnight, this is only meaningful within
+            the current day.
+        monthly_exhaustion_at:
+          type: [integer, "null"]
+          format: int64
+          description: Projected unix epoch seconds the monthly token budget is reached, or `null` when there is no estimate.
+
+    AdminGPUsResponse:
+      type: object
+      description: |
+        The aggregated, read-only GPU/fleet capacity inventory returned by `GET /v1/admin/gpus`,
+        derived live from the heartbeat snapshot (no probing). Contains no secrets. All arrays are
+        present (empty, never null) for an empty fleet.
+      required:
+        - fleet
+        - by_type
+        - workers
+      properties:
+        fleet:
+          $ref: "#/components/schemas/AdminGPUFleet"
+        by_type:
+          type: array
+          description: Workers grouped by their reported GPU type, sorted by `gpu_type`.
+          items:
+            $ref: "#/components/schemas/AdminGPUByType"
+        workers:
+          type: array
+          description: |
+            The per-worker heatmap cells, sorted by `id`. A cell is one worker (not one physical
+            GPU): the control plane tracks GPU capacity only at the aggregate per-worker level.
+          items:
+            $ref: "#/components/schemas/AdminGPUCell"
+
+    AdminGPUFleet:
+      type: object
+      description: |
+        The fleet roll-up section: worker count, summed total/free VRAM (bytes) across the fleet, and
+        the load distribution (mean/max of the coarse 0-100 per-worker load).
+      required:
+        - worker_count
+        - total_vram
+        - free_vram
+        - mean_load
+        - max_load
+      properties:
+        worker_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of workers in the snapshot.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed total VRAM across all workers, in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed free VRAM across all workers, in bytes.
+        mean_load:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+          description: The mean coarse 0-100 load over the workers (0 when the fleet is empty).
+        max_load:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+          description: The single busiest worker's coarse 0-100 load (0 when the fleet is empty).
+
+    AdminGPUByType:
+      type: object
+      description: |
+        One by-GPU-type row: every worker reporting the same GPU type string folded into a worker
+        count and summed total/free VRAM for that type. The type string is the worker's reported value
+        verbatim (e.g. `cpu` for a GPU-less worker); it is not parsed into per-device counts.
+      required:
+        - gpu_type
+        - worker_count
+        - total_vram
+        - free_vram
+      properties:
+        gpu_type:
+          type: string
+          description: The reported GPU type string shared by the grouped workers.
+        worker_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of workers reporting this GPU type.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed total VRAM of the workers of this type, in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The summed free VRAM of the workers of this type, in bytes.
+
+    AdminGPUCell:
+      type: object
+      description: |
+        One heatmap cell: a single worker's capacity and utilization. A cell is per worker (not per
+        physical GPU) because the fleet snapshot tracks GPU capacity only at the aggregate per-worker
+        level.
+      required:
+        - id
+        - gpu_type
+        - total_vram
+        - free_vram
+        - load
+        - status
+        - active_jobs
+      properties:
+        id:
+          type: string
+          description: The worker id.
+        gpu_type:
+          type: string
+          description: The worker's reported GPU type.
+        total_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The worker's total VRAM, in bytes.
+        free_vram:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The worker's free VRAM, in bytes.
+        load:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+          description: A coarse 0-100 utilization value.
+        status:
+          type: string
+          description: The worker's lifecycle state.
+          enum:
+            - online
+            - draining
+            - stale
+            - unknown
+        active_jobs:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of jobs the worker is currently running.
+
+    AdminTelemetryResponse:
+      type: object
+      description: |
+        The dashboard telemetry summary returned by `GET /v1/admin/telemetry`: request rate/latency,
+        aggregate throttle counts, fleet health (status breakdown, queue depth, time-in-queue
+        distribution), the live session count, session-affinity counters, and process uptime — all read
+        live from the same in-process collectors the rest of the server maintains (the Prometheus
+        `/metrics` surface is unchanged). Contains no secrets.
+      required:
+        - requests
+        - throttles
+        - fleet
+        - sessions
+        - affinity
+        - uptime_seconds
+      properties:
+        requests:
+          $ref: "#/components/schemas/TelemetryRequests"
+        throttles:
+          $ref: "#/components/schemas/TelemetryThrottles"
+        fleet:
+          $ref: "#/components/schemas/TelemetryFleet"
+        sessions:
+          $ref: "#/components/schemas/TelemetrySessions"
+        affinity:
+          $ref: "#/components/schemas/TelemetryAffinity"
+        uptime_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Whole seconds since the API server started. Combine with the monotonic `requests.count`
+            (or sample across two polls) to derive a request rate.
+
+    TelemetryRequests:
+      type: object
+      description: |
+        The request-rate/latency section: the total HTTP requests observed and the latency
+        distribution. It is the in-process mirror of the Prometheus request-duration histogram.
+      required:
+        - count
+        - latency
+      properties:
+        count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The total number of HTTP requests observed (monotonic).
+        latency:
+          $ref: "#/components/schemas/TelemetryLatency"
+
+    TelemetryLatency:
+      type: object
+      description: |
+        The request-latency distribution: sum, max, and mean (all in milliseconds) plus the cumulative
+        le-bucketed histogram. The bucket shape matches `AdminWaitBucket` (a trailing `le_ms` of `0` is
+        the `+Inf` bucket).
+      required:
+        - sum_ms
+        - max_ms
+        - mean_ms
+        - buckets
+      properties:
+        sum_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The sum of all observed request latencies, in milliseconds.
+        max_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The longest observed request latency, in milliseconds.
+        mean_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The mean observed request latency, in milliseconds (0 when no request is recorded).
+        buckets:
+          type: array
+          description: The cumulative le-bucketed request-latency histogram, smallest bound first.
+          items:
+            $ref: "#/components/schemas/AdminWaitBucket"
+
+    TelemetryThrottles:
+      type: object
+      description: |
+        The throttle section: the cumulative count of requests rejected by the server-wide (global)
+        rate limiter and by per-key quota. These are **aggregate** (server-wide) — the rate limiter
+        does not attribute throttling to individual keys — matching the usage report's summary.
+      required:
+        - global
+        - key
+      properties:
+        global:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of requests rejected by the global rate limiter.
+        key:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The cumulative count of per-key quota rejections (429s).
+
+    TelemetryFleet:
+      type: object
+      description: |
+        The fleet-health section: the worker count, a breakdown of workers by lifecycle status, the
+        job-queue depth (total plus per-priority), and the time-in-queue distribution.
+      required:
+        - worker_count
+        - by_status
+        - queue
+        - wait_time
+      properties:
+        worker_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of workers in the snapshot.
+        by_status:
+          type: object
+          description: |
+            The worker count keyed by lifecycle status (`online`, `draining`, `stale`); only statuses
+            with at least one worker appear.
+          additionalProperties:
+            type: integer
+            format: int64
+            minimum: 0
+        queue:
+          $ref: "#/components/schemas/AdminQueueStats"
+        wait_time:
+          $ref: "#/components/schemas/AdminWaitTime"
+
+    TelemetrySessions:
+      type: object
+      description: |
+        The sessions section: the number of live (not-yet-expired) conversation sessions across all
+        owners. It is `0` when sessions are disabled.
+      required:
+        - active
+      properties:
+        active:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The number of live sessions (0 when sessions are disabled).
+
+    TelemetryAffinity:
+      type: object
+      description: |
+        The session-affinity section: turns that reused a session's warm worker (`hits`), turns that
+        rebound to a different worker (`misses`), and the session→worker rebindings (`rebinds`).
+      required:
+        - hits
+        - misses
+        - rebinds
+      properties:
+        hits:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Turns that routed back to the worker the session was already bound to (warm cache reused).
+        misses:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Turns that rebound to a different worker because the bound one was gone/unfit.
+        rebinds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The session→worker rebindings (equals `misses` today; reported distinctly).
+
+    AdminRolesResponse:
+      type: object
+      description: |
+        The role/scope catalog returned by `GET /v1/admin/roles`: the assignable roles (each with the
+        inference actions and admin-scope grant it provides) and the complete admin-scope vocabulary,
+        so a permissions editor can render its pickers without reverse-engineering the authorization
+        rules. Static metadata — no per-key state, no secrets. Both arrays are always present.
+      required:
+        - roles
+        - scopes
+      properties:
+        roles:
+          type: array
+          description: The assignable roles, in privilege order (`admin` → `user` → `read-only`).
+          items:
+            $ref: "#/components/schemas/AdminRoleInfo"
+        scopes:
+          type: array
+          description: |
+            The complete admin-scope vocabulary (sorted), i.e. every scope a key may be granted and
+            the exact set the `admin` role implicitly holds.
+          items:
+            $ref: "#/components/schemas/AdminScope"
+
+    AdminRoleInfo:
+      type: object
+      description: |
+        One assignable role's grants: the inference actions it permits, the breadth of models those
+        actions apply to, and whether it implicitly grants every admin scope (the `admin` superuser).
+        It mirrors exactly what dispatch-time authorization enforces for the role.
+      required:
+        - name
+        - description
+        - inference_actions
+        - model_scope
+        - grants_all_admin_scopes
+      properties:
+        name:
+          $ref: "#/components/schemas/Role"
+        description:
+          type: string
+          description: A short human-readable summary of the role for the editor UI.
+        inference_actions:
+          type: array
+          description: |
+            The model actions the role grants, as the op strings the audit log uses, in
+            pull → load → infer order. `user` and `admin` grant all three; `read-only` grants only
+            `infer`.
+          items:
+            type: string
+            enum:
+              - pull
+              - load
+              - infer
+        model_scope:
+          type: string
+          description: |
+            The breadth the role's inference actions apply to: `all` (every model, ignoring the
+            allow/deny lists — only `admin`) or `allow-listed` (only the key's allow-listed models,
+            with the deny-list winning).
+          enum:
+            - all
+            - allow-listed
+        grants_all_admin_scopes:
+          type: boolean
+          description: |
+            Whether the role implicitly holds every admin scope (true only for the `admin` superuser;
+            other roles hold only the scopes explicitly granted on the key).

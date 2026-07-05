@@ -184,7 +184,10 @@ func runKeyCreateHTTP(ctx context.Context, out io.Writer, cf *clientFlags, name 
 }
 
 func runKeyCreateLocal(ctx context.Context, out io.Writer, cf *clientFlags, name string, roles, allow, deny stringList) error {
-	svc, st, err := cf.localService()
+	// create is the one mutating local op that is LEGAL on an empty store (it is the
+	// bootstrap itself); the guard rejects it only once the store already has keys,
+	// at which point a second key must be minted through the running server's API.
+	svc, st, err := cf.localBootstrapService(ctx, "key create")
 	if err != nil {
 		return err
 	}
@@ -252,7 +255,7 @@ func runKeyPermsHTTP(ctx context.Context, out io.Writer, cf *clientFlags, id str
 }
 
 func runKeyPermsLocal(ctx context.Context, out io.Writer, cf *clientFlags, id string, roles, allow, deny stringList) error {
-	svc, st, err := cf.localService()
+	svc, st, err := cf.localBootstrapService(ctx, "key perms")
 	if err != nil {
 		return err
 	}
@@ -358,7 +361,7 @@ func runKeyRevoke(ctx context.Context, out io.Writer, args []string) error {
 }
 
 func runKeyRevokeLocal(ctx context.Context, out io.Writer, cf *clientFlags, id string) error {
-	svc, st, err := cf.localService()
+	svc, st, err := cf.localBootstrapService(ctx, "key revoke")
 	if err != nil {
 		return err
 	}
@@ -401,7 +404,7 @@ func runKeyRotate(ctx context.Context, out io.Writer, args []string) error {
 }
 
 func runKeyRotateLocal(ctx context.Context, out io.Writer, cf *clientFlags, id string) error {
-	svc, st, err := cf.localService()
+	svc, st, err := cf.localBootstrapService(ctx, "key rotate")
 	if err != nil {
 		return err
 	}

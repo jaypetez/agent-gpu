@@ -1,0 +1,251 @@
+package webui
+
+// logs.templ — the Logs viewer (issue 103): a filter bar (level, request_id, session_id,
+// worker, time range) over a monospace line list, plus a PAUSE/RESUME live tail over
+// SSE. Filters reduce volume (the server re-queries on apply); structured fields
+// render as DISCRETE badges beside each line, never embedded in the message. A CSV
+// export link downloads exactly the active filter. All styling is token-derived
+// utility classes; no raw hex and no arbitrary [...] values. The live tail is an
+// Alpine island that opens an EventSource to the SSE proxy (the session cookie
+// authenticates it; CSP connect-src 'self' permits it) and renders each JSON frame
+// into a line row client-side — pause closes the stream, resume reopens it, and a
+// reconnect simply resumes tailing new lines (the cursor is the ring's monotonic
+// position).
+
+// Logs is the viewer. The filter form GETs the line-table partial (so applying a
+// filter visibly reduces the rows). The live-tail panel below it tails new matching
+// lines over SSE with a pause/resume control. The whole screen is one Alpine
+// component owning the tail state.
+templ Logs(d LogsData) {
+	@Shell(d.Shell) {
+		<div class="mb-5">
+			<h1 class="text-2xl font-semibold text-fg">Logs</h1>
+			<p class="mt-1 text-sm text-fg-muted">Filter the buffered log lines, or watch a live tail. Fields show as discrete badges.</p>
+		</div>
+		if !d.Enabled {
+			<div class="panel">
+				<div class="panel-body">
+					@emptyState("Logging isn't enabled", "This server has no in-memory log buffer wired, so there are no lines to show.")
+				</div>
+			</div>
+		} else {
+			@logFilterBar(d)
+			@logTailPanel(d)
+			<!-- Filtered buffer: the server-rendered point-in-time query. Applying a
+			     filter re-fetches this region, visibly reducing the rows. The region
+			     role + label name it as a landmark so tests (and assistive tech)
+			     address it by role, not by its #id. -->
+			<div
+				id="log-table"
+				class="mt-4"
+				role="region"
+				aria-label="Buffered lines"
+				hx-get={ d.Shell.AssetPath + "/../partials/logs" }
+				hx-trigger="load"
+				hx-include="#log-filter"
+				hx-swap="outerHTML"
+			>
+				@LogTableLoading()
+			</div>
+		}
+	}
+}
+
+// logFilterBar is the filter form. It GETs the line-table partial with the current
+// filter values (hx-include), so applying narrows the buffered view; the same values
+// also drive the live tail (Alpine reads them on resume) and the CSV export link.
+// Persistent labels, a level picker, the three attribute filters, and the time
+// window — every field is optional and ANDed server-side.
+templ logFilterBar(d LogsData) {
+	<form
+		id="log-filter"
+		class="panel"
+		hx-get={ d.Shell.AssetPath + "/../partials/logs" }
+		hx-target="#log-table"
+		hx-swap="outerHTML"
+	>
+		<div class="panel-body grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+			<div class="flex flex-col gap-1.5">
+				<label for="filter-level" class="text-xs font-medium text-fg-muted">Level (minimum)</label>
+				<select id="filter-level" name="level" class="field">
+					for _, lvl := range d.Levels {
+						<option value={ lvl } selected?={ lvl == d.Filter.Level }>{ lvl }</option>
+					}
+				</select>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label for="filter-request" class="text-xs font-medium text-fg-muted">Request ID</label>
+				<input id="filter-request" name="request_id" type="text" autocomplete="off" spellcheck="false" value={ d.Filter.RequestID } class="field font-mono"/>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label for="filter-session" class="text-xs font-medium text-fg-muted">Session ID</label>
+				<input id="filter-session" name="session_id" type="text" autocomplete="off" spellcheck="false" value={ d.Filter.SessionID } class="field font-mono"/>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label for="filter-worker" class="text-xs font-medium text-fg-muted">Worker</label>
+				<input id="filter-worker" name="worker" type="text" autocomplete="off" spellcheck="false" value={ d.Filter.Worker } class="field font-mono"/>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label for="filter-since" class="text-xs font-medium text-fg-muted">Since (UTC)</label>
+				<input id="filter-since" name="since" type="datetime-local" value={ d.Filter.Since } class="field"/>
+			</div>
+			<div class="flex flex-col gap-1.5">
+				<label for="filter-until" class="text-xs font-medium text-fg-muted">Until (UTC)</label>
+				<input id="filter-until" name="until" type="datetime-local" value={ d.Filter.Until } class="field"/>
+			</div>
+		</div>
+		<div class="flex items-center justify-between gap-3 border-t border-line px-4 py-3">
+			<a class="btn btn-ghost" href={ templ.SafeURL(d.CSVHref) } title="Download the filtered lines as CSV">
+				@iconDownload()
+				<span>Export CSV</span>
+			</a>
+			<button type="submit" class="btn btn-primary">
+				@iconFilter()
+				<span>Apply filters</span>
+			</button>
+		</div>
+	</form>
+}
+
+// logTailPanel is the PAUSE/RESUME live tail (issue 103). It is an Alpine island that
+// opens an EventSource to the SSE proxy on resume and closes it on pause; each JSON
+// frame is parsed and prepended as a line row (most recent first), capped so the DOM
+// stays bounded. The connection state is shown as a pulsing live dot + a word, and
+// the since/until window is intentionally ignored by the tail (a tail is forward-
+// looking); the level + attribute filters are honored by passing them on the URL.
+// The tail starts PAUSED so opening the page doesn't immediately stream — the
+// operator presses Resume to begin (an explicit, calm default).
+templ logTailPanel(d LogsData) {
+	<div
+		class="mt-4 panel"
+		x-data={ logTailState(d.StreamURL) }
+		x-init="buildURL()"
+	>
+		<div class="panel-head">
+			<div class="flex items-center gap-2">
+				<span class="panel-title">Live tail</span>
+				<span class="flex items-center gap-1.5 text-xs" x-show="streaming">
+					<span class="live-dot" aria-hidden="true"></span>
+					<span class="font-mono uppercase tracking-wide text-accent">streaming</span>
+				</span>
+				<span class="flex items-center gap-1.5 text-xs text-fg-faint" x-show="!streaming" x-cloak>
+					<span class="font-mono uppercase tracking-wide">paused</span>
+				</span>
+			</div>
+			<div class="flex items-center gap-2">
+				<button type="button" class="btn btn-ghost" x-show="!streaming" x-on:click="resume()">
+					@iconPlay()
+					<span>Resume</span>
+				</button>
+				<button type="button" class="btn btn-ghost" x-show="streaming" x-cloak x-on:click="pause()">
+					@iconPause()
+					<span>Pause</span>
+				</button>
+				<button type="button" class="btn btn-ghost" x-on:click="clear()" title="Clear the tail">Clear</button>
+			</div>
+		</div>
+		<div class="panel-body p-0">
+			<div class="max-h-80 overflow-y-auto" aria-live="polite" aria-label="Live log tail">
+				<template x-if="lines.length === 0">
+					<div class="px-4 py-6 text-center text-sm text-fg-faint" x-text="streaming ? 'Waiting for new log lines…' : 'Press Resume to start tailing new log lines.'"></div>
+				</template>
+				<ul class="divide-y divide-line font-mono text-xs">
+					<template x-for="(line, idx) in lines" x-bind:key="idx">
+						<li class="flex flex-wrap items-start gap-x-3 gap-y-1 px-4 py-2">
+							<span class="tnum text-fg-faint" x-text="line.time"></span>
+							<span class="w-12 flex-none font-semibold uppercase" x-bind:class="line.toneClass" x-text="line.level"></span>
+							<span class="min-w-0 flex-1 break-words text-fg-muted" x-text="line.message"></span>
+							<template x-for="(f, fi) in line.fields" x-bind:key="fi">
+								<span class="rounded-sm border border-line bg-surface-2 px-1.5 py-0.5 text-fg-muted" x-bind:class="f.primary ? 'text-accent' : 'text-fg-muted'" x-text="f.text"></span>
+							</template>
+						</li>
+					</template>
+				</ul>
+			</div>
+		</div>
+	</div>
+}
+
+// LogTablePartial is the loaded, filtered, newest-first buffered line table. It is
+// the HTMX partial behind #log-table; applying a filter re-fetches it and the row
+// count visibly drops. Each line shows the time, a text-labeled level, the message,
+// and the structured fields as discrete badges (never embedded in the message). It
+// does not poll (the live tail covers new lines); the count is shown so a tightened
+// filter's effect is legible.
+templ LogTablePartial(t LogsTable) {
+	<div id="log-table" class="mt-4" role="region" aria-label="Buffered lines">
+		<div class="panel">
+			<div class="panel-head">
+				<span class="panel-title">Buffered lines</span>
+				<span class="font-mono text-sm tnum text-fg" aria-label="Buffered line count">{ itoa(t.Count) }</span>
+			</div>
+			<div class="panel-body p-0">
+				if len(t.Lines) == 0 {
+					<div class="px-4 py-6">
+						@emptyState("No matching lines", "Nothing in the buffer matches these filters. Widen the level or clear a field.")
+					</div>
+				} else {
+					<div class="max-h-96 overflow-y-auto">
+						<ul class="divide-y divide-line font-mono text-xs">
+							for _, line := range t.Lines {
+								@logRow(line)
+							}
+						</ul>
+					</div>
+				}
+			</div>
+		</div>
+	</div>
+}
+
+// logRow is one buffered log line: timestamp, text-labeled level (toned), message,
+// and the structured fields as discrete key=value badges (the first-class filter
+// fields emphasized). The fields are kept OUT of the message so an operator scans
+// them without parsing prose (AC3).
+templ logRow(line LogLine) {
+	<li class="flex flex-wrap items-start gap-x-3 gap-y-1 px-4 py-2">
+		<span class="tnum text-fg-faint">{ line.Time }</span>
+		<span class={ "w-12 flex-none font-semibold uppercase", toneText(line.Tone) }>{ line.Level }</span>
+		<span class="min-w-0 flex-1 break-words text-fg-muted">{ line.Message }</span>
+		for _, f := range line.Fields {
+			<span class={ "rounded-sm border border-line bg-surface-2 px-1.5 py-0.5", logFieldTone(f.Primary) }>{ f.Key }={ f.Value }</span>
+		}
+	</li>
+}
+
+// LogTableLoading is the table's first-paint skeleton (loading state).
+templ LogTableLoading() {
+	<div id="log-table" class="mt-4" role="region" aria-label="Buffered lines" aria-busy="true">
+		<div class="panel">
+			<div class="panel-head"><span class="panel-title">Buffered lines</span></div>
+			<div class="panel-body"><div class="skeleton h-40 w-full"></div></div>
+		</div>
+		<span class="sr-only">Loading log lines…</span>
+	</div>
+}
+
+// LogTableError is the table's error state: an in-voice notice with a retry that
+// re-fetches the region with the current filters.
+templ LogTableError(assetPath, msg string) {
+	<div id="log-table" class="mt-4" role="region" aria-label="Buffered lines">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load logs</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get={ assetPath + "/../partials/logs" }
+					hx-target="#log-table"
+					hx-include="#log-filter"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}

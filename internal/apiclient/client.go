@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -122,14 +124,21 @@ func New(baseURL, token string, opts ...Option) *Client {
 type KeyView struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Revoked     bool     `json:"revoked"`
 	UsageCount  uint64   `json:"usage_count"`
 	Created     int64    `json:"created"`
+	CreatedBy   string   `json:"created_by,omitempty"`
 	LastUsed    int64    `json:"last_used,omitempty"`
-	Limits      *Limits  `json:"limits,omitempty"`
+	// ExpiresAt is the key's TTL as unix epoch seconds, or nil when the key never
+	// expires. An expired key fails authentication (#96).
+	ExpiresAt *int64  `json:"expires_at,omitempty"`
+	Limits    *Limits `json:"limits,omitempty"`
 }
 
 // Limits mirrors httpapi.limitsView / store.Limits: a per-key quota override. A
@@ -147,11 +156,18 @@ type Limits struct {
 type CreateKeyResponse struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Token       string   `json:"token"`
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 	Created     int64    `json:"created"`
+	CreatedBy   string   `json:"created_by,omitempty"`
+	// ExpiresAt is the key's TTL as unix epoch seconds, echoed back when one was
+	// requested; nil for a non-expiring key.
+	ExpiresAt *int64 `json:"expires_at,omitempty"`
 }
 
 // RotateKeyResponse is the POST /v1/admin/keys/{id}/rotate response: the key id
@@ -178,6 +194,29 @@ type QuotaUsage struct {
 	MonthResetsAt  int64 `json:"month_resets_at"`
 }
 
+// RolesCatalog is the GET /v1/admin/roles response: the assignable roles (each
+// with the inference actions and admin-scope grant it provides) plus the full
+// admin-scope vocabulary. It is the static metadata a permissions editor renders
+// its role/scope pickers against; it carries no per-key state. Mirrors
+// httpapi.adminRolesResponse. Both slices are present (never nil).
+type RolesCatalog struct {
+	Roles  []RoleInfo `json:"roles"`
+	Scopes []string   `json:"scopes"`
+}
+
+// RoleInfo describes one assignable role's grants for the editor UI: its name and
+// description, the inference actions it grants (as op strings "pull"/"load"/
+// "infer"), the breadth those actions apply to (ModelScope: "all" or
+// "allow-listed"), and whether it implicitly grants every admin scope (the admin
+// superuser). Mirrors httpapi.adminRoleView / authz.RoleInfo.
+type RoleInfo struct {
+	Name                 string   `json:"name"`
+	Description          string   `json:"description"`
+	InferenceActions     []string `json:"inference_actions"`
+	ModelScope           string   `json:"model_scope"`
+	GrantsAllAdminScopes bool     `json:"grants_all_admin_scopes"`
+}
+
 // Model is one entry of the richer GET /models catalog: the model name, its
 // digest, and the Online workers serving it. Mirrors httpapi.modelEntry.
 type Model struct {
@@ -200,19 +239,314 @@ type Worker struct {
 	LastSeen   int64    `json:"last_seen"`
 }
 
+// WorkerDetail is the GET /v1/admin/workers/{id} response: the list view's fields
+// plus the registration time and a derived uptime. Mirrors
+// httpapi.adminWorkerDetailView. GPU capacity is the aggregate the control plane
+// tracks (no per-GPU breakdown). RegisteredAt/UptimeSeconds are 0 when no
+// registration time is recorded.
+type WorkerDetail struct {
+	ID            string   `json:"id"`
+	Models        []string `json:"models"`
+	Status        string   `json:"status"`
+	Draining      bool     `json:"draining"`
+	ActiveJobs    uint32   `json:"active_jobs"`
+	TotalVRAM     uint64   `json:"total_vram"`
+	FreeVRAM      uint64   `json:"free_vram"`
+	Load          uint32   `json:"load"`
+	GPUType       string   `json:"gpu_type"`
+	LastSeen      int64    `json:"last_seen"`
+	RegisteredAt  int64    `json:"registered_at,omitempty"`
+	UptimeSeconds int64    `json:"uptime_seconds,omitempty"`
+}
+
+// FleetCapacity is the GET /v1/admin/gpus response: an aggregated, read-only GPU
+// capacity inventory derived from the fleet heartbeat snapshot (no probing). It
+// mirrors httpapi.adminGPUsResponse. Fleet is the roll-up across all workers,
+// ByType groups workers by their reported GPU type, and Workers is the per-worker
+// (not per-device) heatmap cells. The slices are never nil (empty for an empty
+// fleet).
+type FleetCapacity struct {
+	Fleet   FleetCapacitySummary `json:"fleet"`
+	ByType  []GPUTypeCapacity    `json:"by_type"`
+	Workers []GPUWorkerCell      `json:"workers"`
+}
+
+// FleetCapacitySummary is the fleet roll-up section of FleetCapacity: worker
+// count, summed total/free VRAM (bytes), and the mean/max coarse 0-100 load over
+// the fleet. Mirrors httpapi.adminGPUFleet. Mean/Max are 0 for an empty fleet.
+type FleetCapacitySummary struct {
+	WorkerCount int    `json:"worker_count"`
+	TotalVRAM   uint64 `json:"total_vram"`
+	FreeVRAM    uint64 `json:"free_vram"`
+	MeanLoad    uint32 `json:"mean_load"`
+	MaxLoad     uint32 `json:"max_load"`
+}
+
+// GPUTypeCapacity is one by-GPU-type row of FleetCapacity: the reported GPU type
+// string, how many workers report it, and the summed total/free VRAM for that
+// type. Mirrors httpapi.adminGPUByType. The type string is the worker's reported
+// value verbatim (e.g. "cpu" for a GPU-less worker); it is not parsed for device
+// counts.
+type GPUTypeCapacity struct {
+	GPUType     string `json:"gpu_type"`
+	WorkerCount int    `json:"worker_count"`
+	TotalVRAM   uint64 `json:"total_vram"`
+	FreeVRAM    uint64 `json:"free_vram"`
+}
+
+// GPUWorkerCell is one heatmap cell of FleetCapacity: a single worker's
+// capacity/utilization (per worker, not per physical GPU). Mirrors
+// httpapi.adminGPUCell.
+type GPUWorkerCell struct {
+	ID         string `json:"id"`
+	GPUType    string `json:"gpu_type"`
+	TotalVRAM  uint64 `json:"total_vram"`
+	FreeVRAM   uint64 `json:"free_vram"`
+	Load       uint32 `json:"load"`
+	Status     string `json:"status"`
+	ActiveJobs uint32 `json:"active_jobs"`
+}
+
+// Telemetry is the GET /v1/admin/telemetry response: the dashboard summary in one
+// document — request rate/latency, throttles, fleet health (status breakdown, queue
+// depth, time-in-queue distribution), the live session count, session-affinity
+// counters, and process uptime. It mirrors httpapi.adminTelemetryResponse. It is a
+// read-only view over the same in-process collectors the server already maintains
+// (the Prometheus /metrics surface is separate and unchanged). The histogram bucket
+// slices are never nil.
+type Telemetry struct {
+	Requests      TelemetryRequests  `json:"requests"`
+	Throttles     TelemetryThrottles `json:"throttles"`
+	Fleet         TelemetryFleet     `json:"fleet"`
+	Sessions      TelemetrySessions  `json:"sessions"`
+	Affinity      TelemetryAffinity  `json:"affinity"`
+	UptimeSeconds int64              `json:"uptime_seconds"`
+}
+
+// TelemetryRequests is the request-rate/latency section of Telemetry: the total
+// requests observed and the latency distribution. Mirrors httpapi.telemetryRequests.
+type TelemetryRequests struct {
+	Count   uint64           `json:"count"`
+	Latency TelemetryLatency `json:"latency"`
+}
+
+// TelemetryLatency is the request-latency distribution: sum/max/mean (milliseconds)
+// and the cumulative le-bucketed histogram (trailing le_ms == 0 is the +Inf bucket).
+// Mirrors httpapi.telemetryLatency; Buckets reuses the wait-bucket shape.
+type TelemetryLatency struct {
+	SumMs   uint64                `json:"sum_ms"`
+	MaxMs   uint64                `json:"max_ms"`
+	MeanMs  uint64                `json:"mean_ms"`
+	Buckets []TelemetryStatBucket `json:"buckets"`
+}
+
+// TelemetryStatBucket is one cumulative histogram bucket (latency or wait-time): the
+// count of observations <= LeMs, with LeMs == 0 the sentinel for the +Inf bucket.
+// Mirrors httpapi.adminWaitBucket.
+type TelemetryStatBucket struct {
+	LeMs  uint64 `json:"le_ms"`
+	Count uint64 `json:"count"`
+}
+
+// TelemetryThrottles is the throttle section: the aggregate (server-wide) global and
+// per-key throttle counts. Mirrors httpapi.telemetryThrottles.
+type TelemetryThrottles struct {
+	Global uint64 `json:"global"`
+	Key    uint64 `json:"key"`
+}
+
+// TelemetryFleet is the fleet-health section: worker count, a breakdown of workers
+// by lifecycle status, the queue depth, and the time-in-queue distribution. Mirrors
+// httpapi.telemetryFleet. ByStatus carries only statuses with at least one worker.
+type TelemetryFleet struct {
+	WorkerCount int               `json:"worker_count"`
+	ByStatus    map[string]int    `json:"by_status"`
+	Queue       TelemetryQueue    `json:"queue"`
+	WaitTime    TelemetryWaitTime `json:"wait_time"`
+}
+
+// TelemetryQueue is the queue-depth section: the total pending jobs plus a
+// per-priority breakdown keyed by priority name. Mirrors httpapi.adminQueueStats.
+type TelemetryQueue struct {
+	Total      int            `json:"total"`
+	ByPriority map[string]int `json:"by_priority"`
+}
+
+// TelemetryWaitTime is the time-in-queue distribution: count/sum/max/mean (ms) and
+// the cumulative le-bucketed histogram. Mirrors httpapi.adminWaitTime.
+type TelemetryWaitTime struct {
+	Count   uint64                `json:"count"`
+	SumMs   uint64                `json:"sum_ms"`
+	MaxMs   uint64                `json:"max_ms"`
+	MeanMs  uint64                `json:"mean_ms"`
+	Buckets []TelemetryStatBucket `json:"buckets"`
+}
+
+// TelemetrySessions is the sessions section: the count of live sessions (0 when
+// sessions are disabled). Mirrors httpapi.telemetrySessions.
+type TelemetrySessions struct {
+	Active int `json:"active"`
+}
+
+// TelemetryAffinity is the session-affinity section: hits/misses/rebinds. Mirrors
+// httpapi.telemetryAffinity.
+type TelemetryAffinity struct {
+	Hits    uint64 `json:"hits"`
+	Misses  uint64 `json:"misses"`
+	Rebinds uint64 `json:"rebinds"`
+}
+
+// UsageReport is the GET /v1/admin/usage response: a fleet-wide throttle summary
+// plus the cursor-paginated per-key usage rows. Mirrors httpapi.adminUsageResponse.
+// The client follows next_cursor to assemble the full set; ListUsage returns just
+// the rows, GetUsage the whole report (summary + first page).
+type UsageReport struct {
+	Summary    UsageSummary `json:"summary"`
+	Data       []UsageRow   `json:"data"`
+	Pagination struct {
+		NextCursor *string `json:"next_cursor"`
+		HasMore    bool    `json:"has_more"`
+	} `json:"pagination"`
+}
+
+// UsageSummary is the top-level, fleet-wide section of the usage report: the
+// number of keys matched by the filters and the AGGREGATE (server-wide) throttle
+// counts. Per-key throttling is not tracked, so these are reported once at the top
+// level. Mirrors httpapi.adminUsageSummary.
+type UsageSummary struct {
+	KeyCount        int    `json:"key_count"`
+	GlobalThrottled uint64 `json:"global_throttled"`
+	KeyThrottled    uint64 `json:"key_throttled"`
+}
+
+// UsageRow is one key's usage row: identity/labels, the live quota snapshot
+// (current usage vs effective limits), the rolling daily token series (a
+// sparkline; empty when no history), and a best-effort exhaustion forecast.
+// Mirrors httpapi.adminUsageRow.
+type UsageRow struct {
+	KeyID  string `json:"key_id"`
+	Name   string `json:"name"`
+	Owner  string `json:"owner,omitempty"`
+	Team   string `json:"team,omitempty"`
+	Limits Limits `json:"limits"`
+
+	RequestsThisMinute uint64 `json:"requests_this_minute"`
+	TokensThisMinute   uint64 `json:"tokens_this_minute"`
+	TokensToday        uint64 `json:"tokens_today"`
+	TokensThisMonth    uint64 `json:"tokens_this_month"`
+
+	MinuteResetsAt int64 `json:"minute_resets_at"`
+	DayResetsAt    int64 `json:"day_resets_at"`
+	MonthResetsAt  int64 `json:"month_resets_at"`
+
+	Series   []UsageSeriesPoint `json:"series"`
+	Forecast UsageForecast      `json:"forecast"`
+}
+
+// UsageSeriesPoint is one daily point of a key's usage series: the UTC day (unix
+// seconds at midnight), that day's cumulative tokens, and the requests observed in
+// the minute window at sample time. Mirrors httpapi.adminUsageSeriesPoint.
+type UsageSeriesPoint struct {
+	Day      int64  `json:"day"`
+	Tokens   uint64 `json:"tokens"`
+	Requests uint64 `json:"requests"`
+}
+
+// UsageForecast is a key's best-effort exhaustion forecast: the projected unix
+// seconds each token budget is reached at the recent daily burn rate, or nil when
+// there is no estimate (unlimited budget, non-rising usage, or insufficient
+// history). It is an ESTIMATE for rendering, not an enforcement signal. Mirrors
+// httpapi.adminUsageForecast.
+type UsageForecast struct {
+	DailyExhaustionAt   *int64 `json:"daily_exhaustion_at"`
+	MonthlyExhaustionAt *int64 `json:"monthly_exhaustion_at"`
+}
+
+// UsageFilter narrows a usage query to keys matching the given exact labels. Every
+// field is optional; a zero UsageFilter requests every key. Non-empty fields are
+// ANDed by the server (matching the server-side filter semantics).
+type UsageFilter struct {
+	// KeyID, if non-empty, matches exactly this key id.
+	KeyID string
+	// Owner, if non-empty, matches keys whose owner label equals it.
+	Owner string
+	// Team, if non-empty, matches keys whose team label equals it.
+	Team string
+}
+
+// AuditEntry is one record of the admin audit log (GET /v1/admin/audit): who did
+// it (Actor key id), what (Op), to which resource (Target), the redacted
+// before/after metadata projection of the affected object, the request
+// correlation id, and the outcome. It mirrors httpapi/audit.Entry field-for-field
+// and, like the server-side record, NEVER carries secret material (the
+// before/after maps hold only safe metadata fields). Time is RFC3339; Before and
+// After are absent for operations with no prior/posterior object.
+type AuditEntry struct {
+	Time      time.Time      `json:"time"`
+	Actor     string         `json:"actor"`
+	Op        string         `json:"op"`
+	Target    string         `json:"target"`
+	Before    map[string]any `json:"before,omitempty"`
+	After     map[string]any `json:"after,omitempty"`
+	RequestID string         `json:"request_id"`
+	Outcome   string         `json:"outcome"`
+}
+
+// AuditFilter narrows a ListAudit query. Every field is optional; a zero
+// AuditFilter requests the whole log. Non-empty string fields and non-zero time
+// bounds are ANDed by the server, matching httpapi/audit.Filter: Since is
+// inclusive, Until exclusive (a half-open window). The time bounds are sent as
+// unix seconds (the admin API's timestamp convention); a zero time omits that
+// bound.
+type AuditFilter struct {
+	// Actor, if non-empty, matches entries by exactly this actor key id.
+	Actor string
+	// Op, if non-empty, matches entries with exactly this operation name.
+	Op string
+	// Target, if non-empty, matches entries acting on exactly this resource id.
+	Target string
+	// Since, if non-zero, excludes entries recorded before it (inclusive bound).
+	Since time.Time
+	// Until, if non-zero, excludes entries recorded at or after it (exclusive bound).
+	Until time.Time
+}
+
+// listEnvelope is the shared cursor-paginated list response shape every admin
+// list endpoint returns ({"data":[...],"pagination":{...}}). It mirrors
+// httpapi.listEnvelope. The client follows next_cursor to assemble the full list.
+type listEnvelope[T any] struct {
+	Data       []T `json:"data"`
+	Pagination struct {
+		NextCursor *string `json:"next_cursor"`
+		HasMore    bool    `json:"has_more"`
+	} `json:"pagination"`
+}
+
+// maxPageSize mirrors the server's maximum page size (httpapi.maxPageSize); the
+// list methods request it to minimize round-trips while following the cursor.
+const maxPageSize = 200
+
 // CreateKeyRequest is the POST /v1/admin/keys body. Mirrors
-// httpapi.adminCreateKeyRequest.
+// httpapi.adminCreateKeyRequest. Owner/Team are optional descriptive labels;
+// ExpiresAt is an optional TTL as unix epoch seconds (must be in the future) —
+// omit it for a non-expiring key (#96).
 type CreateKeyRequest struct {
 	Name        string   `json:"name"`
+	Owner       string   `json:"owner,omitempty"`
+	Team        string   `json:"team,omitempty"`
 	Roles       []string `json:"roles,omitempty"`
+	AdminScopes []string `json:"admin_scopes,omitempty"`
 	AllowModels []string `json:"allow_models,omitempty"`
 	DenyModels  []string `json:"deny_models,omitempty"`
+	ExpiresAt   *int64   `json:"expires_at,omitempty"`
 }
 
 // PermissionsRequest is the PUT /v1/admin/keys/{id}/permissions body — a full
-// replace of roles and allow/deny lists. Mirrors httpapi.adminPermissionsRequest.
+// replace of roles, admin scopes, and allow/deny lists. Mirrors
+// httpapi.adminPermissionsRequest.
 type PermissionsRequest struct {
 	Roles       []string `json:"roles"`
+	AdminScopes []string `json:"admin_scopes,omitempty"`
 	AllowModels []string `json:"allow_models"`
 	DenyModels  []string `json:"deny_models"`
 }
@@ -228,6 +562,19 @@ type QuotaRequest struct {
 	MonthlyTokens *uint64 `json:"monthly_tokens,omitempty"`
 }
 
+// drainWorkerRequest is the optional POST /v1/admin/workers/{id}/drain body.
+// DeadlineSeconds > 0 requests a timed forced drain; it is omitted (a pure soft
+// drain) when zero. Mirrors httpapi.adminDrainRequest.
+type drainWorkerRequest struct {
+	DeadlineSeconds int64 `json:"deadline_seconds,omitempty"`
+}
+
+// pullModelRequest is the POST /v1/admin/workers/{id}/models body. Mirrors
+// httpapi.adminPullModelRequest.
+type pullModelRequest struct {
+	Model string `json:"model"`
+}
+
 // ---- methods ----
 
 // CreateKey mints a new key with the given permissions and returns its id and
@@ -238,15 +585,28 @@ func (c *Client) CreateKey(ctx context.Context, req CreateKeyRequest) (CreateKey
 	return out, err
 }
 
-// ListKeys returns metadata for every key (GET /v1/admin/keys). No secrets.
+// ListKeys returns metadata for every key (GET /v1/admin/keys). No secrets. The
+// server returns the cursor-paginated list envelope ({"data":[...],
+// "pagination":{...}}); this method requests the maximum page size and follows
+// the next_cursor until exhausted, so the CLI sees the full keyset as before.
 func (c *Client) ListKeys(ctx context.Context) ([]KeyView, error) {
-	var out struct {
-		Keys []KeyView `json:"keys"`
+	var all []KeyView
+	cursor := ""
+	for {
+		var out listEnvelope[KeyView]
+		path := "/v1/admin/keys?limit=" + strconv.Itoa(maxPageSize)
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
 	}
-	if err := c.do(ctx, http.MethodGet, "/v1/admin/keys", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Keys, nil
 }
 
 // GetKey returns one key's metadata (GET /v1/admin/keys/{id}), or ErrNotFound.
@@ -295,6 +655,17 @@ func (c *Client) GetQuota(ctx context.Context, id string) (QuotaUsage, error) {
 	return out, err
 }
 
+// ListRoles returns the assignable-role + admin-scope catalog (GET
+// /v1/admin/roles): each role with the inference actions and admin scopes it
+// grants, plus the full scope vocabulary. It is the static metadata a permissions
+// editor renders against so it need not reverse-engineer the server's
+// authorization rules. Requires the keys:read scope (the admin role grants it).
+func (c *Client) ListRoles(ctx context.Context) (RolesCatalog, error) {
+	var out RolesCatalog
+	err := c.do(ctx, http.MethodGet, "/v1/admin/roles", nil, &out)
+	return out, err
+}
+
 // ListModels returns the permission-filtered model catalog visible to the
 // client's token (GET /models — the richer shape with digest + worker count).
 func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
@@ -308,15 +679,314 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 // ListWorkers returns a point-in-time snapshot of the fleet (GET
-// /v1/admin/workers).
+// /v1/admin/workers). Like ListKeys, the server returns the cursor-paginated
+// list envelope; this method requests the maximum page size and follows the
+// next_cursor until exhausted so the CLI sees the whole fleet.
 func (c *Client) ListWorkers(ctx context.Context) ([]Worker, error) {
-	var out struct {
-		Workers []Worker `json:"workers"`
+	var all []Worker
+	cursor := ""
+	for {
+		var out listEnvelope[Worker]
+		path := "/v1/admin/workers?limit=" + strconv.Itoa(maxPageSize)
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
 	}
-	if err := c.do(ctx, http.MethodGet, "/v1/admin/workers", nil, &out); err != nil {
-		return nil, err
+}
+
+// WorkerDetail returns the rich per-worker detail (GET /v1/admin/workers/{id}),
+// or ErrNotFound if no such worker is connected.
+func (c *Client) WorkerDetail(ctx context.Context, id string) (WorkerDetail, error) {
+	var out WorkerDetail
+	err := c.do(ctx, http.MethodGet, "/v1/admin/workers/"+url.PathEscape(id), nil, &out)
+	return out, err
+}
+
+// FleetCapacity returns the aggregated GPU/fleet capacity inventory (GET
+// /v1/admin/gpus): the fleet roll-up (worker count, summed total/free VRAM,
+// mean/max load), the by-GPU-type grouping, and the per-worker heatmap cells. It
+// is a live read over the heartbeat snapshot — no GPU probing — so it reflects the
+// fleet as of the call.
+func (c *Client) FleetCapacity(ctx context.Context) (FleetCapacity, error) {
+	var out FleetCapacity
+	err := c.do(ctx, http.MethodGet, "/v1/admin/gpus", nil, &out)
+	return out, err
+}
+
+// Telemetry returns the dashboard telemetry summary (GET /v1/admin/telemetry): the
+// request rate/latency, throttle counts, fleet health (status breakdown, queue
+// depth, time-in-queue distribution), live session count, session-affinity
+// counters, and process uptime — in one call. It is a live read over the same
+// in-process collectors the server maintains (the Prometheus /metrics surface is
+// separate and unchanged), so it reflects the server as of the call. Requires the
+// telemetry:read scope (the admin role grants it).
+func (c *Client) Telemetry(ctx context.Context) (Telemetry, error) {
+	var out Telemetry
+	err := c.do(ctx, http.MethodGet, "/v1/admin/telemetry", nil, &out)
+	return out, err
+}
+
+// DrainWorker drains the worker (POST /v1/admin/workers/{id}/drain): it stops
+// receiving new jobs while its in-flight jobs finish. A deadline > 0 requests a
+// timed forced drain — the worker is evicted once its in-flight jobs finish or
+// the deadline elapses, whichever first; a deadline <= 0 is the pure soft drain.
+// Returns ErrNotFound if no such worker is connected.
+func (c *Client) DrainWorker(ctx context.Context, id string, deadline time.Duration) error {
+	var body any
+	if deadline > 0 {
+		// Round up sub-second deadlines to one second so a small positive duration
+		// still requests a forced drain rather than degrading to a soft drain.
+		secs := int64(deadline / time.Second)
+		if secs == 0 {
+			secs = 1
+		}
+		body = drainWorkerRequest{DeadlineSeconds: secs}
 	}
-	return out.Workers, nil
+	return c.do(ctx, http.MethodPost, "/v1/admin/workers/"+url.PathEscape(id)+"/drain", body, nil)
+}
+
+// PullModel instructs the worker to pull model onto its local Ollama (POST
+// /v1/admin/workers/{id}/models). It is fire-and-forget: the server accepts the
+// request (202) and the model surfaces on the worker's next heartbeat once the
+// pull completes. Returns ErrNotFound if no such worker is connected.
+func (c *Client) PullModel(ctx context.Context, workerID, model string) error {
+	return c.do(ctx, http.MethodPost, "/v1/admin/workers/"+url.PathEscape(workerID)+"/models",
+		pullModelRequest{Model: model}, nil)
+}
+
+// UnloadModel asks the worker to unload model from its Ollama, freeing the VRAM
+// (DELETE /v1/admin/workers/{id}/models/{model}). A model that is not currently
+// loaded is a no-op and still reported as success. Returns ErrNotFound only when
+// no such worker is connected.
+func (c *Client) UnloadModel(ctx context.Context, workerID, model string) error {
+	return c.do(ctx, http.MethodDelete,
+		"/v1/admin/workers/"+url.PathEscape(workerID)+"/models/"+modelPathEscape(model), nil, nil)
+}
+
+// modelPathEscape escapes a model id for use as a path segment while preserving
+// the '/' in a namespaced model id (e.g. "library/llama3"): the server's
+// multi-segment wildcard captures the remainder of the path whole, so an embedded
+// slash must stay a literal separator rather than be percent-encoded. Other
+// reserved characters (notably the ':' in a colon tag like "qwen2:0.5b") are
+// valid unescaped in a path segment and are left as-is.
+func modelPathEscape(model string) string {
+	parts := strings.Split(model, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, "/")
+}
+
+// ListAudit returns the admin audit-log entries matching filter (GET
+// /v1/admin/audit), newest first. Like ListKeys/ListWorkers the server returns
+// the cursor-paginated list envelope; this method requests the maximum page size
+// and follows the next_cursor until exhausted, so the caller sees the full
+// matching set. The filter's string fields and (as unix seconds) its time bounds
+// are sent as query parameters; the entries never carry secret material.
+func (c *Client) ListAudit(ctx context.Context, filter AuditFilter) ([]AuditEntry, error) {
+	base := auditQuery(filter)
+	var all []AuditEntry
+	cursor := ""
+	for {
+		var out listEnvelope[AuditEntry]
+		path := "/v1/admin/audit?limit=" + strconv.Itoa(maxPageSize) + base
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
+	}
+}
+
+// auditQuery renders an AuditFilter into the query-string suffix (each piece
+// prefixed with "&", to follow the leading "?limit=") for ListAudit. Empty string
+// fields and zero time bounds are omitted; the time bounds are encoded as unix
+// seconds to match the server's parsing.
+func auditQuery(f AuditFilter) string {
+	q := url.Values{}
+	if f.Actor != "" {
+		q.Set("actor", f.Actor)
+	}
+	if f.Op != "" {
+		q.Set("op", f.Op)
+	}
+	if f.Target != "" {
+		q.Set("target", f.Target)
+	}
+	if !f.Since.IsZero() {
+		q.Set("since", strconv.FormatInt(f.Since.Unix(), 10))
+	}
+	if !f.Until.IsZero() {
+		q.Set("until", strconv.FormatInt(f.Until.Unix(), 10))
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "&" + q.Encode()
+}
+
+// LogEntry is one structured log line from the admin log API (GET
+// /v1/admin/logs): when it was emitted (RFC3339, UTC), the slog level name
+// (DEBUG/INFO/WARN/ERROR), the human message, and the structured attributes as a
+// discrete map (request_id/session_id/worker land here when present). It mirrors
+// httpapi.logEntryView field-for-field. The attributes are already redacted by the
+// server at capture, so a secret-named field reads "[REDACTED]"; the entry never
+// carries secret material.
+type LogEntry struct {
+	Time    time.Time      `json:"time"`
+	Level   string         `json:"level"`
+	Message string         `json:"message"`
+	Attrs   map[string]any `json:"attrs"`
+}
+
+// LogFilter narrows a Logs query. Every field is optional; a zero LogFilter
+// requests the default view — which on the server side is warnings and errors only
+// (debug/info are excluded unless Level widens it). The server ANDs the set
+// fields; the time bounds are a half-open window (Since inclusive, Until
+// exclusive), sent as unix seconds. The SSE live-tail endpoint is not exposed by
+// this client (it is a long-lived stream); use the query form to poll.
+type LogFilter struct {
+	// Level, if non-empty, is the minimum level to return (debug|info|warn|error).
+	// Empty uses the server default (warn), so debug/info are excluded by default.
+	Level string
+	// RequestID, if non-empty, matches lines whose request_id attribute equals it.
+	RequestID string
+	// SessionID, if non-empty, matches lines whose session_id attribute equals it.
+	SessionID string
+	// Worker, if non-empty, matches lines whose worker attribute equals it.
+	Worker string
+	// Since, if non-zero, excludes lines emitted before it (inclusive bound).
+	Since time.Time
+	// Until, if non-zero, excludes lines emitted at or after it (exclusive bound).
+	Until time.Time
+}
+
+// Logs returns the admin log lines matching filter (GET /v1/admin/logs), newest
+// first. Like ListAudit the server returns the cursor-paginated list envelope;
+// this method requests the maximum page size and follows the next_cursor until
+// exhausted, so the caller sees the full matching set. The filter's fields and (as
+// unix seconds) its time bounds are sent as query parameters; the entries never
+// carry secret material (the server redacts at capture).
+func (c *Client) Logs(ctx context.Context, filter LogFilter) ([]LogEntry, error) {
+	base := logsQuery(filter)
+	var all []LogEntry
+	cursor := ""
+	for {
+		var out listEnvelope[LogEntry]
+		path := "/v1/admin/logs?limit=" + strconv.Itoa(maxPageSize) + base
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
+	}
+}
+
+// logsQuery renders a LogFilter into the query-string suffix (each piece prefixed
+// with "&", to follow the leading "?limit=") for Logs. Empty string fields and
+// zero time bounds are omitted; the time bounds are encoded as unix seconds to
+// match the server's parsing.
+func logsQuery(f LogFilter) string {
+	q := url.Values{}
+	if f.Level != "" {
+		q.Set("level", f.Level)
+	}
+	if f.RequestID != "" {
+		q.Set("request_id", f.RequestID)
+	}
+	if f.SessionID != "" {
+		q.Set("session_id", f.SessionID)
+	}
+	if f.Worker != "" {
+		q.Set("worker", f.Worker)
+	}
+	if !f.Since.IsZero() {
+		q.Set("since", strconv.FormatInt(f.Since.Unix(), 10))
+	}
+	if !f.Until.IsZero() {
+		q.Set("until", strconv.FormatInt(f.Until.Unix(), 10))
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "&" + q.Encode()
+}
+
+// ListUsage returns the per-key usage rows matching filter (GET /v1/admin/usage),
+// sorted by key id. Like ListKeys/ListAudit the server returns the cursor-
+// paginated list envelope; this method requests the maximum page size and follows
+// the next_cursor until exhausted, so the caller sees every matching key's row. The
+// fleet-wide throttle summary is dropped (it is identical on every page); use
+// GetUsage when the summary is needed. The rows never carry secret material.
+func (c *Client) ListUsage(ctx context.Context, filter UsageFilter) ([]UsageRow, error) {
+	base := usageQuery(filter)
+	var all []UsageRow
+	cursor := ""
+	for {
+		var out UsageReport
+		path := "/v1/admin/usage?limit=" + strconv.Itoa(maxPageSize) + base
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Data...)
+		if out.Pagination.NextCursor == nil {
+			return all, nil
+		}
+		cursor = *out.Pagination.NextCursor
+	}
+}
+
+// GetUsage returns the first page of the usage report for filter, including the
+// fleet-wide throttle summary (GET /v1/admin/usage). It is the single-request form
+// for callers that want the aggregate summary and a page of rows rather than the
+// full cursor-followed row set ListUsage assembles.
+func (c *Client) GetUsage(ctx context.Context, filter UsageFilter) (UsageReport, error) {
+	var out UsageReport
+	err := c.do(ctx, http.MethodGet, "/v1/admin/usage?limit="+strconv.Itoa(maxPageSize)+usageQuery(filter), nil, &out)
+	return out, err
+}
+
+// usageQuery renders a UsageFilter into the query-string suffix (each piece
+// prefixed with "&", to follow the leading "?limit=") for ListUsage/GetUsage.
+// Empty fields are omitted; an empty filter yields the empty string.
+func usageQuery(f UsageFilter) string {
+	q := url.Values{}
+	if f.KeyID != "" {
+		q.Set("key_id", f.KeyID)
+	}
+	if f.Owner != "" {
+		q.Set("owner", f.Owner)
+	}
+	if f.Team != "" {
+		q.Set("team", f.Team)
+	}
+	if len(q) == 0 {
+		return ""
+	}
+	return "&" + q.Encode()
 }
 
 // Get performs a raw authenticated GET against path and decodes the JSON body

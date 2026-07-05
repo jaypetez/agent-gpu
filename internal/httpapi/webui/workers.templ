@@ -1,0 +1,550 @@
+package webui
+
+// workers.templ — the Workers + GPU management screens (issue 101). Two screens:
+//
+//   - Workers(...)         the fleet screen: a GPU utilization heatmap over a live
+//     worker list. Both are HTMX-polled regions that load after first paint and
+//     refresh on a calm 6s cadence (within AC4's 5-10s band); the page header is
+//     static and is NOT re-fetched, so only the data regions update.
+//   - WorkerDetailPage(...) one worker's detail: capacity, status, loaded models,
+//     and the management controls — drain (medium friction), force-evict (high
+//     friction, typed-name confirm), pull and unload models. A "View logs" link
+//     reaches the worker's logs (the logs screen lands in issue 103) so a stalled
+//     worker's logs are ~3 clicks from the dashboard.
+//
+// All styling is token-derived utility classes from app.css; no raw hex and no
+// arbitrary [...] values (the token-lint test fails the build on either). Status
+// is always color AND text (statusBadge / band words). Destructive controls use
+// Alpine for the confirm interaction and HTMX for the write, inheriting the body's
+// hx-headers CSRF token; no inline event handlers (CSP-clean).
+
+// Workers is the fleet screen. The static header sits above two independently
+// polled regions: the GPU heatmap and the live worker list. Splitting them means
+// the header never re-fetches and each region refreshes on its own (AC4: static
+// fields not over-refreshed).
+templ Workers(d WorkersData) {
+	@Shell(d.Shell) {
+		<div class="mb-5 flex flex-wrap items-end justify-between gap-3">
+			<div>
+				<h1 class="text-2xl font-semibold text-fg">Workers</h1>
+				<p class="mt-1 text-sm text-fg-muted">Live fleet capacity and health. Updates every few seconds.</p>
+			</div>
+			<button
+				type="button"
+				class="btn btn-ghost"
+				hx-get={ d.Shell.AssetPath + "/../partials/worker-list" }
+				hx-target="#worker-list"
+				hx-swap="outerHTML"
+				title="Refresh now"
+			>
+				@iconGauge()
+				<span>Refresh</span>
+			</button>
+		</div>
+		<!-- GPU heatmap: loads on first paint, then refreshes every 6s. The region
+		     role + label make it a named landmark so tests (and assistive tech)
+		     address it by role, not by its #id. -->
+		<div
+			id="gpu-heatmap"
+			role="region"
+			aria-label="GPU utilization"
+			hx-get={ d.Shell.AssetPath + "/../partials/gpu-heatmap" }
+			hx-trigger="load, every 6s"
+			hx-swap="outerHTML"
+		>
+			@HeatmapLoading()
+		</div>
+		<!-- Worker list: a second, independently polled region under the heatmap. -->
+		<div
+			id="worker-list"
+			class="mt-4"
+			hx-get={ d.Shell.AssetPath + "/../partials/worker-list" }
+			hx-trigger="load, every 6s"
+			hx-swap="outerHTML"
+		>
+			@WorkerListLoading()
+		</div>
+	}
+}
+
+// Heatmap is the loaded GPU utilization heatmap partial: a fleet roll-up line over
+// a grid of per-worker cells. Each cell's load band is conveyed by BOTH a tone
+// fill/text color AND a text word (ok/busy/hot), never color alone (AC2). Each
+// cell is a link to that worker's detail — one click from a cell (AC2). It keeps
+// its poll attributes so it re-refreshes itself.
+templ Heatmap(assetPath string, h HeatmapData) {
+	<div
+		id="gpu-heatmap"
+		role="region"
+		aria-label="GPU utilization"
+		hx-get={ assetPath + "/../partials/gpu-heatmap" }
+		hx-trigger="every 6s"
+		hx-swap="outerHTML"
+	>
+		<div class="panel">
+			<div class="panel-head">
+				<span class="panel-title">GPU utilization</span>
+				<span class="font-mono text-xs text-fg-faint">{ itoa(h.WorkerCount) } workers</span>
+			</div>
+			<div class="panel-body">
+				if len(h.Cells) == 0 {
+					@emptyState("No workers connected", "Start a worker with agentgpu worker start and its GPUs appear here.")
+				} else {
+					<div class="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+						<div class="flex items-baseline gap-2">
+							<span class="text-fg-faint">Mean load</span>
+							<span class={ "font-mono tnum font-semibold", toneText(h.MeanTone) }>{ itoaU32(h.MeanLoad) }%</span>
+							@toneTag(h.MeanTone)
+						</div>
+						<div class="flex items-baseline gap-2">
+							<span class="text-fg-faint">Peak</span>
+							<span class="font-mono tnum text-fg">{ itoaU32(h.MaxLoad) }%</span>
+						</div>
+						<div class="flex items-baseline gap-2">
+							<span class="text-fg-faint">VRAM free</span>
+							<span class="font-mono tnum text-fg">{ h.FreeVRAM }</span>
+							<span class="text-fg-faint">of { h.TotalVRAM }</span>
+						</div>
+					</div>
+					<ul class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+						for _, c := range h.Cells {
+							@heatmapCell(c)
+						}
+					</ul>
+				}
+			</div>
+		</div>
+	</div>
+}
+
+// heatmapCell is one worker's utilization tile. The fill + load number are tone-
+// colored; the band WORD (ok/busy/hot) is printed so the band reads in grayscale
+// and to a screen reader (AC2). The whole tile is a link to the worker's detail.
+// The aria-label states the worker, the load, and the band in words.
+templ heatmapCell(c HeatCell) {
+	<li>
+		<a
+			href={ templ.SafeURL(c.Href) }
+			class={ "flex flex-col gap-1 rounded-md border border-line p-3 transition-colors hover:border-line-strong", heatCell(c.Tone) }
+			aria-label={ "Worker " + c.ID + ": load " + itoaU32(c.Load) + " percent, " + c.BandWord }
+		>
+			<span class="truncate font-mono text-xs text-fg-muted" title={ c.ID }>{ shortID(c.ID) }</span>
+			<div class="flex items-baseline justify-between gap-2">
+				<span class="font-mono text-2xl font-semibold tnum">{ itoaU32(c.Load) }<span class="text-base font-normal">%</span></span>
+				<span class="font-mono text-xs font-semibold uppercase tracking-wide">{ c.BandWord }</span>
+			</div>
+			<span class="font-mono text-xs text-fg-faint">{ c.VRAM }</span>
+		</a>
+	</li>
+}
+
+// HeatmapLoading is the heatmap's first-paint skeleton (AC4 loading state): the
+// panel shape with shimmering placeholder tiles, so the operator sees structure
+// immediately rather than a blank frame.
+templ HeatmapLoading() {
+	<div id="gpu-heatmap" role="region" aria-label="GPU utilization" aria-busy="true">
+		<div class="panel">
+			<div class="panel-head"><span class="panel-title">GPU utilization</span></div>
+			<div class="panel-body">
+				<div class="skeleton mb-4 h-4 w-64"></div>
+				<div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
+					for range 5 {
+						<div class="skeleton h-20 w-full"></div>
+					}
+				</div>
+			</div>
+		</div>
+		<span class="sr-only">Loading GPU utilization…</span>
+	</div>
+}
+
+// HeatmapError is the heatmap's error state (AC4): an in-voice notice with a retry
+// that re-fetches the region. Status is conveyed by the icon AND the text.
+templ HeatmapError(assetPath, msg string) {
+	<div id="gpu-heatmap" role="region" aria-label="GPU utilization">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load GPU utilization</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get={ assetPath + "/../partials/gpu-heatmap" }
+					hx-target="#gpu-heatmap"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}
+
+// WorkerListPartial is the loaded live worker list: a table of every connected
+// worker with its status (text-labeled badge), in-flight jobs, load, GPU type,
+// VRAM, and last-seen. Each row links to the worker's detail. It keeps its poll
+// attributes so it re-refreshes itself. Empty state covers a fleet with no
+// workers connected.
+templ WorkerListPartial(assetPath string, rows []WorkerListItem) {
+	<div
+		id="worker-list"
+		class="mt-4"
+		hx-get={ assetPath + "/../partials/worker-list" }
+		hx-trigger="every 6s"
+		hx-swap="outerHTML"
+	>
+		<div class="panel">
+			<div class="panel-head">
+				<span class="panel-title">Fleet</span>
+				<span class="font-mono text-sm tnum text-fg">{ itoa(len(rows)) }</span>
+			</div>
+			<div class="panel-body p-0">
+				if len(rows) == 0 {
+					<div class="px-4 py-6">
+						@emptyState("No workers connected", "Start a worker with agentgpu worker start and it will register here.")
+					</div>
+				} else {
+					<div class="overflow-x-auto">
+						<table class="tbl">
+							<thead>
+								<tr>
+									<th scope="col">Worker</th>
+									<th scope="col">Status</th>
+									<th scope="col" class="text-right">Jobs</th>
+									<th scope="col" class="text-right">Load</th>
+									<th scope="col">GPU</th>
+									<th scope="col">VRAM</th>
+									<th scope="col">Last seen</th>
+								</tr>
+							</thead>
+							<tbody>
+								for _, w := range rows {
+									<tr>
+										<td>
+											<a class="font-mono text-xs text-accent hover:underline" href={ templ.SafeURL("/admin/workers/" + w.ID) } title={ "Open worker " + w.ID }>{ shortID(w.ID) }</a>
+										</td>
+										<td>@statusBadge(w.Tone, w.Status)</td>
+										<td class="tbl-num text-fg">{ itoaU32(w.ActiveJobs) }</td>
+										<td class="tbl-num text-fg-muted">{ itoaU32(w.Load) }%</td>
+										<td class="text-fg-muted">{ w.GPUType }</td>
+										<td class="font-mono text-xs text-fg-muted">{ w.VRAM }</td>
+										<td class="text-xs text-fg-faint">{ w.LastSeen }</td>
+									</tr>
+								}
+							</tbody>
+						</table>
+					</div>
+				}
+			</div>
+		</div>
+	</div>
+}
+
+// WorkerListLoading is the worker list's first-paint skeleton (AC4 loading state).
+templ WorkerListLoading() {
+	<div id="worker-list" class="mt-4" aria-busy="true">
+		<div class="panel">
+			<div class="panel-head"><span class="panel-title">Fleet</span></div>
+			<div class="panel-body"><div class="skeleton h-32 w-full"></div></div>
+		</div>
+		<span class="sr-only">Loading workers…</span>
+	</div>
+}
+
+// WorkerListError is the worker list's error state (AC4): an in-voice notice with
+// a retry that re-fetches the region.
+templ WorkerListError(assetPath, msg string) {
+	<div id="worker-list" class="mt-4">
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-10 text-center">
+				<span class="text-danger">
+					@iconAlert()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Couldn't load workers</p>
+					<p class="mt-1 text-sm text-fg-muted">{ msg }</p>
+				</div>
+				<button
+					type="button"
+					class="btn"
+					hx-get={ assetPath + "/../partials/worker-list" }
+					hx-target="#worker-list"
+					hx-swap="outerHTML"
+				>Try again</button>
+			</div>
+		</div>
+	</div>
+}
+
+// WorkerDetailPage is one worker's detail screen. It opens with the worker's
+// identity + status and a "View logs" affordance (AC1), then a capacity panel, a
+// status panel, the loaded-models list with per-model unload, and the management
+// controls (drain / force-evict / pull). Writes post via HTMX (CSRF inherited
+// from the body) and append a toast to #toasts; the confirm interactions are
+// Alpine-only (CSP-clean).
+templ WorkerDetailPage(d WorkerDetail, shell ShellData) {
+	@Shell(shell) {
+		<div class="mb-5 flex flex-wrap items-start justify-between gap-3">
+			<div>
+				<div class="flex items-center gap-3">
+					<h1 class="font-mono text-2xl font-semibold text-fg" title={ d.ID }>{ shortID(d.ID) }</h1>
+					@statusBadge(d.Tone, d.Status)
+				</div>
+				<p class="mt-1 text-sm text-fg-muted">Worker detail and management.</p>
+			</div>
+			<a class="btn btn-ghost" href={ templ.SafeURL(d.LogsHref) } title="Open this worker's logs">
+				@iconLogs()
+				<span>View logs</span>
+			</a>
+		</div>
+		<div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+			@workerCapacityPanel(d)
+			@workerStatusPanel(d)
+		</div>
+		<div class="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+			@workerModelsPanel(d)
+			@workerManagePanel(d)
+		</div>
+	}
+}
+
+// workerCapacityPanel shows the worker's GPU type and VRAM, with a used-VRAM bar.
+// The bar width is live data (a percentage), so it is an inline width style —
+// deliberately not an arbitrary Tailwind value (forbidden by the token-lint test).
+templ workerCapacityPanel(d WorkerDetail) {
+	<div class="panel">
+		<div class="panel-head"><span class="panel-title">Capacity</span></div>
+		<div class="panel-body flex flex-col gap-4">
+			<div class="flex items-center justify-between text-sm">
+				<span class="text-fg-faint">GPU</span>
+				<span class="text-fg">{ d.GPUType }</span>
+			</div>
+			<div>
+				<div class="mb-1 flex items-center justify-between text-xs">
+					<span class="text-fg-muted">VRAM in use</span>
+					<span class="font-mono tnum text-fg">{ itoa(d.UsedPct) }%</span>
+				</div>
+				<div class="h-2 w-full overflow-hidden rounded-full bg-surface-2" role="img" aria-label={ "VRAM " + itoa(d.UsedPct) + " percent in use" }>
+					<div class={ "h-full rounded-full", toneBar(d.LoadTone) } style={ barWidth(d.UsedPct, 100) }></div>
+				</div>
+				<div class="mt-2 flex items-center justify-between font-mono text-xs text-fg-faint">
+					<span>{ d.FreeVRAM } free</span>
+					<span>{ d.TotalVRAM } total</span>
+				</div>
+			</div>
+		</div>
+	</div>
+}
+
+// workerStatusPanel shows the operational facts: load, in-flight jobs, uptime,
+// and last-seen. Load carries its tone word so the number's health reads in text.
+templ workerStatusPanel(d WorkerDetail) {
+	<div class="panel">
+		<div class="panel-head"><span class="panel-title">Status</span></div>
+		<div class="panel-body">
+			<dl class="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+				<div class="flex flex-col gap-0.5">
+					<dt class="text-xs text-fg-faint">Load</dt>
+					<dd class="flex items-baseline gap-2">
+						<span class={ "font-mono tnum font-semibold", toneText(d.LoadTone) }>{ itoaU32(d.Load) }%</span>
+						@toneTag(d.LoadTone)
+					</dd>
+				</div>
+				<div class="flex flex-col gap-0.5">
+					<dt class="text-xs text-fg-faint">In-flight jobs</dt>
+					<dd class="font-mono tnum text-fg">{ itoaU32(d.ActiveJobs) }</dd>
+				</div>
+				<div class="flex flex-col gap-0.5">
+					<dt class="text-xs text-fg-faint">Uptime</dt>
+					<dd class="font-mono text-fg">
+						if d.Uptime != "" {
+							{ d.Uptime }
+						} else {
+							<span class="text-fg-faint">—</span>
+						}
+					</dd>
+				</div>
+				<div class="flex flex-col gap-0.5">
+					<dt class="text-xs text-fg-faint">Last seen</dt>
+					<dd class="text-fg">{ d.LastSeen }</dd>
+				</div>
+			</dl>
+		</div>
+	</div>
+}
+
+// workerModelsPanel lists the models loaded on the worker, each with an unload
+// control. The unload posts via HTMX DELETE and appends a toast. Empty state
+// covers a worker with no models loaded yet.
+templ workerModelsPanel(d WorkerDetail) {
+	<div class="panel">
+		<div class="panel-head">
+			<span class="panel-title">Models</span>
+			<span class="font-mono text-sm tnum text-fg">{ itoa(len(d.Models)) }</span>
+		</div>
+		<div class="panel-body p-0">
+			if len(d.Models) == 0 {
+				<div class="px-4 py-6">
+					@emptyState("No models loaded", "Pull a model below and it appears here after the next heartbeat.")
+				</div>
+			} else {
+				<ul class="divide-y divide-line">
+					for _, m := range d.Models {
+						<li class="flex items-center justify-between gap-3 px-4 py-2.5">
+							<span class="min-w-0 break-words font-mono text-sm text-fg">{ m }</span>
+							<button
+								type="button"
+								class="btn btn-ghost"
+								hx-delete={ "/admin/workers/" + d.ID + "/models/" + m }
+								hx-target="#toasts"
+								hx-swap="beforeend"
+								aria-label={ "Unload " + m }
+							>Unload</button>
+						</li>
+					}
+				</ul>
+			}
+		</div>
+	</div>
+}
+
+// workerManagePanel holds the lifecycle controls in escalating friction: pull a
+// model (low), drain (medium — explicit confirm), and force-evict (high — a
+// typed-name confirm whose button stays disabled until the typed text equals the
+// worker id). Each is an Alpine island; the write itself is an HTMX request that
+// inherits the CSRF header from the body. Drain is offered only when the worker
+// is not already draining.
+templ workerManagePanel(d WorkerDetail) {
+	<div class="panel">
+		<div class="panel-head"><span class="panel-title">Manage</span></div>
+		<div class="panel-body flex flex-col gap-5">
+			<!-- Pull a model (low friction). -->
+			<form
+				class="flex flex-col gap-2"
+				hx-post={ "/admin/workers/" + d.ID + "/models" }
+				hx-target="#toasts"
+				hx-swap="beforeend"
+			>
+				<label for="pull-model" class="text-sm font-medium text-fg">Pull a model</label>
+				<div class="flex gap-2">
+					<input id="pull-model" name="model" type="text" required autocomplete="off" spellcheck="false" placeholder="llama3" class="field font-mono"/>
+					<button type="submit" class="btn">Pull</button>
+				</div>
+				<p class="text-xs text-fg-faint">The model downloads on the worker and appears after its next heartbeat.</p>
+			</form>
+			<!-- Drain (medium friction): an explicit confirm step before the write. -->
+			if !d.Draining {
+				<div x-data="{ open: false }" class="border-t border-line pt-4">
+					<div class="flex items-center justify-between gap-3">
+						<div>
+							<p class="text-sm font-medium text-fg">Drain worker</p>
+							<p class="text-xs text-fg-muted">Stop new jobs; in-flight jobs finish first.</p>
+						</div>
+						<button type="button" class="btn" x-show="!open" x-on:click="open = true">Drain</button>
+					</div>
+					<div x-show="open" x-cloak class="mt-3 flex items-center gap-2">
+						<span class="text-sm text-fg-muted">Stop sending new jobs to this worker?</span>
+						<button
+							type="button"
+							class="btn btn-primary"
+							hx-post={ "/admin/workers/" + d.ID + "/drain" }
+							hx-target="#toasts"
+							hx-swap="beforeend"
+							x-on:click="open = false"
+						>Confirm drain</button>
+						<button type="button" class="btn btn-ghost" x-on:click="open = false">Cancel</button>
+					</div>
+				</div>
+			} else {
+				<div class="border-t border-line pt-4">
+					<p class="text-sm font-medium text-fg">Drain worker</p>
+					<p class="text-xs text-fg-muted">This worker is already draining.</p>
+				</div>
+			}
+			<!-- Force-evict (high friction): typed-name confirm. The confirm button is
+			     disabled until the typed text exactly equals the worker id. -->
+			<div x-data="{ open: false, confirm: '' }" class="border-t border-line pt-4">
+				<div class="flex items-center justify-between gap-3">
+					<div>
+						<p class="text-sm font-medium text-fg">Force-evict worker</p>
+						<p class="text-xs text-fg-muted">Disconnect now, even with jobs in flight. This cannot be undone.</p>
+					</div>
+					<button type="button" class="btn btn-danger" x-show="!open" x-on:click="open = true">Force-evict</button>
+				</div>
+				<div x-show="open" x-cloak class="mt-3 flex flex-col gap-2">
+					<label class="text-xs text-fg-muted">
+						Type the worker id <span class="font-mono text-fg">{ d.ID }</span> to confirm.
+					</label>
+					<div class="flex gap-2">
+						<input
+							type="text"
+							x-model="confirm"
+							autocomplete="off"
+							spellcheck="false"
+							placeholder={ d.ID }
+							class="field font-mono"
+							aria-label="Type the worker id to confirm eviction"
+						/>
+						<button
+							type="button"
+							class="btn btn-danger"
+							hx-post={ "/admin/workers/" + d.ID + "/evict" }
+							hx-target="#toasts"
+							hx-swap="beforeend"
+							x-bind:disabled={ "confirm !== '" + d.ID + "'" }
+							x-on:click="open = false; confirm = ''"
+						>Force-evict</button>
+						<button type="button" class="btn btn-ghost" x-on:click="open = false; confirm = ''">Cancel</button>
+					</div>
+				</div>
+			</div>
+		</div>
+	</div>
+}
+
+// WorkerActionToast is the transient notice a write action swaps into #toasts on
+// success or failure. The tone colors the left rule AND a glyph, and the message
+// is in the operator's voice — status conveyed by color AND text (AC3/AC4). It is
+// announced by the #toasts region's aria-live. It auto-dismisses after a short,
+// reduced-motion-respecting delay via an Alpine island.
+templ WorkerActionToast(res WorkerActionResult) {
+	<div
+		class={ "toast pointer-events-auto", toastTone(res.Tone) }
+		role="status"
+		x-data="{ show: true }"
+		x-show="show"
+		x-init="setTimeout(() => show = false, 6000)"
+	>
+		<span class={ toneText(res.Tone) }>
+			@iconAlert()
+		</span>
+		<div class="min-w-0">
+			<p class="font-medium text-fg">{ res.Title }</p>
+			<p class="mt-0.5 text-fg-muted">{ res.Message }</p>
+		</div>
+	</div>
+}
+
+// WorkerNotFound is the detail screen's not-found body: a worker that is not (or
+// no longer) connected. It is a calm in-voice empty state with a way back to the
+// fleet, rendered inside the shell so the chrome stays intact (the handler sets a
+// 404 status).
+templ WorkerNotFound(shell ShellData) {
+	@Shell(shell) {
+		<div class="panel">
+			<div class="panel-body flex flex-col items-center gap-3 py-12 text-center">
+				<span class="text-fg-faint">
+					@iconInbox()
+				</span>
+				<div>
+					<p class="text-sm font-medium text-fg">Worker not connected</p>
+					<p class="mt-1 max-w-sm text-sm text-fg-muted">This worker isn't in the fleet right now. It may have disconnected or never registered.</p>
+				</div>
+				<a href={ templ.SafeURL("/admin/workers") } class="btn btn-primary">Back to workers</a>
+			</div>
+		</div>
+	}
+}

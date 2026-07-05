@@ -90,43 +90,97 @@ func openLogOutput(name string) (io.Writer, func() error, error) {
 	}
 }
 
-// newLogger builds the single root *slog.Logger both the server and worker
-// subcommands inherit (#23). It is the one place logging is configured, so the
-// level, encoding, sink, and secret redaction are uniform across the whole
-// process with no per-subsystem duplication.
+// logRingCapacity is the number of most-recent log records the in-memory ring
+// retains (#90 foundation for the log-stream/level admin endpoints in #92/#99).
+// It is a fixed, modest cap: enough for an operator to inspect recent activity
+// without unbounded memory growth.
+const logRingCapacity = 1024
+
+// logHandle bundles the root logger with the two control seams a later admin
+// endpoint (#92/#99) needs but which are wired here, at the single
+// logging-configuration site: a *slog.LevelVar to flip the verbosity at runtime,
+// and the in-memory ring buffer of recent records. It also carries the file-sink
+// closer. The plain newLogger wrapper discards the extra seams for callers that
+// do not need them (so existing call sites and tests are unchanged).
+type logHandle struct {
+	Logger *slog.Logger
+	// Level is the dynamic log level: SetLevel changes what is emitted (and rung)
+	// process-wide with no restart. It is the seam #92 flips from an admin route.
+	Level *slog.LevelVar
+	// Ring is the bounded in-memory buffer of recent log records (redacted). It is
+	// the seam #92/#99 reads to stream recent logs from an admin route.
+	Ring *logRing
+	// Close flushes/closes a file sink (a no-op for stderr/stdout).
+	Close func() error
+}
+
+// SetLevel changes the dynamic log level at runtime (the seam #92 exposes over
+// an admin route). It is safe for concurrent use (slog.LevelVar is).
+func (h *logHandle) SetLevel(level slog.Level) { h.Level.Set(level) }
+
+// newLoggerHandle builds the root logger plus its runtime-control seams (the
+// dynamic level var and the in-memory ring), at the single place logging is
+// configured (#23/#90). The terminal handler (JSON by default, text on request)
+// is wrapped in a ringHandler so every emitted record is also appended to the
+// ring; the level var governs both what is emitted and what is buffered.
 //
-// It returns the logger, a closer that flushes/closes a file sink (a no-op for
-// stderr/stdout), and an error only when a file sink cannot be opened. The
-// resolved config comes from config.ResolveLog (flag > env > default), so the
-// level is configurable without a code change. An unrecognized level or format
-// degrades to the info/json defaults rather than erroring, so a typo in an env
-// var cannot stop the process from starting.
+// Redaction is installed via redactAttr (the stringly-typed backstop) on the
+// terminal handler AND re-applied by the ring handler to its captured copy; the
+// type-level guarantee lives on store.APIKey.LogValue. Together they ensure no
+// secret material reaches either the logs or the ring.
 //
-// Redaction is installed here via redactAttr (the stringly-typed backstop); the
-// type-level guarantee lives on store.APIKey.LogValue. Both together ensure no
-// secret material reaches the logs.
-func newLogger(cfg config.LogConfig) (*slog.Logger, func() error, error) {
-	level, _ := parseLevel(cfg.Level)
+// It returns an error only when a file sink cannot be opened. An unrecognized
+// level or format degrades to the info/json defaults rather than erroring, so a
+// typo in an env var cannot stop the process from starting.
+func newLoggerHandle(cfg config.LogConfig) (*logHandle, error) {
+	initial, _ := parseLevel(cfg.Level)
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(initial)
 
 	out, closeFn, err := openLogOutput(cfg.Output)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	opts := &slog.HandlerOptions{
-		Level:       level,
+		Level:       levelVar,
 		ReplaceAttr: redactAttr,
 	}
 
-	var handler slog.Handler
+	var terminal slog.Handler
 	switch strings.ToLower(strings.TrimSpace(cfg.Format)) {
 	case "text":
-		handler = slog.NewTextHandler(out, opts)
+		terminal = slog.NewTextHandler(out, opts)
 	default:
 		// json is the default and the fallback for any unrecognized format, so logs
 		// stay structured and parseable unless text is explicitly requested.
-		handler = slog.NewJSONHandler(out, opts)
+		terminal = slog.NewJSONHandler(out, opts)
 	}
 
-	return slog.New(handler), closeFn, nil
+	ring := newLogRing(logRingCapacity)
+	handler := newRingHandler(terminal, ring)
+
+	return &logHandle{
+		Logger: slog.New(handler),
+		Level:  levelVar,
+		Ring:   ring,
+		Close:  closeFn,
+	}, nil
+}
+
+// newLogger builds the single root *slog.Logger both the server and worker
+// subcommands inherit (#23). It is the thin, backward-compatible wrapper over
+// newLoggerHandle for callers that only need the logger + sink closer (most
+// callers and the logging tests); the dynamic level var and in-memory ring it
+// also builds are reachable via newLoggerHandle when a caller needs them (#92).
+//
+// It returns the logger, a closer that flushes/closes a file sink (a no-op for
+// stderr/stdout), and an error only when a file sink cannot be opened. The
+// resolved config comes from config.ResolveLog (flag > env > default).
+func newLogger(cfg config.LogConfig) (*slog.Logger, func() error, error) {
+	h, err := newLoggerHandle(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return h.Logger, h.Close, nil
 }

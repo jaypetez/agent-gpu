@@ -5,10 +5,22 @@
 #   protoc-gen-go      v1.36.6
 #   protoc-gen-go-grpc v1.5.1
 #   goreleaser         v2.16.0
+#   templ              v0.3.1020   (admin console codegen, #100)
+#   tailwindcss        v4.1.16     (admin console CSS, #100; via internal/httpapi/webui/package.json)
 BUF_VERSION             := v1.50.0
 PROTOC_GEN_GO_VERSION   := v1.36.6
 PROTOC_GEN_GRPC_VERSION := v1.5.1
 GORELEASER_VERSION      := v2.16.0
+TEMPL_VERSION           := v0.3.1020
+
+# Admin console (#100) source/build locations. The Node toolchain (package.json,
+# lockfile, node_modules) lives INSIDE the console package dir so that node_modules
+# is an ancestor of assets/css/input.css — Tailwind v4 resolves `@import
+# "tailwindcss"` from the input file's directory walking up, so co-locating is what
+# makes a clean `npm ci` build resolve the package (it is NOT a separate ui/ dir).
+WEBUI_DIR  := internal/httpapi/webui
+UI_DIR     := $(WEBUI_DIR)
+TEMPL      ?= go run github.com/a-h/templ/cmd/templ@$(TEMPL_VERSION)
 
 GORELEASER ?= go run github.com/goreleaser/goreleaser/v2@$(GORELEASER_VERSION)
 
@@ -44,6 +56,26 @@ proto: ## Regenerate Go stubs from proto/ (commit the result)
 proto-lint: ## Lint the protobuf definitions
 	$(BUF) lint
 
+.PHONY: ui
+ui: ui-templ ui-css ## Regenerate the admin console: templ Go + Tailwind CSS (commit the result)
+
+.PHONY: ui-templ
+ui-templ: ## Regenerate *_templ.go from the .templ sources (#100)
+	$(TEMPL) generate ./$(WEBUI_DIR)
+
+.PHONY: ui-css
+ui-css: ## Build the admin console CSS from the design tokens (#100)
+	cd $(UI_DIR) && npm install --no-audit --no-fund && npm run build:css
+
+.PHONY: ui-verify
+ui-verify: ui ## Regenerate the console and FAIL if the committed artifacts drift
+	git diff --exit-code -- $(WEBUI_DIR)
+
+.PHONY: ui-e2e
+ui-e2e: ## Run the Playwright + axe-core accessibility E2E against a built binary (#100)
+	$(GO) build -o agentgpu ./cmd/agentgpu
+	cd $(UI_DIR) && npm install --no-audit --no-fund && npm run test:e2e:install && AGENTGPU_BIN="$(CURDIR)/agentgpu" npm run test:e2e
+
 .PHONY: openapi-lint
 openapi-lint: ## Validate openapi.yaml (OpenAPI 3.1 + recommended ruleset) via the pinned Redocly image
 	$(DOCKER) run --rm -e REDOCLY_TELEMETRY=off -v "$(CURDIR):/spec" -w /spec $(REDOCLY_IMAGE) lint openapi.yaml
@@ -68,6 +100,51 @@ cover: ## Run tests with coverage and print the total (mirrors CI; no -race so i
 .PHONY: cover-html
 cover-html: cover ## Render the coverage profile to coverage.html and open it
 	$(GO) tool cover -html=coverage.out -o coverage.html
+
+# ---------------------------------------------------------------------------
+# Layered agentic E2E gate (#105)
+#
+# test-e2e and test-all are the single-command, single-exit-code gates an agent
+# (or a developer) runs to know the whole suite is green before pushing. Both emit
+# machine-parseable JSON artifacts under $(TEST_RESULTS_DIR) (gitignored) AND keep
+# the human-readable stream, so a failure is legible enough to fix in one loop.
+#
+# The recipes need bash for `set -o pipefail` — so the pipeline's exit status
+# reflects `go test` (not the tee/printf it is piped through). The shell override
+# is target-scoped so the rest of the Makefile keeps its default shell. CI runs
+# these on ubuntu (bash present); the full -race+coverage gate is evaluated there.
+TEST_RESULTS_DIR := test-results
+GO_TEST_JSON     := $(TEST_RESULTS_DIR)/go-test.json
+GO_RACE_JSON     := $(TEST_RESULTS_DIR)/go-test-race.json
+
+.PHONY: test-e2e
+test-e2e: SHELL := bash
+test-e2e: .SHELLFLAGS := -eu -o pipefail -c
+test-e2e: ## Layered E2E: Go unit+httptest (JSON) + Playwright+axe, ONE pass/fail exit code (#105)
+	@mkdir -p $(TEST_RESULTS_DIR)
+	@echo ">> Go unit + httptest (machine-parseable JSON -> $(GO_TEST_JSON))"
+	$(GO) test -json ./... | tee $(GO_TEST_JSON) | $(GO) run ./internal/cmd/testsummary
+	@echo ">> Playwright + axe accessibility E2E (JSON -> $(WEBUI_DIR)/test-results/results.json)"
+	$(MAKE) ui-e2e
+
+.PHONY: test-all
+test-all: SHELL := bash
+test-all: .SHELLFLAGS := -eu -o pipefail -c
+test-all: ## Full gate: Go -race+coverage (JSON) + Playwright+axe + compose smoke, ONE exit code (#105)
+	@mkdir -p $(TEST_RESULTS_DIR)
+	@echo ">> Go -race + coverage (mirrors CI; needs cgo — Linux/CI or a Windows box with gcc)"
+	@echo "   (machine-parseable JSON -> $(GO_RACE_JSON))"
+	$(GO) test -race -covermode=atomic -coverprofile=coverage.out -json ./... \
+		| tee $(GO_RACE_JSON) | $(GO) run ./internal/cmd/testsummary
+	$(GO) tool cover -func=coverage.out | tail -1
+	@echo ">> Playwright + axe accessibility E2E"
+	$(MAKE) ui-e2e
+	@echo ">> Compose infra smoke (build + register + persist + infer); set SKIP_COMPOSE=1 to skip"
+	@if [ "$${SKIP_COMPOSE:-0}" = "1" ]; then \
+		echo "   SKIP_COMPOSE=1 — skipping the Docker/inference smoke"; \
+	else \
+		$(MAKE) compose-e2e; \
+	fi
 
 .PHONY: vet
 vet: ## Run go vet

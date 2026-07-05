@@ -204,14 +204,14 @@ func TestAdminDrainWorkerEndToEnd(t *testing.T) {
 	// The worker is registered (the harness waited for its model to appear).
 	resp := h.adminReq(t, http.MethodGet, admin, "/v1/admin/workers", "")
 	var list struct {
-		Workers []struct {
+		Data []struct {
 			ID     string `json:"id"`
 			Status string `json:"status"`
-		} `json:"workers"`
+		} `json:"data"`
 	}
 	decodeBody(t, resp, &list)
-	if len(list.Workers) != 1 || list.Workers[0].ID != "worker-1" {
-		t.Fatalf("worker list wrong: %+v", list.Workers)
+	if len(list.Data) != 1 || list.Data[0].ID != "worker-1" {
+		t.Fatalf("worker list wrong: %+v", list.Data)
 	}
 
 	// Drain it through the admin API.
@@ -227,15 +227,15 @@ func TestAdminDrainWorkerEndToEnd(t *testing.T) {
 		r := h.adminReq(t, http.MethodGet, admin, "/v1/admin/workers", "")
 		defer func() { _ = r.Body.Close() }()
 		var l struct {
-			Workers []struct {
+			Data []struct {
 				ID     string `json:"id"`
 				Status string `json:"status"`
-			} `json:"workers"`
+			} `json:"data"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&l); err != nil {
 			return false
 		}
-		return len(l.Workers) == 1 && l.Workers[0].Status == "draining"
+		return len(l.Data) == 1 && l.Data[0].Status == "draining"
 	})
 
 	// Draining an unknown worker → 404.

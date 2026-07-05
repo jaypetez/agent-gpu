@@ -47,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sort"
 
 	"github.com/jaypetez/agent-gpu/internal/store"
 )
@@ -92,12 +93,193 @@ func (a Action) String() string { return a.op() }
 // and in docs/architecture.md.
 const (
 	// RoleAdmin grants every action on every model, bypassing allow/deny lists.
+	// It is ALSO the admin-API superuser: it grants every admin scope (see
+	// HasScope and the Scope* constants), so an existing admin key keeps full
+	// access to the management surface without being granted individual scopes.
 	RoleAdmin = "admin"
 	// RoleUser grants pull/load/infer, but only on permitted models.
 	RoleUser = "user"
 	// RoleReadOnly grants infer only (never pull/load), on permitted models.
 	RoleReadOnly = "read-only"
 )
+
+// Admin-API scopes (#90). The management surface is authorized at
+// resource×operation granularity: each scope is "<resource>:<read|write>".
+// A read scope gates the GETs of a resource; a write scope gates its mutations.
+// A key may hold any subset; the RoleAdmin superuser implicitly holds them ALL
+// (see HasScope). Scopes are stored on store.APIKey.AdminScopes and gate the
+// HTTP admin routes via the scope middleware — they are independent of the
+// model-action authorization (Authorize/decide) above, which governs inference.
+//
+// The resources mirror the management epic's surfaces: server config, the
+// worker fleet, model lifecycle, API keys, the structured log stream, telemetry
+// (queue/fleet stats), and the audit log itself.
+const (
+	ScopeConfigRead     = "config:read"
+	ScopeConfigWrite    = "config:write"
+	ScopeWorkersRead    = "workers:read"
+	ScopeWorkersWrite   = "workers:write"
+	ScopeModelsRead     = "models:read"
+	ScopeModelsWrite    = "models:write"
+	ScopeKeysRead       = "keys:read"
+	ScopeKeysWrite      = "keys:write"
+	ScopeLogsRead       = "logs:read"
+	ScopeLogsWrite      = "logs:write"
+	ScopeTelemetryRead  = "telemetry:read"
+	ScopeTelemetryWrite = "telemetry:write"
+	ScopeAuditRead      = "audit:read"
+	ScopeAuditWrite     = "audit:write"
+)
+
+// allScopes is the complete set of admin scopes, used to validate a requested
+// scope set (rejecting unknown scope strings at the create/permissions seam) and
+// documented as exactly what the RoleAdmin superuser implicitly grants. It is
+// the single source of truth for the scope vocabulary.
+var allScopes = map[string]struct{}{
+	ScopeConfigRead:     {},
+	ScopeConfigWrite:    {},
+	ScopeWorkersRead:    {},
+	ScopeWorkersWrite:   {},
+	ScopeModelsRead:     {},
+	ScopeModelsWrite:    {},
+	ScopeKeysRead:       {},
+	ScopeKeysWrite:      {},
+	ScopeLogsRead:       {},
+	ScopeLogsWrite:      {},
+	ScopeTelemetryRead:  {},
+	ScopeTelemetryWrite: {},
+	ScopeAuditRead:      {},
+	ScopeAuditWrite:     {},
+}
+
+// ValidScope reports whether scope names a known admin scope. The HTTP layer
+// uses it to reject an unknown scope on key create/permissions rather than
+// silently storing a string that gates nothing.
+func ValidScope(scope string) bool {
+	_, ok := allScopes[scope]
+	return ok
+}
+
+// AllScopes returns a sorted copy of every defined admin scope. It is the
+// canonical superuser scope set (what RoleAdmin grants) and the validation
+// vocabulary; returning a copy keeps the internal set immutable.
+func AllScopes() []string {
+	out := make([]string, 0, len(allScopes))
+	for s := range allScopes {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HasScope reports whether key is authorized for the admin scope. The RoleAdmin
+// superuser is authorized for every scope (so existing admin keys keep full
+// access); otherwise the key must list the exact scope in its AdminScopes. This
+// is the single decision the admin-route scope middleware consults, mirroring
+// the deny-wins discipline of decide() but for the management surface: a key
+// with neither the admin role nor the scope is denied (the HTTP layer maps that
+// to 403).
+func HasScope(key store.APIKey, scope string) bool {
+	if contains(key.Roles, RoleAdmin) {
+		return true
+	}
+	return contains(key.AdminScopes, scope)
+}
+
+// ModelScope describes, for AllRoles, the breadth of models a role's inference
+// actions apply to: every model (admin), or only the key's per-model allow-list
+// subject to the deny-wins precedence (user, read-only).
+const (
+	// ModelScopeAll means the role's actions apply to every model, ignoring the
+	// per-key allow/deny lists (only RoleAdmin).
+	ModelScopeAll = "all"
+	// ModelScopeAllowListed means the role's actions apply only to models on the
+	// key's allow-list (and never to a deny-listed model).
+	ModelScopeAllowListed = "allow-listed"
+)
+
+// RoleInfo describes one assignable role's grants in a self-contained, wire-ready
+// shape so a permissions-editor GUI can render the role→capability matrix without
+// reverse-engineering decide(). It enumerates the inference actions the role
+// grants (as op strings: "pull"/"load"/"infer"), the breadth of models those
+// actions apply to (ModelScope), and whether the role implicitly grants every
+// admin scope (the RoleAdmin superuser). It carries no per-key state — it is the
+// static definition of the role, identical for every key.
+type RoleInfo struct {
+	// Name is the role identifier stored on a key and accepted by the permissions
+	// API (one of RoleAdmin/RoleUser/RoleReadOnly).
+	Name string `json:"name"`
+	// Description is a short human-readable summary for the editor UI.
+	Description string `json:"description"`
+	// InferenceActions are the model actions the role grants, as op strings
+	// ("pull"/"load"/"infer"), in pull→load→infer order. It mirrors exactly what
+	// decide() permits for the role.
+	InferenceActions []string `json:"inference_actions"`
+	// ModelScope is the breadth those actions apply to: ModelScopeAll (every
+	// model) for admin, ModelScopeAllowListed (allow-list, deny-wins) otherwise.
+	ModelScope string `json:"model_scope"`
+	// GrantsAllAdminScopes reports whether the role implicitly holds every admin
+	// scope (true only for the RoleAdmin superuser; see HasScope).
+	GrantsAllAdminScopes bool `json:"grants_all_admin_scopes"`
+}
+
+// allRoles is the complete, ordered set of assignable roles and their grants. It
+// is the single source of truth backing both AllRoles (enumeration for the editor
+// GUI) and ValidRole (rejecting an unknown role name at the permissions seam),
+// fed by the same Role* constants decide() consults. The order is the privilege
+// ladder admin→user→read-only so the enumeration is deterministic and reads
+// most- to least-privileged. The action lists mirror decide() exactly: admin and
+// user grant pull/load/infer; read-only grants infer only.
+var allRoles = []RoleInfo{
+	{
+		Name:                 RoleAdmin,
+		Description:          "Superuser: every inference action on every model (ignoring allow/deny) and every admin scope.",
+		InferenceActions:     []string{Pull.op(), Load.op(), Infer.op()},
+		ModelScope:           ModelScopeAll,
+		GrantsAllAdminScopes: true,
+	},
+	{
+		Name:                 RoleUser,
+		Description:          "Pull, load, and infer, but only on allow-listed models (deny-list wins).",
+		InferenceActions:     []string{Pull.op(), Load.op(), Infer.op()},
+		ModelScope:           ModelScopeAllowListed,
+		GrantsAllAdminScopes: false,
+	},
+	{
+		Name:                 RoleReadOnly,
+		Description:          "Infer only (never pull or load), on allow-listed models (deny-list wins).",
+		InferenceActions:     []string{Infer.op()},
+		ModelScope:           ModelScopeAllowListed,
+		GrantsAllAdminScopes: false,
+	},
+}
+
+// AllRoles returns the assignable roles and their grants, in the deterministic
+// privilege order admin→user→read-only. It is the canonical role vocabulary a
+// permissions editor renders against (so a GUI need not reverse-engineer
+// decide()) and the set ValidRole validates against. It returns a deep copy each
+// call — including a fresh InferenceActions slice per role — so a caller mutating
+// the result can never corrupt the shared role definitions.
+func AllRoles() []RoleInfo {
+	out := make([]RoleInfo, len(allRoles))
+	for i, r := range allRoles {
+		r.InferenceActions = append([]string(nil), r.InferenceActions...)
+		out[i] = r
+	}
+	return out
+}
+
+// ValidRole reports whether name is a known assignable role. The HTTP layer uses
+// it to reject an unknown role on key create/permissions rather than silently
+// storing a string that grants nothing (mirroring ValidScope for admin scopes).
+func ValidRole(name string) bool {
+	for _, r := range allRoles {
+		if r.Name == name {
+			return true
+		}
+	}
+	return false
+}
 
 // Authorizer decides whether an authenticated key may perform an action on a
 // model, auditing each decision. It is stateless beyond its logger and safe for
