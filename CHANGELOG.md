@@ -7,14 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-05
+
+First public release of agent-gpu: a distributed inference layer for Ollama. A central
+server owns the public OpenAI-compatible API, auth, quotas, permissions, and scheduling;
+workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
+
 ### Added
 
-- Cross-platform release pipeline: GoReleaser builds standalone binaries for
-  Windows/macOS/Linux on x64 and ARM64, with SHA-256 `checksums.txt`, published
-  via a tag-triggered workflow. Adds an `agentgpu version` / `--version` command
-  and a per-PR cross-compile dry run. See [docs/releasing.md](docs/releasing.md).
-- Repository hardening and community-health files: OpenSSF Scorecard workflow,
-  Conventional Commits PR-title check, stale bot, `.gitignore`, `.editorconfig`,
-  `.gitattributes`, `SUPPORT.md`, and automated release-notes config.
+- **OpenAI-compatible API** — `chat/completions` and `completions` with SSE streaming and
+  tool calls, model discovery (`/v1/models`, `/models`), and a global rate-limit middleware
+  with `Retry-After`. Fails fast on unserved models.
+- **Sessions** — stateful and affinity modes with a history store, idle-expiry sweeper,
+  session-affinity scheduling (rebind, hit/miss metrics), per-session quotas (concurrency,
+  turns, context tokens), and Ollama `keep_alive` coordinated with session warmth.
+- **Scheduling** — global job queue with priority lanes, FIFO ordering, and backpressure;
+  a capacity-aware scheduler with queue placement; and queue-depth / wait-time monitoring.
+- **Workers** — Ollama integration with token streaming and gated model pulls, heartbeats
+  with capacity reporting, eviction and drain, and cgo-free GPU detection feeding capacity.
+- **Auth, quotas & permissions** — API key system (generation, hashing, lifecycle, CLI),
+  a model-access permission layer (roles, allow/deny, audit), and a per-key quota engine
+  (RPM/TPM, token budgets, windows).
+- **Admin API** — scoped RBAC with audit log, idempotency, and pagination; endpoints for
+  keys, quotas, permissions, workers (detail, timed/forced drain, model pull/unload),
+  config with live hot-reload, GPU fleet inventory, roles, per-key usage (with CSV export),
+  telemetry dashboard summary, and log query + SSE live-tail.
+- **Admin GUI** — embedded admin console (templ/htmx/alpine/tailwind) covering workers and
+  GPUs, keys/users/permissions, and usage/telemetry/logs/settings.
+- **CLI** — `agentgpu` with server-targeting key/quota and models management, admin
+  subcommands, a `--local` bootstrap mode, a load-testing harness, and typed exit codes.
+- **Observability** — Prometheus `/metrics` endpoint, `/v1/admin/stats`, configurable JSON
+  logging with correlation IDs and secret redaction, and session-id log correlation.
+- **Packaging & release** — multi-stage Dockerfiles for server and worker with CI
+  build/publish, a Docker Compose dev stack (server, workers, ollama, redis, postgres), and
+  a cross-platform GoReleaser pipeline producing signed-checksum binaries for
+  Windows/macOS/Linux on x64 and ARM64, plus an `agentgpu version` / `--version` command.
+- **Documentation** — full OpenAPI 3.1 spec with CI validation, a rendered API reference on
+  GitHub Pages, a contributor developer guide, a multi-turn sessions guide, an end-to-end
+  example client, and a rewritten README with a working quickstart.
+- **Project foundation** — Go + gRPC server/worker scaffold, repository hardening (OpenSSF
+  Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
+  deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/commits/main
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jaypetez/agent-gpu/releases/tag/v0.1.0
