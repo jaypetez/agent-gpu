@@ -66,7 +66,14 @@ func usageTestServer(t *testing.T, defaults quota.Limits, series *usagepkg.Store
 	authSvc := auth.NewService(st)
 	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
 	az := authz.NewAuthorizer(authz.WithLogger(discard))
-	eng := quota.NewEngine(quota.NewMemoryCounterStore(), quota.WithDefaults(defaults), quota.WithLogger(discard))
+	// Pin the engine clock to a fixed instant early in a UTC day. The usage tests
+	// seed their series relative to eng.Now() and the exhaustion forecast is
+	// suppressed once a projection crosses the next UTC-midnight reset, so a real
+	// wall clock made TestUIUsagePartialMetersAndSparkline flaky by time of day
+	// (the ~9h "Runs out" projection only lands before midnight when the run starts
+	// early enough). A fixed 10:00 UTC base keeps every forecast deterministic.
+	clock := func() time.Time { return time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC) }
+	eng := quota.NewEngine(quota.NewMemoryCounterStore(), quota.WithDefaults(defaults), quota.WithLogger(discard), quota.WithClock(clock))
 	s := &Server{
 		fleet:       &fakeFleet{},
 		auth:        authSvc,
