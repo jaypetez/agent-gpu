@@ -16,7 +16,7 @@
 # platform. $BUILDPLATFORM keeps the toolchain native while GOOS/GOARCH
 # cross-compile to $TARGETPLATFORM, so multi-arch builds need no QEMU emulation
 # of the (slow) Go compiler.
-FROM --platform=$BUILDPLATFORM golang:1.26@sha256:f96cc555eb8db430159a3aa6797cd5bae561945b7b0fe7d0e284c63a3b291609 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26@sha256:079e59808d2d252516e27e3f3a9c003740dee7f75e55aa71528766d52bcfc16a AS builder
 
 # Provided automatically by BuildKit for the requested target platform.
 ARG TARGETOS
