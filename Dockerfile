@@ -16,7 +16,7 @@
 # platform. $BUILDPLATFORM keeps the toolchain native while GOOS/GOARCH
 # cross-compile to $TARGETPLATFORM, so multi-arch builds need no QEMU emulation
 # of the (slow) Go compiler.
-FROM --platform=$BUILDPLATFORM golang:1.26@sha256:079e59808d2d252516e27e3f3a9c003740dee7f75e55aa71528766d52bcfc16a AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26@sha256:ae5a2316d12f3e78fd99177dad452e6ad4f240af2d71d57b480c3477f250fec6 AS builder
 
 # Provided automatically by BuildKit for the requested target platform.
 ARG TARGETOS
@@ -95,7 +95,7 @@ CMD ["server", "start"]
 # with `--gpus all`. base-debian12 carries glibc + libssl/CA certs yet stays
 # small (~20 MB), non-root, with no shell or package manager. The worker is
 # stateless and opens no inbound port, so it needs no VOLUME and no EXPOSE.
-FROM gcr.io/distroless/base-debian12:nonroot@sha256:4b5196599229a5cf312a676cfe1ee8587ecf2371dcc22620f8c7a66d77d125c8 AS worker
+FROM gcr.io/distroless/base-debian12:nonroot@sha256:6c806311d31c11d364a8d13a022af5a48f29e43bd585ad6b51f1bb447f83d239 AS worker
 
 # AGENTGPU_SERVER_ADDR (the gRPC server, a bare host:port) and AGENTGPU_OLLAMA_URL
 # (the local Ollama base URL) are deployment-specific and intentionally NOT baked
