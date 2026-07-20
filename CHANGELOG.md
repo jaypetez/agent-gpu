@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-19
+
+### Changed
+
+- Bump `google.golang.org/grpc` from 1.82.0 to 1.82.1 (patch release) — the transport
+  underlying the server↔worker bidirectional stream.
+- Update pinned CI actions and Docker images to their current releases: `actions/setup-go`,
+  `actions/setup-node`, `docker/login-action`, `github/codeql-action/upload-sarif`, and
+  `DavidAnson/markdownlint-cli2-action`, plus the `golang` builder image and the
+  `distroless/base-debian12` / `distroless/static-debian12` runtime image digests.
+
 ## [0.1.1] - 2026-07-12
 
 ### Security
@@ -66,6 +77,7 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/jaypetez/agent-gpu/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jaypetez/agent-gpu/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jaypetez/agent-gpu/releases/tag/v0.1.0
