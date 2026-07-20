@@ -56,7 +56,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---- Server ----------------------------------------------------------------
 # distroless/static is the smallest base for a fully static binary: no libc, no
 # shell, no package manager. The :nonroot tag runs as UID/GID 65532.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:b7bb25d9f7c31d2bdd1982feb4dafcaf137703c7075dbe2febb41c24212b946f AS server
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:aef9602f8710ec12bde19d593fed1f76c708531bb7aba205110f1029786ead7b AS server
 
 # The default listen addresses in the binary are loopback-only; bind all
 # interfaces so the container is reachable, and point all server state at the
