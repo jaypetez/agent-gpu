@@ -95,7 +95,7 @@ CMD ["server", "start"]
 # with `--gpus all`. base-debian12 carries glibc + libssl/CA certs yet stays
 # small (~20 MB), non-root, with no shell or package manager. The worker is
 # stateless and opens no inbound port, so it needs no VOLUME and no EXPOSE.
-FROM gcr.io/distroless/base-debian12:nonroot@sha256:6c806311d31c11d364a8d13a022af5a48f29e43bd585ad6b51f1bb447f83d239 AS worker
+FROM gcr.io/distroless/base-debian12:nonroot@sha256:63f52bd27b6aa6555f5d56500b70d7bb0afe51c654905be88a2c1cf967a77b1a AS worker
 
 # AGENTGPU_SERVER_ADDR (the gRPC server, a bare host:port) and AGENTGPU_OLLAMA_URL
 # (the local Ollama base URL) are deployment-specific and intentionally NOT baked
