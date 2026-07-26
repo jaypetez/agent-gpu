@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-26
+
+A maintenance release: dependency and pinned-toolchain updates only, with no functional or
+API changes.
+
+### Changed
+
+- Bump `github.com/prometheus/client_golang` from 1.23.2 to 1.24.1 — the client library
+  behind the `/metrics` endpoint. Pulls through updated `prometheus/common`,
+  `prometheus/procfs`, `klauspost/compress`, and `golang.org/x/net` / `x/sys` / `x/text`.
+- Update pinned CI actions to their current releases: `actions/checkout` (across all five
+  workflows), `docker/login-action`, `github/codeql-action/upload-sarif`, and
+  `ossf/scorecard-action`.
+- Refresh the pinned Docker image digests: the `golang:1.26` builder, and the
+  `distroless/static-debian12` (server) and `distroless/base-debian12` (worker) runtime
+  images.
+
 ## [0.1.2] - 2026-07-19
 
 ### Changed
@@ -77,7 +94,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/jaypetez/agent-gpu/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jaypetez/agent-gpu/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jaypetez/agent-gpu/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jaypetez/agent-gpu/releases/tag/v0.1.0
