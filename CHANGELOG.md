@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-07
+
+A maintenance release: dependency and pinned-action updates only, with no functional or
+API changes.
+
+### Changed
+
+- Bump `google.golang.org/grpc` from 1.82.1 to 1.83.0 — the transport underlying the
+  server↔worker bidirectional stream. Pulls through updated
+  `google.golang.org/genproto/googleapis/rpc` and OpenTelemetry `otel`, `otel/metric`,
+  `otel/sdk`, `otel/sdk/metric`, and `otel/trace` (1.43.0 to 1.44.0).
+- Update pinned CI actions to their current releases: `actions/stale` (10.4.0 to 11.0.0 —
+  the action moved to ES modules and picked up dependency security fixes; its inputs are
+  unchanged), `docker/login-action`, and `github/codeql-action/upload-sarif`.
+
 ## [0.1.3] - 2026-07-26
 
 A maintenance release: dependency and pinned-toolchain updates only, with no functional or
@@ -94,7 +109,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/jaypetez/agent-gpu/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/jaypetez/agent-gpu/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jaypetez/agent-gpu/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jaypetez/agent-gpu/compare/v0.1.0...v0.1.1
