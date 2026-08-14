@@ -1,6 +1,6 @@
 module github.com/jaypetez/agent-gpu
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/a-h/templ v0.3.1020
