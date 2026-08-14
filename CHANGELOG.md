@@ -9,8 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.5] - 2026-08-13
 
-A maintenance release: pinned-action and Docker base-image updates only, with no functional
-or API changes.
+A maintenance release: a Go toolchain security bump plus pinned-action and Docker
+base-image updates, with no functional or API changes.
+
+### Security
+
+- Bump the Go toolchain to **1.25.13** to patch five standard-library vulnerabilities
+  reachable from this codebase: **GO-2026-6218** (quadratic complexity in `net/url`
+  resolvePath), **GO-2026-6091** (JavaScript regexp context tracking in `html/template`),
+  **GO-2026-6090** (unbounded post-handshake messages in `crypto/tls`), **GO-2026-6089**
+  (missing ReadHeaderTimeout on the unencrypted-HTTP/2 check in `net/http`), and
+  **GO-2026-5972** (unbounded recursion in `encoding/asn1`). `govulncheck` now reports
+  no vulnerabilities.
 
 ### Changed
 
