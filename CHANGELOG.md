@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-08-13
+
+A maintenance release: a Go toolchain security bump plus pinned-action and Docker
+base-image updates, with no functional or API changes.
+
+### Security
+
+- Bump the Go toolchain to **1.25.13** to patch five standard-library vulnerabilities
+  reachable from this codebase: **GO-2026-6218** (quadratic complexity in `net/url`
+  resolvePath), **GO-2026-6091** (JavaScript regexp context tracking in `html/template`),
+  **GO-2026-6090** (unbounded post-handshake messages in `crypto/tls`), **GO-2026-6089**
+  (missing ReadHeaderTimeout on the unencrypted-HTTP/2 check in `net/http`), and
+  **GO-2026-5972** (unbounded recursion in `encoding/asn1`). `govulncheck` now reports
+  no vulnerabilities.
+
+### Changed
+
+- Update pinned CI actions to their current releases: `step-security/harden-runner`
+  (2.20.0 to 2.20.1), `github/codeql-action/upload-sarif` (4.37.4 to 4.37.6), and
+  `DavidAnson/markdownlint-cli2-action` (24.1.0 to 24.2.0).
+- Update the pinned `golang:1.26` builder image digest in the Dockerfile.
+
 ## [0.1.4] - 2026-08-07
 
 A maintenance release: dependency and pinned-action updates only, with no functional or
@@ -109,7 +131,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/jaypetez/agent-gpu/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/jaypetez/agent-gpu/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/jaypetez/agent-gpu/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jaypetez/agent-gpu/compare/v0.1.1...v0.1.2
