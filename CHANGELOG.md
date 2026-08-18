@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-18
+
+A maintenance release: dependency, pinned-action, and base-image updates only, with no
+functional or API changes.
+
+### Changed
+
+- Bump `google.golang.org/protobuf` from 1.36.11 to 1.36.12 — the runtime behind the
+  generated server↔worker gRPC message types. Upstream hardens parsing (a recursion limit
+  in `prototext` encoding, a size guard in `protodelim`) and fixes `protojson` handling of
+  `google.protobuf.Empty` plus non-numeric JSON input for numeric fields.
+- Refresh the pinned Docker runtime image digests: `distroless/static-debian12` (server)
+  and `distroless/base-debian12` (worker).
+- Update the pinned `github/codeql-action/upload-sarif` action from 4.37.6 to 4.37.7.
+
 ## [0.1.5] - 2026-08-13
 
 A maintenance release: a Go toolchain security bump plus pinned-action and Docker
@@ -131,7 +146,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/jaypetez/agent-gpu/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/jaypetez/agent-gpu/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/jaypetez/agent-gpu/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/jaypetez/agent-gpu/compare/v0.1.2...v0.1.3
