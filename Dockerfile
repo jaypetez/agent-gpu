@@ -16,7 +16,7 @@
 # platform. $BUILDPLATFORM keeps the toolchain native while GOOS/GOARCH
 # cross-compile to $TARGETPLATFORM, so multi-arch builds need no QEMU emulation
 # of the (slow) Go compiler.
-FROM --platform=$BUILDPLATFORM golang:1.26@sha256:2005724102f45917a63e9d092fc0e4ea56ea575048ce147caad5f5f61502c365 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27@sha256:65b6f280bf050ec5af12716857e8ea8439d694dbba8f31ceeb7630670071f2bb AS builder
 
 # Provided automatically by BuildKit for the requested target platform.
 ARG TARGETOS
@@ -56,7 +56,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # ---- Server ----------------------------------------------------------------
 # distroless/static is the smallest base for a fully static binary: no libc, no
 # shell, no package manager. The :nonroot tag runs as UID/GID 65532.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a AS server
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS server
 
 # The default listen addresses in the binary are loopback-only; bind all
 # interfaces so the container is reachable, and point all server state at the
@@ -95,7 +95,7 @@ CMD ["server", "start"]
 # with `--gpus all`. base-debian12 carries glibc + libssl/CA certs yet stays
 # small (~20 MB), non-root, with no shell or package manager. The worker is
 # stateless and opens no inbound port, so it needs no VOLUME and no EXPOSE.
-FROM gcr.io/distroless/base-debian12:nonroot@sha256:b12529fbbd0bb15eea8905f69d83148679e0b4d7d434c8808100792029b1caae AS worker
+FROM gcr.io/distroless/base-debian12:nonroot@sha256:7f0c72cd138b442ae0deeb69c08b1acf5525439ba251a49ad93c320a061567e5 AS worker
 
 # AGENTGPU_SERVER_ADDR (the gRPC server, a bare host:port) and AGENTGPU_OLLAMA_URL
 # (the local Ollama base URL) are deployment-specific and intentionally NOT baked
