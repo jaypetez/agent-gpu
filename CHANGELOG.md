@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-03
+
+A maintenance release: a gRPC security update plus builder-toolchain, base-image, and
+pinned-action refreshes, with no functional or API changes.
+
+### Security
+
+- Bump `google.golang.org/grpc` from 1.83.0 to 1.83.2 — the transport underlying the
+  server↔worker bidirectional stream. Upstream 1.83.2 makes the gRPC server reject requests
+  carrying neither an `:authority` nor a `Host` header with HTTP 400 and status `Internal`;
+  1.83.1 bounds the memory overhead of buffering small data frames and tightens `xds/rbac`
+  header matching so malformed or non-lowercase matchers can no longer make DENY rules fail
+  open (agent-gpu does not run xDS, so only the first two reach this codebase). Pulls through
+  `golang.org/x/net` (0.57.0 to 0.58.0) and `golang.org/x/text` (0.40.0 to 0.41.0).
+
+### Changed
+
+- Bump the pinned `golang` builder image in the Dockerfile from 1.26 to 1.27. This affects the
+  published container images only — CI and the release binaries continue to build with the
+  toolchain resolved from `go.mod`.
+- Refresh the pinned Docker runtime image digests: `distroless/static-debian12` (server) and
+  `distroless/base-debian12` (worker).
+- Update pinned CI actions to their current releases: `step-security/harden-runner` (2.20.1 to
+  2.21.0), `docker/setup-buildx-action` (4.2.0 to 4.3.0), and
+  `github/codeql-action/upload-sarif` (4.37.7 to 4.37.9).
+
 ## [0.1.6] - 2026-08-18
 
 A maintenance release: dependency, pinned-action, and base-image updates only, with no
@@ -146,7 +172,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/jaypetez/agent-gpu/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/jaypetez/agent-gpu/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/jaypetez/agent-gpu/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/jaypetez/agent-gpu/compare/v0.1.3...v0.1.4
