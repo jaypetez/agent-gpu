@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-21
+
+A maintenance release: pinned-action, builder-image, and Go dependency refreshes, with no
+functional or API changes.
+
+### Security
+
+- Bump `docker/build-push-action` from 7.3.0 to 7.4.0. Upstream stops Buildx metadata that
+  the action echoes into the job log from being interpreted as GitHub Actions workflow
+  commands, closing a workflow-command injection path. This affects the `docker` CI job and
+  the image-publishing workflow only — nothing in the shipped binaries.
+- Bump `step-security/harden-runner` from 2.21.0 to 2.21.1, the egress-audit wrapper on every
+  CI job. Upstream implicitly allows the endpoints the Actions runner itself needs when the
+  Community tier runs in block mode (previously they could be blocked), speeds up
+  `disable-sudo`, and fixes the post step on distributions without a merged `/usr` layout.
+
+### Changed
+
+- Refresh the pinned `golang:1.27` builder image digest (`65b6f28` to `512690a`) — a rebuild
+  of the same Go minor picking up current base-OS package updates. This affects the published
+  container images only; CI and the release binaries build with the toolchain resolved from
+  `go.mod`.
+- Bump `github.com/prometheus/client_model` from 0.6.2 to 0.6.3 — the generated protobuf
+  types underlying the `/metrics` exposition. Upstream is a maintenance release (protobuf
+  runtime rolled forward to 1.36.11, native histograms no longer marked experimental); the
+  metrics agent-gpu exposes are unchanged.
+- Update pinned CI actions to their current releases: `github/codeql-action/upload-sarif`
+  (4.37.9 to 4.38.0, which adds native `linux-arm64` bundle support and evicts stale bundles
+  from the toolcache), `docker/setup-qemu-action` (4.2.0 to 4.4.0), and `actions/deploy-pages`
+  (5.0.0 to 5.0.1, which adds backoff and jitter to deployment polling).
+
 ## [0.1.7] - 2026-09-03
 
 A maintenance release: a gRPC security update plus builder-toolchain, base-image, and
@@ -172,7 +203,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/jaypetez/agent-gpu/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/jaypetez/agent-gpu/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/jaypetez/agent-gpu/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/jaypetez/agent-gpu/compare/v0.1.4...v0.1.5
