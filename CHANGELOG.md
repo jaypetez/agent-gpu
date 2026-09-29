@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-29
+
+A maintenance release: pinned-action and builder-image refreshes, with no functional or API
+changes.
+
+### Changed
+
+- Refresh the pinned `golang:1.27` builder image digest (`512690a` to `3680233`) — a rebuild
+  of the same Go minor picking up current base-OS package updates. This affects the published
+  container images only; CI and the release binaries build with the toolchain resolved from
+  `go.mod`.
+- Update pinned CI actions to their current releases: `docker/setup-buildx-action` (4.3.0 to
+  4.4.1, which uses official Buildx releases for the cloud driver and pre-pulls the BuildKit
+  image before creating the builder) and `github/codeql-action/upload-sarif` (4.38.0 to
+  4.38.2, which moves the default CodeQL bundle to 2.27.1 and adds experimental per-language
+  bundle support).
+
+### Security
+
+- `google.golang.org/grpc` stays on 1.83.2. The Dependabot bump to 1.84.0 was declined
+  because that release is affected by
+  [GO-2026-6443](https://pkg.go.dev/vuln/GO-2026-6443) (server panic on requests missing
+  `:authority`/`Host`), which 1.83.2 already fixes; no patched 1.84.x release exists yet.
+
 ## [0.1.8] - 2026-09-21
 
 A maintenance release: pinned-action, builder-image, and Go dependency refreshes, with no
@@ -203,7 +227,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/jaypetez/agent-gpu/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/jaypetez/agent-gpu/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/jaypetez/agent-gpu/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/jaypetez/agent-gpu/compare/v0.1.5...v0.1.6
