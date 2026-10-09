@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-08
+
+A maintenance release: a builder-image refresh, with no functional or API changes.
+
+### Changed
+
+- Refresh the pinned `golang:1.27` builder image digest (`3680233` to `e0174e5`) — a rebuild
+  of the same Go minor picking up current base-OS package updates. This affects the published
+  container images only; CI and the release binaries build with the toolchain resolved from
+  `go.mod`.
+
 ## [0.1.9] - 2026-09-29
 
 A maintenance release: pinned-action and builder-image refreshes, with no functional or API
@@ -227,7 +238,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/jaypetez/agent-gpu/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/jaypetez/agent-gpu/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/jaypetez/agent-gpu/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/jaypetez/agent-gpu/compare/v0.1.6...v0.1.7
