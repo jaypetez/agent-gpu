@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-15
+
+A maintenance and security release: a Go toolchain bump that clears reachable standard-library
+and `golang.org/x/net` vulnerabilities, plus pinned-dependency refreshes, with no functional or
+API changes.
+
+### Security
+
+- Bump the Go toolchain from 1.25.13 to 1.26.9 (`go.mod`) and `golang.org/x/net` from v0.58.0 to
+  v0.61.0. `govulncheck` reported reachable HTTP/2 and `net/http` advisories (GO-2026-6617,
+  GO-2026-6612, GO-2026-6611, GO-2026-6603) and 12 standard-library findings fixed only in
+  Go 1.26.9.
+
+### Changed
+
+- Update pinned CI actions to their current releases: `github/codeql-action/upload-sarif`
+  (4.38.2 to 4.38.3), `actions/upload-artifact` (7.0.1 to 7.0.2), `step-security/harden-runner`
+  (2.21.1 to 2.22.1), and `actions/setup-node` (7.0.0 to 7.1.0).
+- Bump `github.com/a-h/templ` from 0.3.1020 to 0.3.1070 (the templ code generator and runtime).
+- Bump `source-map-js` from 1.2.1 to 1.2.2 in the admin console (`internal/httpapi/webui`).
+
 ## [0.1.10] - 2026-10-08
 
 A maintenance release: a builder-image refresh, with no functional or API changes.
@@ -238,7 +259,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/jaypetez/agent-gpu/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/jaypetez/agent-gpu/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/jaypetez/agent-gpu/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/jaypetez/agent-gpu/compare/v0.1.7...v0.1.8
