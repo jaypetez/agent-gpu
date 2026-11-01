@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-01
+
+A maintenance and security release: a Go toolchain bump that clears a reachable standard-library
+vulnerability, plus dependency and pinned-action refreshes, with no functional or API changes.
+
+### Security
+
+- Bump the Go toolchain from 1.26.9 to 1.26.10 (`go.mod`). `govulncheck` reported a reachable
+  `crypto/x509` advisory (GO-2026-6809, distrust of compromised intermediate certificates) fixed
+  only in Go 1.26.10.
+
+### Changed
+
+- Bump `github.com/a-h/templ` from 0.3.1070 to 0.3.1100 and regenerate the admin console's
+  `*_templ.go` output with the matching generator (the `Makefile` templ pin moves from 0.3.1020
+  to 0.3.1100).
+- Bump `github.com/prometheus/client_golang` from 1.24.1 to 1.25.0.
+- Refresh the digest-pinned `golang:1.27` Docker builder image.
+- Update pinned CI actions to their current releases: `step-security/harden-runner`
+  (2.22.1 to 2.22.3), `docker/login-action` (4.6.0 to 4.7.0),
+  `github/codeql-action/upload-sarif` (4.38.3 to 4.39.1), `goreleaser/goreleaser-action`
+  (7.2.3 to 7.3.0), and `ossf/scorecard-action` (2.4.4 to 2.5.0).
+
 ## [0.1.11] - 2026-10-15
 
 A maintenance and security release: a Go toolchain bump that clears reachable standard-library
@@ -259,7 +282,8 @@ workers run Ollama and execute dispatched jobs over a gRPC bidirectional stream.
   Scorecard, Conventional Commits PR-title check, stale bot, community-health files), and a
   deterministic end-to-end agentic test harness with a coverage gate.
 
-[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/jaypetez/agent-gpu/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/jaypetez/agent-gpu/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/jaypetez/agent-gpu/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/jaypetez/agent-gpu/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/jaypetez/agent-gpu/compare/v0.1.8...v0.1.9
