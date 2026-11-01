@@ -5,13 +5,13 @@
 #   protoc-gen-go      v1.36.6
 #   protoc-gen-go-grpc v1.5.1
 #   goreleaser         v2.16.0
-#   templ              v0.3.1020   (admin console codegen, #100)
+#   templ              v0.3.1100   (admin console codegen, #100)
 #   tailwindcss        v4.1.16     (admin console CSS, #100; via internal/httpapi/webui/package.json)
 BUF_VERSION             := v1.50.0
 PROTOC_GEN_GO_VERSION   := v1.36.6
 PROTOC_GEN_GRPC_VERSION := v1.5.1
 GORELEASER_VERSION      := v2.16.0
-TEMPL_VERSION           := v0.3.1020
+TEMPL_VERSION           := v0.3.1100
 
 # Admin console (#100) source/build locations. The Node toolchain (package.json,
 # lockfile, node_modules) lives INSIDE the console package dir so that node_modules
