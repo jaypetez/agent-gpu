@@ -1124,7 +1124,7 @@ Pinned tool versions:
 
 | Tool                   | Version    |
 | ---------------------- | ---------- |
-| `templ`                | v0.3.1020  |
+| `templ`                | v0.3.1100  |
 | `tailwindcss`          | v4.1.16    |
 | `@playwright/test`     | v1.56.0    |
 | `@axe-core/playwright` | v4.10.2    |
